@@ -1,0 +1,14 @@
+.dart_tool/
+.packages
+build/
+*.iml
+.idea/
+android/.gradle/
+android/local.properties
+# Signing: dedicated keystore + passwords stay local, never in git.
+.local/
+android/key.properties
+
+# Built APKs stay local
+*.apk
+build-*.log

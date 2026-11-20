@@ -1,0 +1,112 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:horihori/app_config.dart';
+import 'package:horihori/store.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+  });
+
+  group('アーカイブ復元・削除', () {
+    test('アーカイブすると visible から消え archived に出る', () async {
+      final store = IdeaStore();
+      await store.load();
+      final idea = await store.addIdea('テストアイデア', '');
+      expect(store.visibleIdeas.length, 1);
+      expect(store.archivedIdeas, isEmpty);
+
+      await store.archiveIdea(idea);
+      expect(store.visibleIdeas, isEmpty);
+      expect(store.archivedIdeas.length, 1);
+      expect(store.archivedIdeas.first.id, idea.id);
+    });
+
+    test('戻すと一覧に再表示される（永続化も往復する）', () async {
+      final store = IdeaStore();
+      await store.load();
+      final idea = await store.addIdea('戻したいアイデア', '');
+      await store.archiveIdea(idea);
+      await store.unarchiveIdea(idea);
+      expect(store.visibleIdeas.length, 1);
+      expect(store.archivedIdeas, isEmpty);
+
+      // 再読み込みしても戻った状態が保たれる
+      final reloaded = IdeaStore();
+      await reloaded.load();
+      expect(reloaded.visibleIdeas.length, 1);
+      expect(reloaded.archivedIdeas, isEmpty);
+    });
+
+    test('アーカイブ状態も永続化される', () async {
+      final store = IdeaStore();
+      await store.load();
+      final idea = await store.addIdea('しまうアイデア', '');
+      await store.archiveIdea(idea);
+
+      final reloaded = IdeaStore();
+      await reloaded.load();
+      expect(reloaded.visibleIdeas, isEmpty);
+      expect(reloaded.archivedIdeas.length, 1);
+    });
+
+    test('完全に削除するとどこにも残らない', () async {
+      final store = IdeaStore();
+      await store.load();
+      final a = await store.addIdea('消すアイデア', '');
+      await store.addIdea('残すアイデア', '');
+      await store.archiveIdea(a);
+      await store.deleteIdea(a);
+      expect(store.archivedIdeas, isEmpty);
+      expect(store.visibleIdeas.length, 1);
+      expect(store.ideas.length, 1);
+
+      final reloaded = IdeaStore();
+      await reloaded.load();
+      expect(reloaded.ideas.length, 1);
+      expect(reloaded.visibleIdeas.first.title, '残すアイデア');
+    });
+  });
+
+  group('hasRemoteKey', () {
+    test('キー未設定なら false、保存すると true', () async {
+      final store = IdeaStore();
+      await store.load();
+      expect(store.hasRemoteKey, isFalse);
+      await store.saveApiKey('dummy-key');
+      expect(store.hasRemoteKey, isTrue);
+    });
+  });
+
+  group('データ消失ガード', () {
+    test('壊れたJSONはバックアップキーへ退避してから空で開始する', () async {
+      SharedPreferences.setMockInitialValues({
+        AppConfig.prefsIdeasKey: '{broken json',
+      });
+      final store = IdeaStore();
+      await store.load();
+      expect(store.ideas, isEmpty);
+      expect(store.loaded, isTrue);
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(AppConfig.prefsIdeasBackupKey), '{broken json');
+
+      // その後の保存で新しいデータが書け、退避した原文は残る
+      await store.addIdea('新しいアイデア', '');
+      expect(prefs.getString(AppConfig.prefsIdeasBackupKey), '{broken json');
+      final reloaded = IdeaStore();
+      await reloaded.load();
+      expect(reloaded.visibleIdeas.length, 1);
+    });
+
+    test('正常なJSONは退避されない', () async {
+      final store = IdeaStore();
+      await store.load();
+      await store.addIdea('普通のアイデア', '');
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(AppConfig.prefsIdeasBackupKey), isNull);
+    });
+  });
+}
