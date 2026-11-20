@@ -29,3 +29,7 @@
 
 ## 経緯メモ
 - Muse（パソパソ）側の実装委託が 2026-11-20 夜から内部の安全チェックで開始直後に止まる事象が3回連続したため、実装は他のエージェントへ引き継ぐことになった。アプリ本体・データに問題はない。
+
+## リポジトリ
+- GitHub: https://github.com/TaigaShinohara/idea-horihori （public）
+- 署名鍵・APK・ビルド生成物は git 管理外（.gitignore 済み）
