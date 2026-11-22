@@ -33,21 +33,9 @@ class StageBadge extends StatelessWidget {
       container: true,
       label: '成長段階は${stage.label}',
       child: ExcludeSemantics(
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(stage.emoji, style: TextStyle(fontSize: emojiSize)),
-            const SizedBox(width: 5),
-            Text(
-              stage.label,
-              style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
-                color: kAccentDeep,
-              ),
-            ),
-          ],
-        ),
+        // v0.2.1 ノイズ削減 N2: 見える段階ラベルは絵文字と同義なので消す。
+        // 読み上げ名は上の Semantics label に残る。
+        child: Text(stage.emoji, style: TextStyle(fontSize: emojiSize)),
       ),
     );
   }

@@ -240,23 +240,6 @@ class _DetailScreenState extends State<DetailScreen> {
                   stage: idea.stage,
                   animate: _celebrate,
                 ),
-                if (_celebrate && latest != null) ...[
-                  const SizedBox(height: 10),
-                  const Row(
-                    children: [
-                      Text('🌳', style: TextStyle(fontSize: 16)),
-                      SizedBox(width: 6),
-                      Text(
-                        '新しいメモができたよ',
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.bold,
-                          color: kAccentDeep,
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
                 const SizedBox(height: 16),
                 if (latest == null) ...[
                   // メモがまだ無い時だけ、深掘りCTAが主役でよい。
@@ -271,7 +254,7 @@ class _DetailScreenState extends State<DetailScreen> {
                   ),
                   const Padding(
                     padding: EdgeInsets.symmetric(vertical: 24),
-                    child: Center(child: Text('まだメモはないよ。深掘りすると育つよ。')),
+                    child: Center(child: Text('まだメモはないよ')),
                   ),
                 ] else ...[
                   // K5: 最新メモが主役（最初・最大）。
@@ -302,7 +285,7 @@ class _DetailScreenState extends State<DetailScreen> {
                           ),
                           icon: const Icon(Icons.description_outlined,
                               size: 18),
-                          label: const Text('指示書を書き出す'),
+                          label: const Text('指示書'),
                         ),
                       ),
                       const SizedBox(width: 10),
@@ -310,7 +293,7 @@ class _DetailScreenState extends State<DetailScreen> {
                         child: OutlinedButton.icon(
                           onPressed: () => _showNameCandidates(context),
                           icon: const Icon(Icons.badge_outlined, size: 18),
-                          label: const Text('名前候補を出す'),
+                          label: const Text('名前候補'),
                         ),
                       ),
                     ],

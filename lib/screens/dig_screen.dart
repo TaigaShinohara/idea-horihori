@@ -281,19 +281,15 @@ class _DigScreenState extends State<DigScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Row(
-                children: [
-                  StageBadge(stage: idea.stage, emojiSize: 18),
-                  const SizedBox(width: 10),
-                  Expanded(
-                      child: GrowthBar(value: idea.growthValue, stage: idea.stage)),
-                  const SizedBox(width: 8),
-                  Text('$done / ${AppConfig.questionsPerSession}問',
-                      style: const TextStyle(fontSize: 13)),
-                ],
+              // v0.2.1 ノイズ削減 N3/N4: 進み具合は「n/5問」に一本化
+              // （段階アイコンと成長バーはホーム／詳細が正本）。
+              Align(
+                alignment: Alignment.centerRight,
+                child: Text('$done / ${AppConfig.questionsPerSession}問',
+                    style: const TextStyle(fontSize: 13)),
               ),
               const SizedBox(height: 10),
-              _ModeBadge(kind: _modeKind, style: widget.store.digStyle),
+              _ModeBadge(kind: _modeKind),
               const SizedBox(height: 10),
               _styleAndViewpointControls(),
               const SizedBox(height: 12),
@@ -308,10 +304,6 @@ class _DigScreenState extends State<DigScreen> {
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         _questionCard(_question!),
-                        if (_session.answers.isNotEmpty) ...[
-                          const SizedBox(height: 8),
-                          _historyTile(),
-                        ],
                       ],
                     ),
                   ),
@@ -327,36 +319,21 @@ class _DigScreenState extends State<DigScreen> {
                   child: const Text('答える', style: TextStyle(fontSize: 16)),
                 ),
                 const SizedBox(height: 8),
-                TextButton(
-                  // 項目7: 選択肢の記録がある最新の回答だけ「もどる」対象。
-                  onPressed: canUndoLastAnswer(_session) ? _undo : null,
-                  child: const Text('1問もどる'),
-                ),
-                TextButton(
-                  onPressed: canSummarize ? () => _summarize() : null,
-                  child: const Text('いったんまとめる'),
-                ),
-                if (!canSummarize)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 2),
-                    child: Text(
-                      '1問答えると、ここでまとめられるよ',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Theme.of(context)
-                            .colorScheme
-                            .onSurface
-                            .withValues(alpha: 0.55),
-                      ),
+                // v0.2.1 ノイズ削減 N7/N8: 補助ボタンは横1行に集約し、
+                // 説明文と「あとで続きを掘る」（戻る操作と重複・自動保存済み）を削除。
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    TextButton(
+                      // 項目7: 選択肢の記録がある最新の回答だけ「もどる」対象。
+                      onPressed: canUndoLastAnswer(_session) ? _undo : null,
+                      child: const Text('1問もどる'),
                     ),
-                  ),
-                TextButton(
-                  onPressed: () async {
-                    await _persist();
-                    if (context.mounted) Navigator.pop(context);
-                  },
-                  child: const Text('あとで続きを掘る'),
+                    TextButton(
+                      onPressed: canSummarize ? () => _summarize() : null,
+                      child: const Text('いったんまとめる'),
+                    ),
+                  ],
                 ),
               ],
             ],
@@ -367,61 +344,50 @@ class _DigScreenState extends State<DigScreen> {
   }
 
   /// 掘り方スタイル（友達／上司）と視点（通常／お金／技術／使う人）の切替UI。
+  /// v0.2.1 ノイズ削減: 支援項目なので既定は畳む（質問が主役）。
+  /// 見出しは現在の選択が閉じたままでも分かる形にする。
   Widget _styleAndViewpointControls() {
     final style = widget.store.digStyle;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+    return ExpansionTile(
+      tilePadding: EdgeInsets.zero,
+      title: Text(
+        '掘り方・視点（${style.label}／${_session.viewpoint.label}）',
+        style: const TextStyle(fontSize: 13),
+      ),
       children: [
-        Wrap(
-          spacing: 8,
-          runSpacing: 4,
-          children: [
-            for (final s in DigStyle.values)
-              ChoiceChip(
-                label: Text(s.label),
-                selected: style == s,
-                onSelected: (_) => _setStyle(s),
-              ),
-          ],
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              for (final s in DigStyle.values)
+                ChoiceChip(
+                  label: Text(s.label),
+                  selected: style == s,
+                  onSelected: (_) => _setStyle(s),
+                ),
+            ],
+          ),
         ),
         const SizedBox(height: 6),
-        Wrap(
-          spacing: 8,
-          runSpacing: 4,
-          children: [
-            for (final v in DigViewpoint.values)
-              ChoiceChip(
-                label: Text(v.label),
-                selected: _session.viewpoint == v,
-                selectedColor: kAccent.withValues(alpha: 0.35),
-                onSelected: (_) => _setViewpoint(v),
-              ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  /// これまでの回答（項目7）。既定は畳んだ状態で、時系列に Q→A を出す。
-  Widget _historyTile() {
-    return ExpansionTile(
-      title: const Text('これまでの回答', style: TextStyle(fontSize: 13)),
-      childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-      children: [
-        for (final a in _session.answers)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 10),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('Q: ${a.question}',
-                    style: const TextStyle(
-                        fontSize: 13, fontWeight: FontWeight.bold, height: 1.5)),
-                Text('A: ${a.answer}',
-                    style: const TextStyle(fontSize: 14, height: 1.6)),
-              ],
-            ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              for (final v in DigViewpoint.values)
+                ChoiceChip(
+                  label: Text(v.label),
+                  selected: _session.viewpoint == v,
+                  selectedColor: kAccent.withValues(alpha: 0.35),
+                  onSelected: (_) => _setViewpoint(v),
+                ),
+            ],
           ),
+        ),
+        const SizedBox(height: 8),
       ],
     );
   }
@@ -483,13 +449,13 @@ class _DigScreenState extends State<DigScreen> {
 /// v0.2: 掘り方スタイルも併記する（例: 「AIで深掘り中・友達モード」）。
 class _ModeBadge extends StatelessWidget {
   final DigModeKind kind;
-  final DigStyle style;
-  const _ModeBadge({required this.kind, required this.style});
+  const _ModeBadge({required this.kind});
 
   @override
   Widget build(BuildContext context) {
     final isAi = kind.isAi;
-    final fullLabel = '${kind.label}・${style.label}';
+    // v0.2.1 ノイズ削減 N5: 掘り方は選択中チップが正本。バッジはAI／定型だけ。
+    final fullLabel = kind.label;
     return Semantics(
       container: true,
       label: '現在のモード: $fullLabel',
