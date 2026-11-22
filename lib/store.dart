@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'ai_backend.dart';
 import 'app_config.dart';
+import 'on_device_backend.dart';
 import 'dig_mode.dart';
 import 'models.dart';
 
@@ -134,9 +135,12 @@ class IdeaStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 現在の設定でバックエンドを組む。キー未設定ならローカルのみ。
+  /// 現在の設定でバックエンドを組む。
+  /// v0.3.0 PoC: 優先順は オンデバイス → Gemini（キーがある場合）→ 定型。
   ResilientBackend backend() {
-    if (apiKey.isEmpty) return ResilientBackend(null);
-    return ResilientBackend(GeminiBackend(apiKey: apiKey, model: model));
+    return ResilientBackend(
+      apiKey.isEmpty ? null : GeminiBackend(apiKey: apiKey, model: model),
+      onDevice: OnDeviceBackend(),
+    );
   }
 }

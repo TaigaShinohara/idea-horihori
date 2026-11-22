@@ -10,7 +10,7 @@ import 'name_candidates.dart';
 import 'prompts.dart';
 
 /// 応答がどこから来たか（K1: モード開示のために画面へ伝える）。
-enum AnswerSource { remote, local }
+enum AnswerSource { onDevice, remote, local }
 
 /// AIバックエンドの抽象化。v1の既定は Gemini、差し替え口だけ用意する。
 /// v0.2: 掘り方スタイル／視点／逆張り指定と、名前候補の取得口を追加。
@@ -203,8 +203,11 @@ class LocalBackend implements AiBackend {
 /// 同じインスタンスを保持し、呼び出しのたびにこの値でモード表示を更新する。
 class ResilientBackend implements AiBackend {
   final AiBackend? remote;
+
+  /// v0.3.0 PoC: オンデバイスAI。最優先で試し、失敗したら次へ倒す。
+  final AiBackend? onDevice;
   final LocalBackend local = LocalBackend();
-  ResilientBackend(this.remote);
+  ResilientBackend(this.remote, {this.onDevice});
 
   /// 直近の呼び出し（質問・まとめ共通）の応答元。未呼び出しなら null。
   AnswerSource? lastSource;
@@ -212,6 +215,54 @@ class ResilientBackend implements AiBackend {
   /// 直近の呼び出しでリモートが失敗しローカルへ倒れたか。
   /// キー未設定で最初からローカルの場合は false。
   bool lastRemoteFailed = false;
+
+  /// 直近の呼び出しでオンデバイスが失敗し次へ倒れたか（v0.3.0 PoC）。
+  bool lastOnDeviceFailed = false;
+
+  /// 現在のモード表示（DigScreen のバッジ用）。
+  DigModeKind get currentModeKind {
+    final s = lastSource;
+    if (s == AnswerSource.onDevice) return DigModeKind.onDevice;
+    if (s == AnswerSource.remote) return DigModeKind.ai;
+    if (s == AnswerSource.local &&
+        (lastOnDeviceFailed || lastRemoteFailed)) {
+      return DigModeKind.templateFailed;
+    }
+    if (s == AnswerSource.local) return DigModeKind.templateNoKey;
+    // 未呼び出し: 最優先の候補を表示する。
+    if (onDevice != null) return DigModeKind.onDevice;
+    if (remote != null) return DigModeKind.ai;
+    return DigModeKind.templateNoKey;
+  }
+
+  /// 候補を優先順（オンデバイス→リモート→ローカル）で試す共通処理。
+  Future<T> _run<T>(
+    Future<T> Function(AiBackend backend) op,
+    Future<T> Function() localOp,
+  ) async {
+    lastOnDeviceFailed = false;
+    lastRemoteFailed = false;
+    if (onDevice != null) {
+      try {
+        final r = await op(onDevice!);
+        lastSource = AnswerSource.onDevice;
+        return r;
+      } catch (_) {
+        lastOnDeviceFailed = true;
+      }
+    }
+    if (remote != null) {
+      try {
+        final r = await op(remote!);
+        lastSource = AnswerSource.remote;
+        return r;
+      } catch (_) {
+        lastRemoteFailed = true;
+      }
+    }
+    lastSource = AnswerSource.local;
+    return localOp();
+  }
 
   @override
   bool get isRemote => remote != null;
@@ -223,34 +274,22 @@ class ResilientBackend implements AiBackend {
     DigStyle style = DigStyle.friend,
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
-  }) async {
-    if (remote != null) {
-      try {
-        final q = await remote!.nextQuestion(
-          idea: idea,
-          history: history,
-          style: style,
-          viewpoint: viewpoint,
-          contrarianDue: contrarianDue,
-        );
-        lastSource = AnswerSource.remote;
-        lastRemoteFailed = false;
-        return q;
-      } catch (_) {
-        // オフライン・キー不正などはローカルへ倒すが、失敗した事実は残す。
-        lastSource = AnswerSource.local;
-        lastRemoteFailed = true;
-      }
-    } else {
-      lastSource = AnswerSource.local;
-      lastRemoteFailed = false;
-    }
-    return local.nextQuestion(
-      idea: idea,
-      history: history,
-      style: style,
-      viewpoint: viewpoint,
-      contrarianDue: contrarianDue,
+  }) {
+    return _run(
+      (b) => b.nextQuestion(
+        idea: idea,
+        history: history,
+        style: style,
+        viewpoint: viewpoint,
+        contrarianDue: contrarianDue,
+      ),
+      () => local.nextQuestion(
+        idea: idea,
+        history: history,
+        style: style,
+        viewpoint: viewpoint,
+        contrarianDue: contrarianDue,
+      ),
     );
   }
 
@@ -260,50 +299,28 @@ class ResilientBackend implements AiBackend {
     required List<QaEntry> history,
     required int version,
     DigStyle style = DigStyle.friend,
-  }) async {
-    if (remote != null) {
-      try {
-        final memo = await remote!.summarize(
-          idea: idea,
-          history: history,
-          version: version,
-          style: style,
-        );
-        lastSource = AnswerSource.remote;
-        lastRemoteFailed = false;
-        return memo;
-      } catch (_) {
-        lastSource = AnswerSource.local;
-        lastRemoteFailed = true;
-      }
-    } else {
-      lastSource = AnswerSource.local;
-      lastRemoteFailed = false;
-    }
-    return local.summarize(
-      idea: idea,
-      history: history,
-      version: version,
-      style: style,
+  }) {
+    return _run(
+      (b) => b.summarize(
+        idea: idea,
+        history: history,
+        version: version,
+        style: style,
+      ),
+      () => local.summarize(
+        idea: idea,
+        history: history,
+        version: version,
+        style: style,
+      ),
     );
   }
 
   @override
-  Future<List<String>> nameCandidates({required Idea idea}) async {
-    if (remote != null) {
-      try {
-        final names = await remote!.nameCandidates(idea: idea);
-        lastSource = AnswerSource.remote;
-        lastRemoteFailed = false;
-        return names;
-      } catch (_) {
-        lastSource = AnswerSource.local;
-        lastRemoteFailed = true;
-      }
-    } else {
-      lastSource = AnswerSource.local;
-      lastRemoteFailed = false;
-    }
-    return local.nameCandidates(idea: idea);
+  Future<List<String>> nameCandidates({required Idea idea}) {
+    return _run(
+      (b) => b.nameCandidates(idea: idea),
+      () => local.nameCandidates(idea: idea),
+    );
   }
 }
