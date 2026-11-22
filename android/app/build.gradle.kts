@@ -26,7 +26,8 @@ android {
 
     defaultConfig {
         applicationId = "com.taigashinohara.horihori"
-        minSdk = flutter.minSdkVersion
+        // v0.3.0: flutter_device_ai（ML Kit GenAI）が API 26 を要求するため引き上げ。
+        minSdk = 26
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

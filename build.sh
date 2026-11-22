@@ -33,5 +33,11 @@ if ! curl -s -o /dev/null --max-time 3 http://127.0.0.1:18081/flutterio/; then
   (cd .local && nohup python3 flutterio_mirror.py > /tmp/flutterio-mirror.log 2>&1 &)
   sleep 1
 fi
+# v0.3.0: sync version from pubspec.yaml into android/local.properties.
+# Gradle-direct builds do not regenerate it, and a stale file silently
+# ships the old versionName/versionCode (happened on the first v0.3.0 build).
+VER=$(grep -E '^version:' pubspec.yaml | sed -E 's/version: *([0-9.]+)\+([0-9]+).*/\1 \2/')
+VNAME=$(echo $VER | cut -d' ' -f1); VCODE=$(echo $VER | cut -d' ' -f2)
+sed -i -E "s/^flutter.versionName=.*/flutter.versionName=$VNAME/; s/^flutter.versionCode=.*/flutter.versionCode=$VCODE/" android/local.properties
 G="$GRADLE_USER_HOME/wrapper/dists/gradle-9.3.1-all/9ot9r568e8zfvvd4mn8rbu1j0/gradle-9.3.1/bin/gradle"
 cd android && "$G" assembleRelease --max-workers=1 "$@"
