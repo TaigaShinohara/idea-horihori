@@ -83,7 +83,6 @@ class HomeScreen extends StatelessWidget {
             }
             final ideas = store.visibleIdeas;
             if (ideas.isEmpty) {
-              final archivedCount = store.archivedIdeas.length;
               return Center(
                 child: Padding(
                   padding: const EdgeInsets.all(32),
@@ -97,14 +96,6 @@ class HomeScreen extends StatelessWidget {
                         style: Theme.of(context).textTheme.titleMedium,
                         textAlign: TextAlign.center,
                       ),
-                      if (archivedCount > 0) ...[
-                        const SizedBox(height: 12),
-                        Text(
-                          'アーカイブが$archivedCount件あるよ。右上の📦から戻せるよ',
-                          style: Theme.of(context).textTheme.bodyMedium,
-                          textAlign: TextAlign.center,
-                        ),
-                      ],
                     ],
                   ),
                 ),

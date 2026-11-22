@@ -46,45 +46,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Text('Gemini APIキー（BYOK）',
+                  const Text('Gemini APIキー',
                       style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 6),
                   const Text(
-                    '自分のキーを入れるとAIが質問します。空でも定型の質問で深掘りできます。キーはこの端末の中だけに保存されます。',
+                    '入れるとAIが質問する。空でも定型で掘れる。キーは端末内だけに保存。',
                     style: TextStyle(fontSize: 13, height: 1.6),
                   ),
                   const SizedBox(height: 6),
                   const Text(
                     'キーは Google AI Studio（aistudio.google.com）で無料で作れます。',
                     style: TextStyle(fontSize: 13, height: 1.6),
-                  ),
-                  const SizedBox(height: 10),
-                  // K1: 現在の有効状態（AI有効／定型モード）を常時見せる。
-                  AnimatedBuilder(
-                    animation: widget.store,
-                    builder: (context, _) {
-                      final ai = widget.store.hasRemoteKey;
-                      return Row(
-                        children: [
-                          Icon(
-                            ai ? Icons.auto_awesome : Icons.list_alt_outlined,
-                            size: 16,
-                            color: kAccentDeep,
-                          ),
-                          const SizedBox(width: 6),
-                          Text(
-                            ai
-                                ? '現在の状態：AI有効（Gemini）'
-                                : '現在の状態：定型モード（キー未設定）',
-                            style: const TextStyle(
-                              fontSize: 13,
-                              fontWeight: FontWeight.bold,
-                              color: kAccentDeep,
-                            ),
-                          ),
-                        ],
-                      );
-                    },
                   ),
                   const SizedBox(height: 12),
                   TextField(
@@ -108,21 +80,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                     ),
                   ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _modelCtrl,
-                    autocorrect: false,
-                    enableSuggestions: false,
-                    decoration: InputDecoration(
-                      labelText: 'モデル名',
-                      hintText: AppConfig.defaultGeminiModel,
-                      filled: true,
-                      fillColor: glassInputFill(context),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(14),
-                        borderSide: BorderSide.none,
+                  // v0.2.1 ノイズ削減: モデル名は通常変更不要の支援項目 → 畳む。
+                  ExpansionTile(
+                    tilePadding: EdgeInsets.zero,
+                    title: const Text('詳細', style: TextStyle(fontSize: 13)),
+                    children: [
+                      TextField(
+                        controller: _modelCtrl,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        decoration: InputDecoration(
+                          labelText: 'モデル名',
+                          hintText: AppConfig.defaultGeminiModel,
+                          filled: true,
+                          fillColor: glassInputFill(context),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
                       ),
-                    ),
+                      const SizedBox(height: 8),
+                    ],
                   ),
                   const SizedBox(height: 14),
                   FilledButton(

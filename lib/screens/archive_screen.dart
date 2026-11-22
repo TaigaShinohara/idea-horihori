@@ -69,19 +69,11 @@ class _ArchivedCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              StageBadge(stage: idea.stage, emojiSize: 22),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  idea.title,
-                  style: const TextStyle(
-                      fontSize: 16, height: 1.5, fontWeight: FontWeight.w600),
-                ),
-              ),
-            ],
+          // v0.2.1 ノイズ削減 N13: 戻す／消すの判断に成長段階は要らない。
+          Text(
+            idea.title,
+            style: const TextStyle(
+                fontSize: 16, height: 1.5, fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 10),
           Row(
