@@ -3,24 +3,34 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'app_config.dart';
+import 'dig_mode.dart';
 import 'fallback.dart';
 import 'models.dart';
+import 'name_candidates.dart';
 import 'prompts.dart';
 
 /// 応答がどこから来たか（K1: モード開示のために画面へ伝える）。
 enum AnswerSource { remote, local }
 
 /// AIバックエンドの抽象化。v1の既定は Gemini、差し替え口だけ用意する。
+/// v0.2: 掘り方スタイル／視点／逆張り指定と、名前候補の取得口を追加。
 abstract class AiBackend {
   Future<DigQuestion> nextQuestion({
     required Idea idea,
     required List<QaEntry> history,
+    DigStyle style = DigStyle.friend,
+    DigViewpoint viewpoint = DigViewpoint.none,
+    bool contrarianDue = false,
   });
   Future<PlanMemo> summarize({
     required Idea idea,
     required List<QaEntry> history,
     required int version,
+    DigStyle style = DigStyle.friend,
   });
+
+  /// 名前候補を必ず3件返す（項目6）。
+  Future<List<String>> nameCandidates({required Idea idea});
   bool get isRemote;
 }
 
@@ -77,16 +87,23 @@ class GeminiBackend implements AiBackend {
   Future<DigQuestion> nextQuestion({
     required Idea idea,
     required List<QaEntry> history,
+    DigStyle style = DigStyle.friend,
+    DigViewpoint viewpoint = DigViewpoint.none,
+    bool contrarianDue = false,
   }) async {
     final text = await _generate(Prompts.nextQuestion(
       title: idea.title,
       note: idea.note,
       history: history,
       latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
+      style: style,
+      viewpoint: viewpoint,
+      contrarian: contrarianDue,
     ));
     final q = Prompts.parseQuestion(text);
     if (q == null) throw Exception('Gemini API: unparsable question');
-    return q;
+    // 逆張りとして出させた質問には印を付けて返す（取り消し時の復元用）。
+    return contrarianDue ? q.copyWith(isContrarian: true) : q;
   }
 
   @override
@@ -94,15 +111,29 @@ class GeminiBackend implements AiBackend {
     required Idea idea,
     required List<QaEntry> history,
     required int version,
+    DigStyle style = DigStyle.friend,
   }) async {
     final text = await _generate(Prompts.summarize(
       title: idea.title,
       history: history,
       latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
+      style: style,
     ));
     final memo = Prompts.parseMemo(text, version: version);
     if (memo == null) throw Exception('Gemini API: unparsable memo');
     return memo;
+  }
+
+  @override
+  Future<List<String>> nameCandidates({required Idea idea}) async {
+    if (idea.memos.isEmpty) throw Exception('Gemini API: no memo');
+    final text = await _generate(Prompts.nameCandidates(
+      title: idea.title,
+      memo: idea.memos.last,
+    ));
+    final names = Prompts.parseNameCandidates(text);
+    if (names.length < 3) throw Exception('Gemini API: unparsable names');
+    return names;
   }
 }
 
@@ -116,17 +147,29 @@ class LocalBackend implements AiBackend {
   Future<DigQuestion> nextQuestion({
     required Idea idea,
     required List<QaEntry> history,
+    DigStyle style = DigStyle.friend,
+    DigViewpoint viewpoint = DigViewpoint.none,
+    bool contrarianDue = false,
   }) async {
+    // 逆張り（項目3）: 指定があり、まだ出していなければ固定文を出す（1回だけ）。
+    if (contrarianDue && !history.any((a) => a.contrarian)) {
+      return FallbackQuestions.contrarianQuestion;
+    }
     // 既出の定型質問は飛ばし、次の未出題を出す。
     for (final q in FallbackQuestions.questions) {
-      if (!history.any((a) => a.questionId == q.id)) return q;
+      if (!history.any((a) => a.questionId == q.id)) {
+        return FallbackQuestions.styled(q, style);
+      }
     }
     // 定型を使い切ったら汎用の広げ質問を出す。
     final n = history.length + 1;
-    return DigQuestion(
-      id: 'extra$n',
-      text: '「${idea.title}」で、まだ決まっていない大事なことは？',
-      choices: ['使う場面をもっと具体的に', '一番の売りを決める', '似たものとの違いを決める'],
+    return FallbackQuestions.styled(
+      DigQuestion(
+        id: 'extra$n',
+        text: '「${idea.title}」で、まだ決まっていない大事なことは？',
+        choices: ['使う場面をもっと具体的に', '一番の売りを決める', '似たものとの違いを決める'],
+      ),
+      style,
     );
   }
 
@@ -135,11 +178,20 @@ class LocalBackend implements AiBackend {
     required Idea idea,
     required List<QaEntry> history,
     required int version,
+    DigStyle style = DigStyle.friend,
   }) async {
     return LocalMemoBuilder.build(
       title: idea.title,
       answers: history,
       version: version,
+    );
+  }
+
+  @override
+  Future<List<String>> nameCandidates({required Idea idea}) async {
+    return LocalNameCandidates.generate(
+      title: idea.title,
+      memo: idea.memos.isEmpty ? null : idea.memos.last,
     );
   }
 }
@@ -168,10 +220,19 @@ class ResilientBackend implements AiBackend {
   Future<DigQuestion> nextQuestion({
     required Idea idea,
     required List<QaEntry> history,
+    DigStyle style = DigStyle.friend,
+    DigViewpoint viewpoint = DigViewpoint.none,
+    bool contrarianDue = false,
   }) async {
     if (remote != null) {
       try {
-        final q = await remote!.nextQuestion(idea: idea, history: history);
+        final q = await remote!.nextQuestion(
+          idea: idea,
+          history: history,
+          style: style,
+          viewpoint: viewpoint,
+          contrarianDue: contrarianDue,
+        );
         lastSource = AnswerSource.remote;
         lastRemoteFailed = false;
         return q;
@@ -184,7 +245,13 @@ class ResilientBackend implements AiBackend {
       lastSource = AnswerSource.local;
       lastRemoteFailed = false;
     }
-    return local.nextQuestion(idea: idea, history: history);
+    return local.nextQuestion(
+      idea: idea,
+      history: history,
+      style: style,
+      viewpoint: viewpoint,
+      contrarianDue: contrarianDue,
+    );
   }
 
   @override
@@ -192,11 +259,16 @@ class ResilientBackend implements AiBackend {
     required Idea idea,
     required List<QaEntry> history,
     required int version,
+    DigStyle style = DigStyle.friend,
   }) async {
     if (remote != null) {
       try {
-        final memo =
-            await remote!.summarize(idea: idea, history: history, version: version);
+        final memo = await remote!.summarize(
+          idea: idea,
+          history: history,
+          version: version,
+          style: style,
+        );
         lastSource = AnswerSource.remote;
         lastRemoteFailed = false;
         return memo;
@@ -208,6 +280,30 @@ class ResilientBackend implements AiBackend {
       lastSource = AnswerSource.local;
       lastRemoteFailed = false;
     }
-    return local.summarize(idea: idea, history: history, version: version);
+    return local.summarize(
+      idea: idea,
+      history: history,
+      version: version,
+      style: style,
+    );
+  }
+
+  @override
+  Future<List<String>> nameCandidates({required Idea idea}) async {
+    if (remote != null) {
+      try {
+        final names = await remote!.nameCandidates(idea: idea);
+        lastSource = AnswerSource.remote;
+        lastRemoteFailed = false;
+        return names;
+      } catch (_) {
+        lastSource = AnswerSource.local;
+        lastRemoteFailed = true;
+      }
+    } else {
+      lastSource = AnswerSource.local;
+      lastRemoteFailed = false;
+    }
+    return local.nameCandidates(idea: idea);
   }
 }

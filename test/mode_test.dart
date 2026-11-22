@@ -28,9 +28,18 @@ class _FakeRemote implements AiBackend {
   Future<DigQuestion> nextQuestion({
     required Idea idea,
     required List<QaEntry> history,
+    DigStyle style = DigStyle.friend,
+    DigViewpoint viewpoint = DigViewpoint.none,
+    bool contrarianDue = false,
   }) async {
     if (fail) throw Exception('network down');
     return const DigQuestion(id: 'ai1', text: 'AIの質問', choices: ['a', 'b', 'c']);
+  }
+
+  @override
+  Future<List<String>> nameCandidates({required Idea idea}) async {
+    if (fail) throw Exception('network down');
+    return ['候補1', '候補2', '候補3'];
   }
 
   @override
@@ -38,6 +47,7 @@ class _FakeRemote implements AiBackend {
     required Idea idea,
     required List<QaEntry> history,
     required int version,
+    DigStyle style = DigStyle.friend,
   }) async {
     if (fail) throw Exception('network down');
     return PlanMemo(
