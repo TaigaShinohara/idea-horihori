@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'dig_mode.dart';
 import 'models.dart';
 
 /// Gemini へ渡すプロンプト生成と、応答JSONの解釈（純ロジック寄り）。
@@ -10,17 +11,27 @@ class Prompts {
   }
 
   /// 次の質問を1つだけJSONで返させるプロンプト。
+  /// [style] で掘り方（友達／上司）、[viewpoint] で視点掘り、
+  /// [contrarian] が true のときは逆張り質問にする（v0.2 項目1〜3）。
   static String nextQuestion({
     required String title,
     String note = '',
     required List<QaEntry> history,
     PlanMemo? latestMemo,
+    DigStyle style = DigStyle.friend,
+    DigViewpoint viewpoint = DigViewpoint.none,
+    bool contrarian = false,
   }) {
     final memoPart = latestMemo == null
         ? ''
         : '\n前回までの企画メモ:\nWhat: ${latestMemo.what}\n誰に: ${latestMemo.who}\nなぜ: ${latestMemo.why}\nどうやって: ${latestMemo.how}\n次の一歩: ${latestMemo.nextStep}\n';
+    final viewpointLine =
+        viewpoint.promptLine == null ? '' : '\n${viewpoint.promptLine}こと。';
+    final contrarianLine = contrarian
+        ? '\n今回は逆張りとして、このアイデアが失敗するとしたら何が原因かを聞く質問にすること。'
+        : '';
     return '''
-あなたはアプリのアイデアを深掘りするインタビュアーです。
+あなたはアプリのアイデアを深掘りするインタビュアーです。あなたの役割: ${style.personaPrompt}
 アイデア: 「$title」${note.isEmpty ? '' : '\nメモ: $note'}$memoPart
 これまでのやりとり:
 ${_historyText(history)}
@@ -28,26 +39,57 @@ ${_historyText(history)}
 次に聞く質問を「1つだけ」考えてください。条件:
 - 企画を具体化するために今いちばん効く質問にする
 - 回答の選択肢をちょうど3つ作る。3つ目は発想を広げる選択肢にする
-- 質問も選択肢も短く、日本語で
+- 質問も選択肢も短く、日本語で$viewpointLine$contrarianLine
 出力はJSONのみ（コードフェンス禁止）:
 {"id":"q${history.length + 1}","text":"質問文","choices":["選択肢1","選択肢2","選択肢3"]}
 ''';
   }
 
   /// 回答群を企画メモの型に整理させるプロンプト。
+  /// 出力には体力測定（ease/spark、各1〜3）も含める（v0.2 項目4）。
   static String summarize({
     required String title,
     required List<QaEntry> history,
     PlanMemo? latestMemo,
+    DigStyle style = DigStyle.friend,
   }) {
     return '''
-アプリのアイデア「$title」について、以下のQ&Aをもとに企画メモを整理してください。
+アプリのアイデア「$title」について、以下のQ&Aをもとに企画メモを整理してください。あなたの役割: ${style.personaPrompt}
 ${_historyText(history)}
 ${latestMemo == null ? '' : '前回のメモ（改善してよい）: What: ${latestMemo.what} / 誰に: ${latestMemo.who} / なぜ: ${latestMemo.why} / どうやって: ${latestMemo.how} / 次の一歩: ${latestMemo.nextStep}'}
 各項目は1〜2文の日本語で、Q&Aに無いことは盛らないでください。
+あわせて体力測定として、作りやすさ ease とワクワク度 spark をそれぞれ1〜3の整数で付けてください。
 出力はJSONのみ（コードフェンス禁止）:
-{"what":"何を作るか","who":"誰のためか","why":"どんな困りごとを解くか","how":"どうやって助けるか","nextStep":"次の一歩"}
+{"what":"何を作るか","who":"誰のためか","why":"どんな困りごとを解くか","how":"どうやって助けるか","nextStep":"次の一歩","ease":2,"spark":3}
 ''';
+  }
+
+  /// 名前候補を3つ返させるプロンプト（v0.2 項目6）。
+  static String nameCandidates({required String title, required PlanMemo memo}) {
+    return '''
+アプリのアイデア「$title」の企画メモ:
+What: ${memo.what}
+誰に: ${memo.who}
+なぜ: ${memo.why}
+どうやって: ${memo.how}
+
+このアプリの名前の候補をちょうど3つ考えてください。条件:
+- 短く、呼びやすく、覚えやすいこと
+- 日本語／英語の混在可
+出力はJSONのみ（コードフェンス禁止）:
+{"candidates":["候補1","候補2","候補3"]}
+''';
+  }
+
+  /// 名前候補の応答JSONを解釈する。取れた分だけ返す（最大3件）。
+  static List<String> parseNameCandidates(String text) {
+    final j = extractJson(text);
+    if (j == null) return [];
+    return (j['candidates'] as List? ?? [])
+        .map((e) => e.toString().trim())
+        .where((s) => s.isNotEmpty)
+        .take(3)
+        .toList();
   }
 
   /// 応答テキストからJSONオブジェクトを取り出す（フェンス混入に耐える）。
@@ -98,6 +140,9 @@ ${latestMemo == null ? '' : '前回のメモ（改善してよい）: What: ${la
       nextStep: v('nextStep').isEmpty ? '続きを深掘りする' : v('nextStep'),
       createdAt: now ?? DateTime.now(),
       version: version,
+      // 体力測定: 範囲外・欠落は null（表示なし）に倒す。
+      ease: fitnessValueOrNull(j['ease']),
+      spark: fitnessValueOrNull(j['spark']),
     );
   }
 }

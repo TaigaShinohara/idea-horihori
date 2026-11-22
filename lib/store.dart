@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'ai_backend.dart';
 import 'app_config.dart';
+import 'dig_mode.dart';
 import 'models.dart';
 
 /// 端末内のみの保存（SharedPreferences に JSON）。アカウント・同期なし。
@@ -18,11 +19,16 @@ class IdeaStore extends ChangeNotifier {
   /// K3: キー未設定時の初回案内を出したかどうか（1回だけ出す）。
   bool keyGuideShown = false;
 
+  /// 掘り方スタイル（v0.2 項目1）。既定は友達モード。再起動後も保持する。
+  DigStyle digStyle = DigStyle.friend;
+
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     apiKey = prefs.getString(AppConfig.prefsApiKeyKey) ?? '';
     model = prefs.getString(AppConfig.prefsModelKey) ?? AppConfig.defaultGeminiModel;
     keyGuideShown = prefs.getBool(AppConfig.prefsKeyGuideShownKey) ?? false;
+    digStyle =
+        DigStyleX.fromStorage(prefs.getString(AppConfig.prefsDigStyleKey));
     final raw = prefs.getString(AppConfig.prefsIdeasKey);
     if (raw != null && raw.isNotEmpty) {
       try {
@@ -103,6 +109,14 @@ class IdeaStore extends ChangeNotifier {
     keyGuideShown = true;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(AppConfig.prefsKeyGuideShownKey, true);
+    notifyListeners();
+  }
+
+  /// 掘り方スタイルを保存する（v0.2 項目1）。
+  Future<void> saveDigStyle(DigStyle style) async {
+    digStyle = style;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(AppConfig.prefsDigStyleKey, style.storageValue);
     notifyListeners();
   }
 

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models.dart';
 import '../store.dart';
 import '../widgets/glass.dart';
+import 'dev_brief_screen.dart';
 import 'dig_screen.dart';
 
 /// S4 アイデア詳細＝企画メモ。メモは版として積まれ、古い版も見返せる。
@@ -34,6 +35,108 @@ class _DetailScreenState extends State<DetailScreen> {
 
   IdeaStore get store => widget.store;
   Idea get idea => widget.idea;
+
+  /// タイトル・メモの編集（v0.2 項目8）。空タイトルは保存不可。
+  Future<void> _editIdea(BuildContext context) async {
+    final titleCtrl = TextEditingController(text: idea.title);
+    final noteCtrl = TextEditingController(text: idea.note);
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (dialogCtx, setDialogState) => AlertDialog(
+          title: const Text('タイトルとメモを編集'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: titleCtrl,
+                autofocus: true,
+                decoration: const InputDecoration(labelText: 'タイトル'),
+                onChanged: (_) => setDialogState(() {}),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: noteCtrl,
+                maxLines: 3,
+                decoration: const InputDecoration(labelText: 'メモ'),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogCtx, false),
+              child: const Text('キャンセル'),
+            ),
+            TextButton(
+              onPressed: titleCtrl.text.trim().isEmpty
+                  ? null
+                  : () => Navigator.pop(dialogCtx, true),
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (saved != true || !context.mounted) return;
+    idea.title = titleCtrl.text.trim();
+    idea.note = noteCtrl.text.trim();
+    await store.updateIdea(idea);
+    if (mounted) setState(() {});
+  }
+
+  /// 名前候補を出す（v0.2 項目6）。表示のみで、名前は勝手に変えない。
+  Future<void> _showNameCandidates(BuildContext context) async {
+    final backend = store.backend();
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetCtx) => FutureBuilder<List<String>>(
+        future: backend.nameCandidates(idea: idea),
+        builder: (sheetCtx, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const SizedBox(
+              height: 160,
+              child: Center(child: CircularProgressIndicator()),
+            );
+          }
+          final names = snapshot.data ?? const <String>[];
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '名前の候補',
+                    style:
+                        TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 10),
+                  if (names.isEmpty)
+                    const Text('候補が出せなかったよ')
+                  else
+                    for (final name in names)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.lightbulb_outline,
+                                size: 18, color: kAccentDeep),
+                            const SizedBox(width: 8),
+                            Text(name,
+                                style: const TextStyle(
+                                    fontSize: 16, height: 1.5)),
+                          ],
+                        ),
+                      ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
 
   Future<void> _openDig() async {
     final completed = await Navigator.push<bool>(
@@ -91,6 +194,11 @@ class _DetailScreenState extends State<DetailScreen> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.edit_outlined),
+            tooltip: 'タイトルとメモを編集',
+            onPressed: () => _editIdea(context),
+          ),
           IconButton(
             icon: const Icon(Icons.archive_outlined),
             tooltip: 'アーカイブ',
@@ -180,6 +288,47 @@ class _DetailScreenState extends State<DetailScreen> {
                     icon: const Icon(Icons.terrain, size: 19),
                     label: const Text('もっと深掘り'),
                   ),
+                  const SizedBox(height: 10),
+                  // v0.2 項目5・6: メモがある時だけ出せる書き出し／名前候補。
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: () => Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => DevBriefScreen(idea: idea),
+                            ),
+                          ),
+                          icon: const Icon(Icons.description_outlined,
+                              size: 18),
+                          label: const Text('指示書を書き出す'),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: () => _showNameCandidates(context),
+                          icon: const Icon(Icons.badge_outlined, size: 18),
+                          label: const Text('名前候補を出す'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (idea.sessions.any((s) => s.answers.isNotEmpty)) ...[
+                    const SizedBox(height: 20),
+                    const Text(
+                      '深掘りの記録',
+                      style:
+                          TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    for (final session in idea.sessions)
+                      if (session.answers.isNotEmpty) ...[
+                        _SessionHistoryTile(session: session),
+                        const SizedBox(height: 10),
+                      ],
+                  ],
                   if (older.isNotEmpty) ...[
                     const SizedBox(height: 20),
                     const Text(
@@ -255,6 +404,93 @@ class _MemoView extends StatelessWidget {
                   fontSize: 13, fontWeight: FontWeight.bold, color: kAccentDeep)),
           const SizedBox(height: 10),
           _MemoBody(memo: memo),
+          // 体力測定（項目4）: 値がある時だけ、末尾に静かに1行添える。
+          if (memo.hasFitness) ...[
+            const SizedBox(height: 12),
+            Text(
+              [
+                if (memo.ease != null)
+                  '作りやすさ ${fitnessDots(memo.ease!)}',
+                if (memo.spark != null)
+                  'ワクワク度 ${fitnessDots(memo.spark!)}',
+              ].join(' ／ '),
+              style: const TextStyle(fontSize: 13, color: kAccentDeep),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// 深掘りの記録（項目7）: セッションごとの折りたたみ。開始日＋Q→A を時系列で出す。
+class _SessionHistoryTile extends StatefulWidget {
+  final DigSession session;
+  const _SessionHistoryTile({required this.session});
+
+  @override
+  State<_SessionHistoryTile> createState() => _SessionHistoryTileState();
+}
+
+class _SessionHistoryTileState extends State<_SessionHistoryTile> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final s = widget.session;
+    final d = s.startedAt;
+    return GlassCard(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '${d.year}/${d.month}/${d.day} の深掘り（${s.answers.length}問）',
+                      style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          color: kAccentDeep),
+                    ),
+                  ),
+                  Icon(_expanded ? Icons.expand_less : Icons.expand_more,
+                      size: 20),
+                ],
+              ),
+            ),
+          ),
+          if (_expanded)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  for (final a in s.answers)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Q: ${a.question}',
+                              style: const TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.bold,
+                                  height: 1.5)),
+                          Text('A: ${a.answer}',
+                              style:
+                                  const TextStyle(fontSize: 14, height: 1.6)),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
         ],
       ),
     );

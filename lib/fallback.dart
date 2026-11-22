@@ -1,3 +1,4 @@
+import 'dig_mode.dart';
 import 'models.dart';
 
 /// APIキー未設定／オフラインでも深掘りが成立するための
@@ -36,6 +37,36 @@ class FallbackQuestions {
   static DigQuestion? nextAfter(int answeredCount) {
     if (answeredCount < 0 || answeredCount >= questions.length) return null;
     return questions[answeredCount];
+  }
+
+  /// 逆張り質問の固定文（v0.2 項目3）。セッションの4問目に出す。
+  static const DigQuestion contrarianQuestion = DigQuestion(
+    id: 'contrarian',
+    text: 'このアイデアが失敗するとしたら、何が原因だと思う？',
+    choices: ['需要がない', '作りきれない', '続けられない'],
+    isContrarian: true,
+  );
+
+  /// 上司モード用の前置き（v0.2 項目1）。質問の骨格と選択肢は共通で、
+  /// boss のときだけ各質問の前置きを詰める調子に差し替える。
+  static const Map<String, String> _bossPrefixes = {
+    'who': '対象をはっきりさせよう。',
+    'why': '甘くないか、確認する。',
+    'what': '形を決めよう。',
+    'how': '実現方法を詰めよう。',
+    'next': '次の一手を決めよう。',
+  };
+
+  /// スタイルに合わせて質問を返す。friend はそのまま、boss は前置きを付ける。
+  static DigQuestion styled(DigQuestion q, DigStyle style) {
+    if (style == DigStyle.friend) return q;
+    final prefix = _bossPrefixes[q.id] ?? '詰めよう。';
+    return DigQuestion(
+      id: q.id,
+      text: '$prefix${q.text}',
+      choices: q.choices,
+      isContrarian: q.isContrarian,
+    );
   }
 }
 
@@ -107,6 +138,19 @@ class LocalMemoBuilder {
     final whatBase = form.isEmpty ? title : '「$title」— $formアプリ';
     final what = extras.isEmpty ? whatBase : '$whatBase。${extras.join('。')}';
 
+    // 体力測定（v0.2 項目4）の簡易ルール。単純で説明可能に保つ:
+    // - 作りやすさ ease: 「形（what）／どうやって（how）／次の一歩（next）」の
+    //   3欄のうち埋まった数（最低1）。作る道筋が見えるほど高い。
+    // - ワクワク度 spark: 1 +「誰に（who）」が埋まれば1 +「なぜ（why）」が
+    //   埋まれば1（最大3）。誰の何を解くかが見えるほど高い。
+    final buildSlots = ['what', 'how', 'next']
+        .where((id) => slot(id).isNotEmpty)
+        .length;
+    final ease = buildSlots == 0 ? 1 : buildSlots;
+    final spark = 1 +
+        (slot('who').isNotEmpty ? 1 : 0) +
+        (slot('why').isNotEmpty ? 1 : 0);
+
     return PlanMemo(
       what: what,
       who: slot('who').isEmpty ? '（まだ掘れていない）' : slot('who'),
@@ -115,6 +159,8 @@ class LocalMemoBuilder {
       nextStep: slot('next').isEmpty ? '続きを深掘りする' : slot('next'),
       createdAt: now ?? DateTime.now(),
       version: version,
+      ease: ease,
+      spark: spark,
     );
   }
 }

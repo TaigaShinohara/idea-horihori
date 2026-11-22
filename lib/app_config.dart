@@ -2,7 +2,7 @@
 class AppConfig {
   static const String appName = 'アイデアホリホリ'; // 2026-11-20 本人が確定（旧称ホリホリ）。IDは引き継ぎのため horihori のまま
   static const String appId = 'com.taigashinohara.horihori';
-  static const String version = '0.1.2';
+  static const String version = '0.2.0';
 
   /// Gemini の既定モデル。設定で差し替え可能な定数として一元管理。
   static const String defaultGeminiModel = 'gemini-2.0-flash';
@@ -18,4 +18,7 @@ class AppConfig {
   static const String prefsApiKeyKey = 'gemini_api_key';
   static const String prefsModelKey = 'gemini_model';
   static const String prefsKeyGuideShownKey = 'key_guide_shown_v1';
+
+  /// 掘り方スタイル（友達／上司）の保存キー（v0.2 項目1）。
+  static const String prefsDigStyleKey = 'dig_style_v1';
 }
