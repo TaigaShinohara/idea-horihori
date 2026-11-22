@@ -62,10 +62,7 @@ class _DigScreenState extends State<DigScreen> {
   void initState() {
     super.initState();
     _backend = widget.store.backend();
-    _modeKind = digModeKind(
-      hasKey: widget.store.hasRemoteKey,
-      remoteFailed: false,
-    );
+    _modeKind = _backend.currentModeKind;
     _session = idea.resumableSession ??
         DigSession(
           id: DateTime.now().microsecondsSinceEpoch.toString(),
@@ -88,23 +85,26 @@ class _DigScreenState extends State<DigScreen> {
   /// バックエンドの直近結果からモード表示を更新する（K1）。
   /// 定型（失敗）へ切り替わった瞬間に1回だけ通知する。
   void _syncMode({bool notify = true}) {
-    final kind = digModeKind(
-      hasKey: widget.store.hasRemoteKey,
-      remoteFailed: _backend.lastRemoteFailed,
-    );
+    final kind = _backend.currentModeKind;
     if (kind != _modeKind && mounted) {
       setState(() => _modeKind = kind);
     } else {
       _modeKind = kind;
     }
-    if (notify &&
-        kind == DigModeKind.templateFailed &&
-        _fallbackNotice.tryConsume() &&
-        mounted) {
+    // v0.3.0 PoC: オンデバイス→次候補への切替も、定型への切替と同じく
+    // セッションに1回だけ静かに知らせる。
+    final fellBack = kind == DigModeKind.templateFailed ||
+        (_backend.lastOnDeviceFailed && kind == DigModeKind.ai);
+    if (notify && fellBack && _fallbackNotice.tryConsume() && mounted) {
+      final msg = kind == DigModeKind.ai
+          ? 'オンデバイスAIが使えなかったので、AI（Gemini）に切り替えたよ'
+          : _backend.lastOnDeviceFailed && !widget.store.hasRemoteKey
+              ? 'オンデバイスAIが使えなかったので、定型の質問に切り替えたよ'
+              : 'AIにつながらなかったので、定型の質問に切り替えたよ';
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('AIにつながらなかったので、定型の質問に切り替えたよ'),
-          duration: Duration(seconds: 5),
+        SnackBar(
+          content: Text(msg),
+          duration: const Duration(seconds: 5),
         ),
       );
     }
@@ -112,7 +112,13 @@ class _DigScreenState extends State<DigScreen> {
 
   /// K3: キー未設定で深掘りを始めた時に1回だけ案内を出す。
   void _maybeShowKeyGuide() {
-    if (widget.store.hasRemoteKey || widget.store.keyGuideShown) return;
+    // v0.3.0 PoC: オンデバイスで掘れている間は案内しない。
+    // 定型に落ちた時だけ出す。
+    if (widget.store.hasRemoteKey ||
+        widget.store.keyGuideShown ||
+        _backend.lastSource != AnswerSource.local) {
+      return;
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
       await widget.store.markKeyGuideShown();

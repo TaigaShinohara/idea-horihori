@@ -4,6 +4,9 @@ library;
 
 /// 深掘りの現在モード。
 enum DigModeKind {
+  /// オンデバイスAI（Gemini Nano）が質問している（v0.3.0 PoC）。
+  onDevice,
+
   /// Gemini（AI）が質問している。
   ai,
 
@@ -91,12 +94,13 @@ extension DigViewpointX on DigViewpoint {
 extension DigModeKindX on DigModeKind {
   /// バッジに出す1行。
   String get label => switch (this) {
+        DigModeKind.onDevice => 'オンデバイスで深掘り中',
         DigModeKind.ai => 'AIで深掘り中',
         DigModeKind.templateNoKey => '定型モード（キー未設定）',
         DigModeKind.templateFailed => '定型モード（AIにつながらなかった）',
       };
 
-  bool get isAi => this == DigModeKind.ai;
+  bool get isAi => this == DigModeKind.ai || this == DigModeKind.onDevice;
 }
 
 /// 「1回だけ出す」ための消費フラグ（通知の出しすぎ防止）。
