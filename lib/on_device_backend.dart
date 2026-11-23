@@ -9,7 +9,7 @@ import 'prompts.dart';
 
 /// オンデバイスAI（Android: Gemini Nano / ML Kit GenAI Prompt API）の
 /// 状態。プラグインの型をアプリ側の言葉に寄せたもの（テスト差し替え用）。
-enum OnDeviceStatus { available, needsDownload, unavailable }
+enum OnDeviceStatus { available, needsDownload, unavailable, checkFailed }
 
 enum OnDeviceLifecycle {
   idle,
@@ -53,6 +53,8 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
       ModelFeatureStatus.downloadable ||
       ModelFeatureStatus.downloading =>
         OnDeviceStatus.needsDownload,
+      ModelFeatureStatus.unavailable when a.reason == AvailabilityReason.unknown =>
+        OnDeviceStatus.checkFailed,
       ModelFeatureStatus.unavailable => OnDeviceStatus.unavailable,
     };
     return OnDeviceCheck(status, a.message);
@@ -67,16 +69,17 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
             'on-device model download failed: ${event.errorMessage ?? ''}');
       }
     }
+    if ((await checkStatus()).status == OnDeviceStatus.available) return;
     throw Exception('on-device model download ended unexpectedly');
   }
 
   @override
   Future<String> generate(String prompt) async {
     final res = await _ai.generateText(
+      // プロンプト内に役割と出力形式がある。専用の systemInstruction は
+      // Nano V3 以降でしか使えないため、ここでは指定しない。
       prompt: prompt,
-      instructions: 'あなたはアプリのアイデアを深掘りするインタビュアーです。'
-          '指示された形式（JSONのみ）で、日本語で短く答えてください。',
-      config: const GenerationConfig(maxTokens: 512, temperature: 0.7),
+      config: const GenerationConfig(maxTokens: 512, temperature: 0.3),
     );
     return res.text;
   }
@@ -153,6 +156,7 @@ class OnDeviceBackend implements AiBackend {
           lastError = null;
           return;
         case OnDeviceStatus.unavailable:
+        case OnDeviceStatus.checkFailed:
           lifecycle = OnDeviceLifecycle.unavailable;
           throw OnDeviceException(check.message.isEmpty
               ? 'on-device AI unavailable on this device'
@@ -180,9 +184,19 @@ class OnDeviceBackend implements AiBackend {
     try {
       return await _client.checkStatus().timeout(statusTimeout);
     } catch (e) {
-      return OnDeviceCheck(OnDeviceStatus.unavailable, '確認に失敗: $e');
+      return OnDeviceCheck(OnDeviceStatus.checkFailed, e.toString());
     }
   }
+
+  /// 実際の質問生成を、利用者のアイデアに触れず端末AIだけで確認する。
+  Future<DigQuestion> verifyGeneration() => nextQuestion(
+        idea: Idea(
+          id: 'nano-check',
+          title: '近所の散歩コースを記録するアプリ',
+          createdAt: DateTime.now(),
+        ),
+        history: const [],
+      );
 
   void cancelPending() {
     lifecycle = OnDeviceLifecycle.cancelled;

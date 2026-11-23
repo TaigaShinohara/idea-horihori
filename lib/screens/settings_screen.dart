@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../app_config.dart';
+import '../models.dart';
 import '../on_device_backend.dart';
 import '../store.dart';
 import '../widgets/glass.dart';
@@ -26,22 +27,51 @@ class _SettingsScreenState extends State<SettingsScreen> {
   // v0.3.1: オンデバイスAIの診断表示。
   bool _checking = false;
   OnDeviceCheck? _diag;
+  final _nano = OnDeviceBackend();
+  bool _testingNano = false;
+  DigQuestion? _nanoQuestion;
+  String? _nanoError;
 
   Future<void> _runDiagnosis() async {
     setState(() => _checking = true);
-    final result = await OnDeviceBackend().diagnose();
+    final result = await _nano.diagnose();
     if (!mounted) return;
     setState(() {
       _checking = false;
       _diag = result;
+      _nanoQuestion = null;
+      _nanoError = null;
     });
   }
 
+  Future<void> _verifyNano() async {
+    setState(() {
+      _testingNano = true;
+      _nanoQuestion = null;
+      _nanoError = null;
+    });
+    try {
+      final question = await _nano.verifyGeneration();
+      if (!mounted) return;
+      setState(() {
+        _diag = const OnDeviceCheck(OnDeviceStatus.available);
+        _nanoQuestion = question;
+      });
+    } on OnDeviceException catch (error) {
+      if (mounted) setState(() => _nanoError = error.message);
+    } finally {
+      if (mounted) setState(() => _testingNano = false);
+    }
+  }
+
   String get _diagLabel => switch (_diag?.status) {
-        OnDeviceStatus.available => '使える状態です',
+        OnDeviceStatus.available => 'モデルの準備ができています',
         OnDeviceStatus.needsDownload =>
-          'モデルのダウンロードが必要です（初回の深掘りで自動で落とします）',
-        OnDeviceStatus.unavailable => 'この端末では使えない状態です',
+          'モデルの準備が必要です。「Nanoで質問を試す」で準備を始めます。',
+        OnDeviceStatus.unavailable =>
+          '現在は利用できません。Android AICoreの更新を確認してください。',
+        OnDeviceStatus.checkFailed =>
+          'AICoreの状態を確認できませんでした。少し待って再確認してください。',
         null => '',
       };
 
@@ -198,13 +228,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 6),
                   const Text(
-                    '端末の中のAIで深掘りする機能。使えない時は理由を確認できます。',
+                    '対応するAndroidではGemini Nanoを優先します。'
+                    'サンプル質問で端末内の生成を確認できます。',
                     style: TextStyle(fontSize: 13, height: 1.6),
                   ),
                   const SizedBox(height: 12),
                   OutlinedButton(
-                    onPressed: _checking ? null : _runDiagnosis,
+                    onPressed: _checking || _testingNano ? null : _runDiagnosis,
                     child: Text(_checking ? '確認中…' : '状態を確認する'),
+                  ),
+                  OutlinedButton(
+                    onPressed: _checking || _testingNano ? null : _verifyNano,
+                    child: Text(
+                      _testingNano ? 'モデルを準備・生成中…' : 'Nanoで質問を試す',
+                    ),
                   ),
                   if (_diag != null) ...[
                     const SizedBox(height: 10),
@@ -217,6 +254,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         child: Text(_diag!.message,
                             style: const TextStyle(fontSize: 12, height: 1.6)),
                       ),
+                  ],
+                  if (_nanoQuestion case final question?) ...[
+                    const Text('Gemini Nanoで生成できました'),
+                    Text(question.text),
+                  ],
+                  if (_nanoError case final error?) ...[
+                    const Text('Gemini Nanoで質問を生成できませんでした'),
+                    Text(error),
                   ],
                 ],
               ),

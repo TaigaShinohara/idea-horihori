@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:horihori/main.dart';
 import 'package:horihori/screens/detail_screen.dart';
@@ -150,8 +151,41 @@ void main() {
       for (var i = 0; i < 20; i++) {
         await tester.pump(const Duration(seconds: 1));
       }
-      // テスト環境ではプラグインが無いため「使えない状態」＋理由が出る。
-      expect(find.textContaining('状態です'), findsWidgets);
+      // プラグインのないテスト環境は、機種非対応ではなく確認失敗になる。
+      expect(find.textContaining('AICoreの状態を確認できませんでした'),
+          findsOneWidget);
+    });
+
+    testWidgets('Nanoの試用で生成したサンプル質問を表示する', (tester) async {
+      setSurface(tester);
+      const channel = MethodChannel('flutter_device_ai');
+      final messenger = TestDefaultBinaryMessengerBinding.instance
+          .defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        return switch (call.method) {
+          'getAvailability' => {'status': 'available', 'reason': 'ready'},
+          'getPlatformInfo' => {'backend': 'androidMlKitGenAi'},
+          'sessionGetResponse' => {
+              'text': '{"id":"q1","text":"どこを歩く？","choices":["公園","川","街"]}',
+            },
+          _ => null,
+        };
+      });
+      addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+      final store = await loadedStore();
+      await tester.pumpWidget(MaterialApp(
+        theme: theme(),
+        home: SettingsScreen(store: store),
+      ));
+      await tester.pump();
+      await tester.ensureVisible(find.text('Nanoで質問を試す'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Nanoで質問を試す'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Gemini Nanoで生成できました'), findsOneWidget);
+      expect(find.text('どこを歩く？'), findsOneWidget);
+      expect(store.ideas, isEmpty);
     });
   });
 }

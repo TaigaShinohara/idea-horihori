@@ -125,9 +125,13 @@ What: ${memo.what}
   static DigQuestion? parseQuestion(String text) {
     final j = extractJson(text);
     if (j == null) return null;
-    final qText = (j['text'] as String? ?? '').trim();
-    final choices = (j['choices'] as List? ?? [])
-        .map((e) => e.toString().trim())
+    final rawText = j['text'];
+    final rawChoices = j['choices'];
+    if (rawText is! String || rawChoices is! List) return null;
+    final qText = rawText.trim();
+    final choices = rawChoices
+        .whereType<String>()
+        .map((choice) => choice.trim())
         .where((s) => s.isNotEmpty)
         .where((s) => _safeText(s) && s.length <= maxChoiceLength)
         .take(3)
@@ -138,8 +142,11 @@ What: ${memo.what}
         choices.length > 3) {
       return null;
     }
+    final rawId = j['id'];
+    if (rawId != null && rawId is! String) return null;
+    final id = (rawId as String?)?.trim() ?? '';
     return DigQuestion(
-      id: (j['id'] as String? ?? 'ai').trim().isEmpty ? 'ai' : j['id'] as String,
+      id: id.isEmpty ? 'ai' : id,
       text: qText,
       choices: choices,
     );
