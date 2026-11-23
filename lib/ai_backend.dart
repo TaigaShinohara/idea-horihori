@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 
 import 'app_config.dart';
 import 'dig_mode.dart';
+import 'on_device_backend.dart';
 import 'fallback.dart';
 import 'models.dart';
 import 'name_candidates.dart';
@@ -219,6 +220,9 @@ class ResilientBackend implements AiBackend {
   /// 直近の呼び出しでオンデバイスが失敗し次へ倒れたか（v0.3.0 PoC）。
   bool lastOnDeviceFailed = false;
 
+  /// 直近のオンデバイス失敗の理由（診断表示用、v0.3.1）。
+  String? lastOnDeviceError;
+
   /// 現在のモード表示（DigScreen のバッジ用）。
   DigModeKind get currentModeKind {
     final s = lastSource;
@@ -246,9 +250,13 @@ class ResilientBackend implements AiBackend {
       try {
         final r = await op(onDevice!);
         lastSource = AnswerSource.onDevice;
+        lastOnDeviceError = null;
         return r;
-      } catch (_) {
+      } catch (e) {
         lastOnDeviceFailed = true;
+        final od = onDevice;
+        lastOnDeviceError =
+            od is OnDeviceBackend ? (od.lastError ?? e.toString()) : e.toString();
       }
     }
     if (remote != null) {

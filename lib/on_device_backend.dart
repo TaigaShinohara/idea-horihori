@@ -11,10 +11,17 @@ import 'prompts.dart';
 /// 状態。プラグインの型をアプリ側の言葉に寄せたもの（テスト差し替え用）。
 enum OnDeviceStatus { available, needsDownload, unavailable }
 
+/// 状態確認の結果（プラグインが返す理由メッセージつき）。
+class OnDeviceCheck {
+  final OnDeviceStatus status;
+  final String message;
+  const OnDeviceCheck(this.status, [this.message = '']);
+}
+
 /// オンデバイスAIクライアントの抽象化（実機: [FlutterOnDeviceClient]、
 /// テスト: Fake）。profileMaker PoC と同じ分離パターン。
 abstract class OnDeviceTextClient {
-  Future<OnDeviceStatus> checkStatus();
+  Future<OnDeviceCheck> checkStatus();
 
   /// モデルのダウンロード完了まで待つ。失敗・タイムアウトは例外。
   Future<void> downloadModel();
@@ -28,15 +35,16 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
   FlutterOnDeviceClient({FlutterDeviceAi? ai}) : _ai = ai ?? FlutterDeviceAi();
 
   @override
-  Future<OnDeviceStatus> checkStatus() async {
+  Future<OnDeviceCheck> checkStatus() async {
     final a = await _ai.availability();
-    return switch (a.status) {
+    final status = switch (a.status) {
       ModelFeatureStatus.available => OnDeviceStatus.available,
       ModelFeatureStatus.downloadable ||
       ModelFeatureStatus.downloading =>
         OnDeviceStatus.needsDownload,
       ModelFeatureStatus.unavailable => OnDeviceStatus.unavailable,
     };
+    return OnDeviceCheck(status, a.message);
   }
 
   @override
@@ -87,6 +95,9 @@ class OnDeviceBackend implements AiBackend {
 
   Future<void>? _readyFuture;
 
+  /// 直近の失敗理由（診断表示用）。成功したら消える。
+  String? lastError;
+
   OnDeviceBackend({
     OnDeviceTextClient? client,
     this.statusTimeout = const Duration(seconds: 15),
@@ -105,12 +116,13 @@ class OnDeviceBackend implements AiBackend {
 
   Future<void> _prepare() async {
     try {
-      final status = await _client.checkStatus().timeout(
+      final check = await _client.checkStatus().timeout(
             statusTimeout,
             onTimeout: () =>
                 throw OnDeviceException('status check timed out'),
           );
-      switch (status) {
+      lastError = null;
+      switch (check.status) {
         case OnDeviceStatus.available:
           return;
         case OnDeviceStatus.needsDownload:
@@ -121,14 +133,26 @@ class OnDeviceBackend implements AiBackend {
               );
           return;
         case OnDeviceStatus.unavailable:
-          throw OnDeviceException('on-device AI unavailable on this device');
+          throw OnDeviceException(check.message.isEmpty
+              ? 'on-device AI unavailable on this device'
+              : 'on-device AI unavailable: ${check.message}');
       }
     } catch (e) {
       // 失敗を保持すると再試行できなくなるので、次回呼び出しでやり直せる
       // ようにキャッシュを捨てる。
       _readyFuture = null;
+      lastError = e.toString();
       if (e is OnDeviceException) rethrow;
       throw OnDeviceException('on-device AI preparation failed: $e');
+    }
+  }
+
+  /// 設定画面の診断用：状態と理由をそのまま返す（例外にしない）。
+  Future<OnDeviceCheck> diagnose() async {
+    try {
+      return await _client.checkStatus().timeout(statusTimeout);
+    } catch (e) {
+      return OnDeviceCheck(OnDeviceStatus.unavailable, '確認に失敗: $e');
     }
   }
 
@@ -141,9 +165,11 @@ class OnDeviceBackend implements AiBackend {
           );
       if (text.trim().isEmpty) throw OnDeviceException('empty response');
       return text;
-    } on OnDeviceException {
+    } on OnDeviceException catch (e) {
+      lastError = e.toString();
       rethrow;
     } catch (e) {
+      lastError = 'generation failed: $e';
       throw OnDeviceException('generation failed: $e');
     }
   }
