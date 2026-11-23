@@ -40,4 +40,6 @@ VER=$(grep -E '^version:' pubspec.yaml | sed -E 's/version: *([0-9.]+)\+([0-9]+)
 VNAME=$(echo $VER | cut -d' ' -f1); VCODE=$(echo $VER | cut -d' ' -f2)
 sed -i -E "s/^flutter.versionName=.*/flutter.versionName=$VNAME/; s/^flutter.versionCode=.*/flutter.versionCode=$VCODE/" android/local.properties
 G="$GRADLE_USER_HOME/wrapper/dists/gradle-9.3.1-all/9ot9r568e8zfvvd4mn8rbu1j0/gradle-9.3.1/bin/gradle"
-cd android && "$G" assembleRelease --max-workers=1 "$@"
+# Build serialization rule (user decision 2026-11-23, revised): at most 2
+# builds VM-wide, via the shared semaphore wrapper.
+cd android && exec ~/workspace/tools/with-build-lock.sh "$G" assembleRelease --max-workers=1 "$@"
