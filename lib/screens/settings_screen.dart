@@ -104,7 +104,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                   ),
                   // v0.2.1 ノイズ削減: モデル名は通常変更不要の支援項目 → 畳む。
-                  ExpansionTile(
+                  // GlassCard（DecoratedBox）の中で ListTile の塗りが隠れる
+                  // フレームワーク警告を避けるため、透明 Material で包む
+                  // （交付前UI検証で検出、2026-11-23）。
+                  Material(
+                    type: MaterialType.transparency,
+                    child: ExpansionTile(
                     tilePadding: EdgeInsets.zero,
                     title: const Text('詳細', style: TextStyle(fontSize: 13)),
                     children: [
@@ -125,6 +130,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                       const SizedBox(height: 8),
                     ],
+                    ),
                   ),
                   const SizedBox(height: 14),
                   FilledButton(
