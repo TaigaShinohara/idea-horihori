@@ -29,42 +29,53 @@ class HomeScreen extends StatelessWidget {
             animation: store,
             builder: (context, _) {
               final count = store.archivedIdeas.length;
-              return IconButton(
-                tooltip: 'アーカイブ',
-                onPressed: () => Navigator.push(
+              final label = count == 0 ? 'アーカイブ' : 'アーカイブ $count件';
+              void openArchive() {
+                if (ModalRoute.of(context)?.isCurrent != true) return;
+                Navigator.push<void>(
                   context,
                   MaterialPageRoute(
                     builder: (_) => ArchiveScreen(store: store),
                   ),
-                ),
-                icon: Stack(
-                  clipBehavior: Clip.none,
-                  children: [
-                    const Icon(Icons.archive_outlined),
-                    if (count > 0)
-                      Positioned(
-                        right: -10,
-                        top: -6,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 5,
-                            vertical: 1,
-                          ),
-                          decoration: BoxDecoration(
-                            color: kButtonFill,
-                            borderRadius: BorderRadius.circular(99),
-                          ),
-                          child: Text(
-                            '$count',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 11,
-                              fontWeight: FontWeight.bold,
+                );
+              }
+              return Semantics(
+                label: label,
+                button: true,
+                onTap: openArchive,
+                excludeSemantics: true,
+                child: IconButton(
+                  tooltip: label,
+                  onPressed: openArchive,
+                  icon: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      const Icon(Icons.archive_outlined),
+                      if (count > 0)
+                        Positioned(
+                          right: -10,
+                          top: -6,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 5,
+                              vertical: 1,
+                            ),
+                            decoration: BoxDecoration(
+                              color: kButtonFill,
+                              borderRadius: BorderRadius.circular(99),
+                            ),
+                            child: Text(
+                              '$count',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                              ),
                             ),
                           ),
                         ),
-                      ),
-                  ],
+                    ],
+                  ),
                 ),
               );
             },
