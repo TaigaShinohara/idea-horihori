@@ -38,6 +38,8 @@ DigSession _session(List<QaEntry> answers) => DigSession(
     );
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   group('旧データ互換（v0.2 共通ルール）', () {
     test('旧形式JSON（新キーなし）がそのまま読める', () {
       final oldJson = <String, dynamic>{

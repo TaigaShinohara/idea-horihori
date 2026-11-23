@@ -72,6 +72,20 @@ void main() {
       expect(client.generateCalls, 2);
     });
 
+    test('サンプル質問はモデルを準備し、JSONの型違いでも再試行する', () async {
+      final client = FakeOnDeviceClient(
+        status: OnDeviceStatus.needsDownload,
+        responses: ['{"text":42,"choices":["A","B","C"]}', _qJson],
+      );
+      final backend = OnDeviceBackend(client: client);
+
+      final question = await backend.verifyGeneration();
+
+      expect(client.downloadCalls, 1);
+      expect(client.generateCalls, 2);
+      expect(question.text, '誰に使ってほしい？');
+    });
+
     test('パース失敗が続いたら例外（フォールバック可能にする）', () async {
       final b = OnDeviceBackend(
           client: FakeOnDeviceClient(responses: ['x', 'y']));
