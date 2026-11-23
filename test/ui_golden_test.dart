@@ -125,6 +125,18 @@ void main() {
   });
 
   group('widget: 遷移と表示', () {
+    testWidgets('アーカイブ件数があっても操作名を読み上げる', (tester) async {
+      final semantics = tester.ensureSemantics();
+      try {
+        final store = await loadedStore(ideaCount: 1);
+        await store.archiveIdea(store.visibleIdeas.single);
+        await tester.pumpWidget(HorihoriApp(store: store));
+        expect(find.bySemanticsLabel('アーカイブ 1件'), findsOneWidget);
+      } finally {
+        semantics.dispose();
+      }
+    });
+
     testWidgets('ホームでアイデアをタップすると詳細へ遷移する', (tester) async {
       setSurface(tester);
       final store = await loadedStore(ideaCount: 1);
