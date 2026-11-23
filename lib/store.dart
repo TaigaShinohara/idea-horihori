@@ -1,7 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -21,55 +22,48 @@ abstract class SecretStore {
 
 class PlatformSecretStore implements SecretStore {
   final FlutterSecureStorage _storage;
-  static final Map<String, String> _testFallback = {};
-  @visibleForTesting
-  static void resetForTest() => _testFallback.clear();
   PlatformSecretStore({FlutterSecureStorage? storage})
-      : _storage = storage ?? const FlutterSecureStorage();
+    : _storage = storage ?? const FlutterSecureStorage();
 
   @override
-  Future<String?> read(String key) async {
-    try {
-      return await _storage.read(key: key);
-    } on MissingPluginException {
-      return _testFallback[key];
-    } on PlatformException {
-      return _testFallback[key];
-    }
-  }
+  Future<String?> read(String key) => _storage.read(key: key);
 
   @override
-  Future<void> write(String key, String value) async {
-    try {
-      await _storage.write(key: key, value: value);
-    } on MissingPluginException {
-      _testFallback[key] = value;
-    } on PlatformException {
-      _testFallback[key] = value;
-    }
-  }
+  Future<void> write(String key, String value) =>
+      _storage.write(key: key, value: value);
 
   @override
-  Future<void> delete(String key) async {
-    try {
-      await _storage.delete(key: key);
-    } on MissingPluginException {
-      _testFallback.remove(key);
-    } on PlatformException {
-      _testFallback.remove(key);
-    }
-  }
+  Future<void> delete(String key) => _storage.delete(key: key);
+}
+
+class StoreFailure implements Exception {
+  const StoreFailure(this.message);
+  final String message;
 }
 
 class IdeaStore extends ChangeNotifier {
   final SecretStore _secrets;
-  IdeaStore({SecretStore? secrets}) : _secrets = secrets ?? PlatformSecretStore();
+  IdeaStore({SecretStore? secrets})
+    : _secrets = secrets ?? PlatformSecretStore();
 
   List<Idea> ideas = [];
-  String apiKey = '';
-  String model = AppConfig.defaultGeminiModel;
+  String _apiKey = '';
+  String get apiKey => _apiKey;
+  String _model = AppConfig.defaultGeminiModel;
+  String get model => _model;
   bool loaded = false;
-  bool remoteConsent = false;
+  bool _loading = false;
+  String? loadError;
+  bool _remoteConsent = false;
+  bool get remoteConsent => _remoteConsent;
+  String? keyStorageError;
+  String? ideasRecoveryNotice;
+  bool _ideasWritable = true;
+  final _cloudChanges = ChangeNotifier();
+  int _cloudRevision = 0;
+  int _consentRevision = 0;
+  Future<void> _settingsQueue = Future.value();
+  Future<void> _ideasQueue = Future.value();
 
   /// K3: キー未設定時の初回案内を出したかどうか（1回だけ出す）。
   bool keyGuideShown = false;
@@ -78,46 +72,121 @@ class IdeaStore extends ChangeNotifier {
   DigStyle digStyle = DigStyle.friend;
 
   Future<void> load() async {
-    final prefs = await SharedPreferences.getInstance();
-    apiKey = await _secrets.read(AppConfig.secureApiKeyKey) ?? '';
-    if (apiKey.isEmpty) {
-      final legacyKey = prefs.getString(AppConfig.prefsApiKeyKey);
-      if (legacyKey != null && legacyKey.isNotEmpty) {
-        await _secrets.write(AppConfig.secureApiKeyKey, legacyKey.trim());
-        apiKey = legacyKey.trim();
-      }
-    }
-    await prefs.remove(AppConfig.prefsApiKeyKey);
-    remoteConsent =
-        prefs.getBool(AppConfig.prefsRemoteConsentKey) ?? false;
-    model = prefs.getString(AppConfig.prefsModelKey) ?? AppConfig.defaultGeminiModel;
-    keyGuideShown = prefs.getBool(AppConfig.prefsKeyGuideShownKey) ?? false;
-    digStyle =
-        DigStyleX.fromStorage(prefs.getString(AppConfig.prefsDigStyleKey));
-    final raw = prefs.getString(AppConfig.prefsIdeasKey);
-    if (raw != null && raw.isNotEmpty) {
-      try {
-        final list = jsonDecode(raw) as List;
-        ideas = list
-            .map((e) => Idea.fromJson(e as Map<String, dynamic>))
-            .toList();
-      } catch (_) {
-        // パース失敗でデータを握りつぶさない: 原文を別キーへ退避してから
-        // 空で開始する（次の保存で壊れた原文ごと消える事故を防ぐ）。
-        await prefs.setString(AppConfig.prefsIdeasBackupKey, raw);
-        ideas = [];
-      }
-    }
-    loaded = true;
+    if (_loading) return;
+    _loading = true;
+    loadError = null;
     notifyListeners();
+    try {
+      await _readPreferences(
+        await SharedPreferences.getInstance().timeout(
+          const Duration(seconds: 6),
+        ),
+      );
+      loaded = true;
+    } catch (_) {
+      loadError = '端末のデータを読み込めませんでした。';
+    } finally {
+      _loading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _readPreferences(SharedPreferences prefs) async {
+    keyStorageError = null;
+    _remoteConsent = false;
+    _invalidateCloud();
+    try {
+      await _loadApiKey(prefs);
+      _remoteConsent =
+          hasRemoteKey && prefs.get(AppConfig.prefsRemoteConsentKey) == true;
+    } catch (_) {
+      _apiKey = '';
+      keyStorageError = 'APIキーを安全な保存先から読み込めませんでした。設定で確認してください。';
+    }
+    final storedModel = prefs.get(AppConfig.prefsModelKey);
+    _model = AppConfig.geminiModel(storedModel is String ? storedModel : null);
+    if (storedModel is String && storedModel != _model) {
+      try {
+        await prefs.setString(AppConfig.prefsModelKey, _model);
+      } catch (_) {
+        // 次回も読み込み時に旧モデルを移行する。
+      }
+    }
+    keyGuideShown = prefs.get(AppConfig.prefsKeyGuideShownKey) == true;
+    final style = prefs.get(AppConfig.prefsDigStyleKey);
+    digStyle = DigStyleX.fromStorage(style is String ? style : null);
+    await _loadIdeas(prefs);
+  }
+
+  Future<void> _loadApiKey(SharedPreferences prefs) async {
+    _apiKey = await _readKey() ?? '';
+    final legacy = prefs.get(AppConfig.prefsApiKeyKey);
+    if (legacy is! String || legacy.isEmpty) return;
+    if (_apiKey.isEmpty && legacy.trim().isNotEmpty) {
+      await _writeKey(legacy.trim());
+      _apiKey = legacy.trim();
+    }
+    _checkWrite(await prefs.remove(AppConfig.prefsApiKeyKey));
+  }
+
+  Future<void> _loadIdeas(SharedPreferences prefs) async {
+    ideas = [];
+    ideasRecoveryNotice = null;
+    _ideasWritable = true;
+    final raw = prefs.get(AppConfig.prefsIdeasKey);
+    if (raw == null || raw == '') return;
+    var damaged = 0;
+    try {
+      final records = jsonDecode(raw as String) as List;
+      for (final record in records) {
+        try {
+          ideas.add(Idea.fromJson(record as Map<String, dynamic>));
+        } catch (_) {
+          damaged++;
+        }
+      }
+    } catch (_) {
+      damaged++;
+    }
+    if (damaged == 0) return;
+    try {
+      final original = raw is String ? raw : jsonEncode(raw);
+      final backup = prefs.get(AppConfig.prefsIdeasBackupKey);
+      final alreadySaved = backup == original || prefs.getKeys().any(
+        (key) => key.startsWith('${AppConfig.prefsIdeasBackupKey}_') &&
+            prefs.get(key) == original,
+      );
+      if (!alreadySaved) {
+        final key = backup == null
+            ? AppConfig.prefsIdeasBackupKey
+            : '${AppConfig.prefsIdeasBackupKey}_${DateTime.now().microsecondsSinceEpoch}';
+        _checkWrite(await prefs.setString(key, original));
+      }
+      ideasRecoveryNotice = '読み込めないアイデアデータを端末内に退避しました。';
+    } catch (_) {
+      _ideasWritable = false;
+      ideasRecoveryNotice = '元データを保護するため、現在は変更を保存できません。';
+    }
   }
 
   Future<void> _saveIdeas() async {
+    if (!_ideasWritable) throw StoreFailure(ideasRecoveryNotice!);
+    final snapshot = jsonEncode(ideas.map((e) => e.toJson()).toList());
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-      AppConfig.prefsIdeasKey,
-      jsonEncode(ideas.map((e) => e.toJson()).toList()),
+    _checkWrite(await prefs.setString(AppConfig.prefsIdeasKey, snapshot));
+  }
+
+  Future<T> _changeIdeas<T>(Future<T> Function() change) {
+    final write = _ideasQueue.then((_) => change());
+    _ideasQueue = write.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
     );
+    return write;
+  }
+
+  static void _checkWrite(bool saved) {
+    if (!saved) throw const StoreFailure('端末に保存できませんでした。もう一度お試しください。');
   }
 
   List<Idea> get visibleIdeas =>
@@ -131,102 +200,221 @@ class IdeaStore extends ChangeNotifier {
   /// リモート（Gemini）を使える設定かどうか。
   bool get hasRemoteKey => apiKey.isNotEmpty;
 
-  Future<Idea> addIdea(String title, String note) async {
+  Future<Idea> addIdea(String title, String note) => _changeIdeas(() async {
+    final now = DateTime.now();
     final idea = Idea(
-      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      id: now.microsecondsSinceEpoch.toString(),
       title: title.trim(),
       note: note.trim(),
-      createdAt: DateTime.now(),
+      createdAt: now,
     );
     ideas.add(idea);
-    await _saveIdeas();
+    try {
+      await _saveIdeas();
+    } catch (_) {
+      ideas.remove(idea);
+      rethrow;
+    }
     notifyListeners();
     return idea;
-  }
+  });
 
-  Future<void> updateIdea(Idea idea) async {
+  Future<void> updateIdea(Idea idea) => _changeIdeas(() async {
+    if (!ideas.contains(idea)) throw const StoreFailure('アイデアを確認できませんでした。');
     await _saveIdeas();
     notifyListeners();
-  }
+  });
 
-  Future<void> archiveIdea(Idea idea) async {
-    idea.archived = true;
-    await _saveIdeas();
-    notifyListeners();
-  }
+  Future<void> archiveIdea(Idea idea) => _setArchived(idea, true);
 
   /// アーカイブから一覧へ戻す。
-  Future<void> unarchiveIdea(Idea idea) async {
-    idea.archived = false;
-    await _saveIdeas();
+  Future<void> unarchiveIdea(Idea idea) => _setArchived(idea, false);
+
+  Future<void> _setArchived(Idea idea, bool archived) => _changeIdeas(() async {
+    if (!ideas.contains(idea) || idea.archived == archived) return;
+    idea.archived = archived;
+    try {
+      await _saveIdeas();
+    } catch (_) {
+      idea.archived = !archived;
+      rethrow;
+    }
     notifyListeners();
-  }
+  });
 
   /// 完全に削除する（復元不可。呼び出し側で確認を取ること）。
-  Future<void> deleteIdea(Idea idea) async {
-    ideas.remove(idea);
-    await _saveIdeas();
+  Future<void> deleteIdea(Idea idea) => _changeIdeas(() async {
+    final index = ideas.indexOf(idea);
+    if (index < 0) return;
+    ideas.removeAt(index);
+    try {
+      await _saveIdeas();
+    } catch (_) {
+      ideas.insert(index, idea);
+      rethrow;
+    }
     notifyListeners();
-  }
+  });
 
   /// K3: 初回案内を表示済みにし、以後は再表示しない。
   Future<void> markKeyGuideShown() async {
     keyGuideShown = true;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(AppConfig.prefsKeyGuideShownKey, true);
+    _checkWrite(await prefs.setBool(AppConfig.prefsKeyGuideShownKey, true));
     notifyListeners();
   }
 
   /// 掘り方スタイルを保存する（v0.2 項目1）。
   Future<void> saveDigStyle(DigStyle style) async {
-    digStyle = style;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(AppConfig.prefsDigStyleKey, style.storageValue);
-    notifyListeners();
-  }
-
-  Future<void> saveApiKey(String key) async {
-    apiKey = key.trim();
-    if (apiKey.isEmpty) {
-      await _secrets.delete(AppConfig.secureApiKeyKey);
-    } else {
-      await _secrets.write(AppConfig.secureApiKeyKey, apiKey);
-    }
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(AppConfig.prefsApiKeyKey);
-    notifyListeners();
-  }
-
-  Future<void> deleteApiKey() async {
-    apiKey = '';
-    await _secrets.delete(AppConfig.secureApiKeyKey);
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(AppConfig.prefsApiKeyKey);
-    notifyListeners();
-  }
-
-  Future<void> saveRemoteConsent(bool consent) async {
-    remoteConsent = consent;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(AppConfig.prefsRemoteConsentKey, consent);
-    notifyListeners();
-  }
-
-  Future<void> saveModel(String m) async {
-    model = m.trim().isEmpty ? AppConfig.defaultGeminiModel : m.trim();
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(AppConfig.prefsModelKey, model);
-    notifyListeners();
-  }
-
-  /// 現在の設定でバックエンドを組む。
-  /// v0.3.0 PoC: 優先順は オンデバイス → Gemini（キーがある場合）→ 定型。
-  ResilientBackend backend() {
-    return ResilientBackend(
-      apiKey.isEmpty || !remoteConsent
-          ? null
-          : GeminiBackend(apiKey: apiKey, model: model),
-      onDevice: OnDeviceBackend(),
+    _checkWrite(
+      await prefs.setString(AppConfig.prefsDigStyleKey, style.storageValue),
     );
+    digStyle = style;
+    notifyListeners();
+  }
+
+  void _invalidateCloud() {
+    _cloudRevision++;
+    _cloudChanges.notifyListeners();
+  }
+
+  Future<void> _saveSettings(Future<void> Function() action) {
+    final write = _settingsQueue.then((_) => action());
+    _settingsQueue = write.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return write;
+  }
+
+  Future<void> _writeKey(String value) async {
+    await _secrets
+        .write(AppConfig.secureApiKeyKey, value)
+        .timeout(const Duration(seconds: 6));
+    if (await _readKey() != value) {
+      throw const StoreFailure('APIキーを保存先から読み戻せませんでした。');
+    }
+  }
+
+  Future<String?> _readKey() => _secrets
+      .read(AppConfig.secureApiKeyKey)
+      .timeout(const Duration(seconds: 6));
+
+  void _revokeCloud() {
+    _consentRevision++;
+    _remoteConsent = false;
+    _invalidateCloud();
+  }
+
+  Future<void> saveApiKey(String key) {
+    final value = key.trim();
+    if (value.isEmpty) return deleteApiKey();
+    if (value == _apiKey && keyStorageError == null) return Future.value();
+    _revokeCloud();
+    return _saveSettings(() async {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        _checkWrite(
+          await prefs.setBool(AppConfig.prefsRemoteConsentKey, false),
+        );
+        await _writeKey(value);
+        _checkWrite(await prefs.remove(AppConfig.prefsApiKeyKey));
+        _apiKey = value;
+        keyStorageError = null;
+      } catch (_) {
+        keyStorageError = 'APIキーの保存を確認できませんでした。';
+        throw StoreFailure(keyStorageError!);
+      } finally {
+        notifyListeners();
+      }
+    });
+  }
+
+  Future<void> deleteApiKey() {
+    _revokeCloud();
+    return _saveSettings(() async {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        _checkWrite(
+          await prefs.setBool(AppConfig.prefsRemoteConsentKey, false),
+        );
+        _checkWrite(await prefs.remove(AppConfig.prefsApiKeyKey));
+        await _secrets
+            .delete(AppConfig.secureApiKeyKey)
+            .timeout(const Duration(seconds: 6));
+        if (await _readKey() != null) {
+          throw const StoreFailure('削除後もキーが残っています。');
+        }
+        _apiKey = '';
+        keyStorageError = null;
+      } catch (_) {
+        keyStorageError = 'APIキーの削除を確認できませんでした。';
+        throw StoreFailure(keyStorageError!);
+      } finally {
+        notifyListeners();
+      }
+    });
+  }
+
+  Future<void> saveRemoteConsent(bool consent) {
+    if (!consent) _revokeCloud();
+    final revision = ++_consentRevision;
+    return _saveSettings(() async {
+      if (consent && (!hasRemoteKey || keyStorageError != null)) {
+        throw const StoreFailure('先にAPIキーを保存してください。');
+      }
+      final prefs = await SharedPreferences.getInstance();
+      _checkWrite(
+        await prefs.setBool(AppConfig.prefsRemoteConsentKey, consent),
+      );
+      if (_consentRevision == revision) {
+        _remoteConsent = consent;
+        notifyListeners();
+      }
+    });
+  }
+
+  Future<void> saveModel(String value) {
+    final next = AppConfig.geminiModel(value);
+    if (!AppConfig.validGeminiModel(next)) {
+      return Future.error(const StoreFailure('モデル名の形式を確認してください。'));
+    }
+    return _saveSettings(() async {
+      final prefs = await SharedPreferences.getInstance();
+      _checkWrite(await prefs.setString(AppConfig.prefsModelKey, next));
+      if (_model != next) _invalidateCloud();
+      _model = next;
+      notifyListeners();
+    });
+  }
+
+  GeminiBackend? _remote() {
+    if (!remoteConsent || !hasRemoteKey || keyStorageError != null) return null;
+    final grant = _cloudRevision;
+    return GeminiBackend(
+      apiKey: _apiKey,
+      model: _model,
+      consentChanges: _cloudChanges,
+      maySend: () {
+        final state = WidgetsBinding.instance.lifecycleState;
+        return remoteConsent &&
+            _cloudRevision == grant &&
+            (state == null || state == AppLifecycleState.resumed);
+      },
+    );
+  }
+
+  ResilientBackend backend() => ResilientBackend(
+    null,
+    onDevice: OnDeviceBackend(),
+    remoteFactory: _remote,
+  );
+
+  @override
+  void dispose() {
+    _invalidateCloud();
+    _cloudChanges.dispose();
+    super.dispose();
   }
 }

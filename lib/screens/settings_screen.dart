@@ -1,13 +1,12 @@
 import 'package:flutter/material.dart';
 
+import '../ai_backend.dart';
 import '../app_config.dart';
 import '../models.dart';
 import '../on_device_backend.dart';
 import '../store.dart';
 import '../widgets/glass.dart';
 
-/// S5 設定。Gemini APIキーの BYOK 入力・保存。
-/// キーは端末内だけに保存し、表示は伏せる。
 class SettingsScreen extends StatefulWidget {
   final IdeaStore store;
   const SettingsScreen({super.key, required this.store});
@@ -17,79 +16,162 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  late final TextEditingController _keyCtrl =
-      TextEditingController(text: widget.store.apiKey);
-  late final TextEditingController _modelCtrl =
-      TextEditingController(text: widget.store.model);
+  late final _key = TextEditingController(text: widget.store.apiKey);
+  late final _model = TextEditingController(text: widget.store.model);
+  late final _nano = OnDeviceBackend(onDownloadProgress: _downloadProgress);
   bool _obscure = true;
-  bool _saved = false;
-
-  // v0.3.1: オンデバイスAIの診断表示。
+  bool _editing = false;
   bool _checking = false;
-  OnDeviceCheck? _diag;
-  final _nano = OnDeviceBackend();
   bool _testingNano = false;
-  DigQuestion? _nanoQuestion;
-  String? _nanoError;
+  double? _progress;
+  int _nanoAttempt = 0;
+  OnDeviceCheck? _diagnosis;
+  DigQuestion? _sampleQuestion;
+  GeminiBackend? _connection;
+  String? _apiMessage;
+  String? _nanoMessage;
+
+  Future<void> _edit(Future<void> Function() change, String success) async {
+    if (_editing) return;
+    setState(() {
+      _editing = true;
+      _apiMessage = null;
+    });
+    try {
+      await change();
+      if (mounted) setState(() => _apiMessage = success);
+    } on StoreFailure catch (failure) {
+      if (mounted) setState(() => _apiMessage = failure.message);
+    } catch (_) {
+      if (mounted) setState(() => _apiMessage = '設定を保存できませんでした。');
+    } finally {
+      if (mounted) setState(() => _editing = false);
+    }
+  }
+
+  Future<void> _save() => _edit(() async {
+    final model = AppConfig.geminiModel(_model.text);
+    if (!AppConfig.validGeminiModel(model)) {
+      throw const StoreFailure('モデル名の形式を確認してください。');
+    }
+    if (_key.text.trim().isNotEmpty || widget.store.hasRemoteKey) {
+      await widget.store.saveApiKey(_key.text);
+    }
+    await widget.store.saveModel(model);
+    if (mounted) {
+      _model.text = widget.store.model;
+      _key.text = widget.store.apiKey;
+    }
+  }, '設定を保存しました。');
+
+  Future<void> _deleteKey() => _edit(() async {
+    await widget.store.deleteApiKey();
+    if (mounted) _key.clear();
+  }, 'APIキーを削除しました。');
+
+  Future<void> _verifyConnection() async {
+    final connection = GeminiBackend(apiKey: _key.text, model: _model.text);
+    setState(() {
+      _connection = connection;
+      _apiMessage = null;
+    });
+    try {
+      await connection.verifyConnection();
+      if (mounted) {
+        setState(() => _apiMessage = 'キーとモデルへのアクセスを確認できました。');
+      }
+    } on GeminiFailure catch (failure) {
+      if (mounted) setState(() => _apiMessage = failure.message);
+    } catch (_) {
+      if (mounted) setState(() => _apiMessage = '接続を確認できませんでした。');
+    } finally {
+      if (mounted) setState(() => _connection = null);
+    }
+  }
 
   Future<void> _runDiagnosis() async {
-    setState(() => _checking = true);
+    setState(() {
+      _checking = true;
+      _sampleQuestion = null;
+      _nanoMessage = null;
+    });
     final result = await _nano.diagnose();
     if (!mounted) return;
     setState(() {
       _checking = false;
-      _diag = result;
-      _nanoQuestion = null;
-      _nanoError = null;
+      _diagnosis = result;
     });
+  }
+
+  void _downloadProgress(double? value) {
+    if (mounted && _testingNano) setState(() => _progress = value);
   }
 
   Future<void> _verifyNano() async {
+    final attempt = ++_nanoAttempt;
     setState(() {
       _testingNano = true;
-      _nanoQuestion = null;
-      _nanoError = null;
+      _diagnosis = null;
+      _sampleQuestion = null;
+      _nanoMessage = null;
+      _progress = null;
     });
     try {
       final question = await _nano.verifyGeneration();
-      if (!mounted) return;
+      if (!mounted || attempt != _nanoAttempt) return;
       setState(() {
-        _diag = const OnDeviceCheck(OnDeviceStatus.available);
-        _nanoQuestion = question;
+        _diagnosis = const OnDeviceCheck(OnDeviceStatus.available);
+        _sampleQuestion = question;
       });
     } on OnDeviceException catch (error) {
-      if (mounted) setState(() => _nanoError = error.message);
+      if (mounted && attempt == _nanoAttempt) {
+        setState(
+          () => _nanoMessage = 'Gemini Nanoで生成できませんでした。 ${error.message}',
+        );
+      }
+    } on AiCancelled {
+      // 画面を閉じた場合もキャンセルする。
     } finally {
-      if (mounted) setState(() => _testingNano = false);
+      if (mounted && attempt == _nanoAttempt) {
+        setState(() => _testingNano = false);
+      }
     }
   }
 
-  String get _diagLabel => switch (_diag?.status) {
-        OnDeviceStatus.available => 'モデルの準備ができています',
-        OnDeviceStatus.needsDownload =>
-          'モデルの準備が必要です。「Nanoで質問を試す」で準備を始めます。',
-        OnDeviceStatus.unavailable =>
-          '現在は利用できません。Android AICoreの更新を確認してください。',
-        OnDeviceStatus.checkFailed =>
-          'AICoreの状態を確認できませんでした。少し待って再確認してください。',
-        null => '',
-      };
+  void _cancelNano() {
+    _nanoAttempt++;
+    _nano.cancelPending();
+    setState(() {
+      _testingNano = false;
+      _nanoMessage = '端末AIの確認を中止しました。';
+    });
+  }
+
+  String get _diagnosisLabel => switch (_diagnosis?.status) {
+    OnDeviceStatus.available => 'モデルの準備ができています',
+    OnDeviceStatus.needsDownload => 'モデルの準備が必要です。「Nanoで質問を試す」で取得を始めます。',
+    OnDeviceStatus.unavailable => '現在は利用できません。対応機種とAndroid AICoreの更新を確認してください。',
+    OnDeviceStatus.checkFailed => 'AICoreの状態を確認できませんでした。少し待って再確認してください。',
+    null => '',
+  };
 
   @override
   void dispose() {
-    _keyCtrl.dispose();
-    _modelCtrl.dispose();
+    _connection?.cancelPending();
+    _nano.cancelPending();
+    _key.dispose();
+    _model.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final apiBusy = _editing || _connection != null;
     return Scaffold(
       backgroundColor: Colors.transparent,
       appBar: AppBar(
         title: const Text('設定'),
         backgroundColor: Colors.transparent,
-        elevation: 0,
       ),
       body: GlassBackground(
         child: ListView(
@@ -99,170 +181,144 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Text('Gemini APIキー',
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 6),
                   const Text(
-                    '入れるとAIが質問する。空でも定型で掘れる。キーは端末内だけに保存。',
-                    style: TextStyle(fontSize: 13, height: 1.6),
+                    'オンデバイスAI',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 6),
-                  const Text(
-                    'キーは Google AI Studio（aistudio.google.com）で無料で作れます。',
-                    style: TextStyle(fontSize: 13, height: 1.6),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _keyCtrl,
-                    obscureText: _obscure,
-                    autocorrect: false,
-                    enableSuggestions: false,
-                    decoration: InputDecoration(
-                      hintText: 'APIキー',
-                      filled: true,
-                      fillColor: glassInputFill(context),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(14),
-                        borderSide: BorderSide.none,
-                      ),
-                      suffixIcon: IconButton(
-                        icon: Icon(_obscure
-                            ? Icons.visibility_outlined
-                            : Icons.visibility_off_outlined),
-                        onPressed: () => setState(() => _obscure = !_obscure),
-                      ),
-                    ),
-                  ),
-                  // v0.2.1 ノイズ削減: モデル名は通常変更不要の支援項目 → 畳む。
-                  // GlassCard（DecoratedBox）の中で ListTile の塗りが隠れる
-                  // フレームワーク警告を避けるため、透明 Material で包む
-                  // （交付前UI検証で検出、2026-11-23）。
-                  Material(
-                    type: MaterialType.transparency,
-                    child: ExpansionTile(
-                    tilePadding: EdgeInsets.zero,
-                    title: const Text('詳細', style: TextStyle(fontSize: 13)),
-                    children: [
-                      TextField(
-                        controller: _modelCtrl,
-                        autocorrect: false,
-                        enableSuggestions: false,
-                        decoration: InputDecoration(
-                          labelText: 'モデル名',
-                          hintText: AppConfig.defaultGeminiModel,
-                          filled: true,
-                          fillColor: glassInputFill(context),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(14),
-                            borderSide: BorderSide.none,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                    ],
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  FilledButton(
-                    style: FilledButton.styleFrom(backgroundColor: kButtonFill),
-                    onPressed: () async {
-                      await widget.store.saveApiKey(_keyCtrl.text);
-                      await widget.store.saveModel(_modelCtrl.text);
-                      setState(() => _saved = true);
-                    },
-                    child: const Text('保存する'),
-                  ),
-                  if (_keyCtrl.text.isNotEmpty)
-                    TextButton(
-                      onPressed: () async {
-                        await widget.store.deleteApiKey();
-                        _keyCtrl.clear();
-                        await widget.store.saveRemoteConsent(false);
-                        if (!mounted) return;
-                        setState(() => _saved = true);
-                      },
-                      child: const Text('キーを削除する'),
-                    ),
-                  if (_saved)
-                    const Padding(
-                      padding: EdgeInsets.only(top: 8),
-                      child: Text('保存しました', textAlign: TextAlign.center),
-                    ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            GlassCard(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const Text('クラウド送信',
-                      style:
-                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 6),
-                  Material(
-                    type: MaterialType.transparency,
-                    child: SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text('オンデバイス失敗時にGeminiへ送る'),
-                      subtitle: const Text(
-                        '送る項目: アイデア名、メモ、回答履歴。未同意なら外部送信しない。',
-                      ),
-                      value: widget.store.remoteConsent,
-                      onChanged: (value) async {
-                        await widget.store.saveRemoteConsent(value);
-                        if (mounted) setState(() {});
-                      },
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            GlassCard(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const Text('オンデバイスAI',
-                      style:
-                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 6),
-                  const Text(
-                    '対応するAndroidではGemini Nanoを優先します。'
-                    'サンプル質問で端末内の生成を確認できます。',
-                    style: TextStyle(fontSize: 13, height: 1.6),
-                  ),
+                  const Text('対応するAndroidではGemini Nanoを優先します。'),
                   const SizedBox(height: 12),
                   OutlinedButton(
                     onPressed: _checking || _testingNano ? null : _runDiagnosis,
                     child: Text(_checking ? '確認中…' : '状態を確認する'),
                   ),
-                  OutlinedButton(
-                    onPressed: _checking || _testingNano ? null : _verifyNano,
-                    child: Text(
-                      _testingNano ? 'モデルを準備・生成中…' : 'Nanoで質問を試す',
+                  if (_testingNano) ...[
+                    LinearProgressIndicator(value: _progress),
+                    const SizedBox(height: 8),
+                    Text(
+                      _progress == null
+                          ? 'モデルの準備状況を確認し、サンプル質問を生成しています。'
+                          : 'モデル取得中 ${(_progress! * 100).round()}%',
                     ),
-                  ),
-                  if (_diag != null) ...[
-                    const SizedBox(height: 10),
-                    Text(_diagLabel,
-                        style: const TextStyle(
-                            fontSize: 14, fontWeight: FontWeight.bold)),
-                    if (_diag!.message.isNotEmpty)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 4),
-                        child: Text(_diag!.message,
-                            style: const TextStyle(fontSize: 12, height: 1.6)),
+                    TextButton(
+                      onPressed: _cancelNano,
+                      child: const Text('中止する'),
+                    ),
+                  ] else
+                    OutlinedButton(
+                      onPressed: _checking ? null : _verifyNano,
+                      child: const Text('Nanoで質問を試す'),
+                    ),
+                  if (_diagnosis case final diagnosis?) ...[
+                    const SizedBox(height: 8),
+                    Text(_diagnosisLabel),
+                    if (diagnosis.message.isNotEmpty)
+                      Text(
+                        diagnosis.message,
+                        style: const TextStyle(fontSize: 12),
                       ),
                   ],
-                  if (_nanoQuestion case final question?) ...[
+                  if (_sampleQuestion case final question?) ...[
                     const Text('Gemini Nanoで生成できました'),
                     Text(question.text),
                   ],
-                  if (_nanoError case final error?) ...[
-                    const Text('Gemini Nanoで質問を生成できませんでした'),
-                    Text(error),
-                  ],
+                  if (_nanoMessage case final message?) Text(message),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            GlassCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'クラウド送信',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 6),
+                  Material(
+                    type: MaterialType.transparency,
+                    child: SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('端末AIが使えないときにGemini APIを使う'),
+                      value: widget.store.remoteConsent,
+                      onChanged:
+                          apiBusy ||
+                              (!widget.store.hasRemoteKey &&
+                                  !widget.store.remoteConsent)
+                          ? null
+                          : (value) => _edit(
+                              () => widget.store.saveRemoteConsent(value),
+                              value ? 'クラウド送信を有効にしました。' : 'クラウド送信を停止しました。',
+                            ),
+                    ),
+                  ),
+                  const Text(
+                    '質問・企画メモの生成では、タイトル、関連する最近の質問と回答、最新の企画メモをGoogleへ送ります。'
+                    '質問では入力した補足、名前候補ではタイトルと最新の企画メモを使います。'
+                    '無料枠では、利用地域に応じて入力と出力がGoogleのサービス改善や人による確認に使われる場合があります。',
+                    style: TextStyle(fontSize: 13, height: 1.5),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Gemini APIキー（任意）',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: _key,
+                    enabled: !apiBusy,
+                    obscureText: _obscure,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    decoration: InputDecoration(
+                      labelText: 'APIキー',
+                      suffixIcon: IconButton(
+                        tooltip: _obscure ? 'APIキーを表示' : 'APIキーを隠す',
+                        icon: Icon(
+                          _obscure
+                              ? Icons.visibility_outlined
+                              : Icons.visibility_off_outlined,
+                        ),
+                        onPressed: () => setState(() => _obscure = !_obscure),
+                      ),
+                    ),
+                  ),
+                  Material(
+                    type: MaterialType.transparency,
+                    child: ExpansionTile(
+                      tilePadding: EdgeInsets.zero,
+                      title: const Text('モデル設定'),
+                      children: [
+                        TextField(
+                          controller: _model,
+                          enabled: !apiBusy,
+                          autocorrect: false,
+                          enableSuggestions: false,
+                          decoration: const InputDecoration(labelText: 'モデル名'),
+                        ),
+                      ],
+                    ),
+                  ),
+                  FilledButton(
+                    onPressed: apiBusy ? null : _save,
+                    child: const Text('保存する'),
+                  ),
+                  OutlinedButton(
+                    onPressed: apiBusy ? null : _verifyConnection,
+                    child: Text(
+                      _connection == null ? 'キーとモデルの接続を確認' : '接続を確認中…',
+                    ),
+                  ),
+                  if (widget.store.hasRemoteKey ||
+                      widget.store.keyStorageError != null)
+                    TextButton(
+                      onPressed: apiBusy ? null : _deleteKey,
+                      child: const Text('キーを削除する'),
+                    ),
+                  if ((_apiMessage ?? widget.store.keyStorageError)
+                      case final message?)
+                    Text(message, textAlign: TextAlign.center),
                 ],
               ),
             ),

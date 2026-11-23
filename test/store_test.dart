@@ -25,7 +25,6 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
-    PlatformSecretStore.resetForTest();
   });
 
   group('アーカイブ復元・削除', () {
@@ -90,7 +89,7 @@ void main() {
 
   group('hasRemoteKey', () {
     test('キー未設定なら false、保存すると true', () async {
-      final store = IdeaStore();
+      final store = IdeaStore(secrets: FakeSecretStore());
       await store.load();
       expect(store.hasRemoteKey, isFalse);
       await store.saveApiKey('dummy-key');

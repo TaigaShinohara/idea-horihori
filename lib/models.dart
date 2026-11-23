@@ -2,6 +2,22 @@ import 'dart:math' as math;
 
 import 'dig_mode.dart';
 
+enum AnswerSource {
+  onDevice('Gemini Nano'),
+  remote('Gemini API'),
+  local('定型');
+
+  const AnswerSource(this.label);
+  final String label;
+
+  static AnswerSource? fromJson(Object? value) {
+    for (final source in values) {
+      if (source.name == value) return source;
+    }
+    return null;
+  }
+}
+
 /// 成長段階: 種(登録直後) → 芽(深掘り中) → 実(メモ1つ以上)
 enum GrowthStage { seed, sprout, fruit }
 
@@ -23,6 +39,7 @@ class DigQuestion {
   final String id;
   final String text;
   final List<String> choices; // 最大3つ。3つ目は「広げる」選択肢
+  final AnswerSource? source;
 
   /// 逆張り質問かどうか（v0.2 項目3）。旧データには無いので既定 false。
   final bool isContrarian;
@@ -31,27 +48,32 @@ class DigQuestion {
     required this.text,
     required this.choices,
     this.isContrarian = false,
+    this.source,
   });
 
-  DigQuestion copyWith({bool? isContrarian}) => DigQuestion(
+  DigQuestion copyWith({bool? isContrarian, AnswerSource? source}) =>
+      DigQuestion(
         id: id,
         text: text,
         choices: choices,
         isContrarian: isContrarian ?? this.isContrarian,
+        source: source ?? this.source,
       );
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'text': text,
-        'choices': choices,
-        'isContrarian': isContrarian,
-      };
+    'id': id,
+    'text': text,
+    'choices': choices,
+    'isContrarian': isContrarian,
+    if (source != null) 'source': source!.name,
+  };
   factory DigQuestion.fromJson(Map<String, dynamic> j) => DigQuestion(
-        id: j['id'] as String,
-        text: j['text'] as String,
-        choices: (j['choices'] as List).map((e) => e.toString()).toList(),
-        isContrarian: j['isContrarian'] as bool? ?? false,
-      );
+    id: j['id'] as String,
+    text: j['text'] as String,
+    choices: (j['choices'] as List).map((e) => e.toString()).toList(),
+    isContrarian: j['isContrarian'] as bool? ?? false,
+    source: AnswerSource.fromJson(j['source']),
+  );
 }
 
 /// 質問への回答1件。
@@ -59,6 +81,7 @@ class QaEntry {
   final String questionId;
   final String question;
   final String answer;
+  final AnswerSource? source;
 
   /// 回答時に提示されていた選択肢（v0.2 項目7）。
   /// 「1問もどる」で質問を復元するために記録する。旧データでは null で、
@@ -73,22 +96,25 @@ class QaEntry {
     required this.answer,
     this.choices,
     this.contrarian = false,
+    this.source,
   });
 
   Map<String, dynamic> toJson() => {
-        'questionId': questionId,
-        'question': question,
-        'answer': answer,
-        'choices': choices,
-        'contrarian': contrarian,
-      };
+    'questionId': questionId,
+    'question': question,
+    'answer': answer,
+    'choices': choices,
+    'contrarian': contrarian,
+    if (source != null) 'source': source!.name,
+  };
   factory QaEntry.fromJson(Map<String, dynamic> j) => QaEntry(
-        questionId: j['questionId'] as String,
-        question: j['question'] as String,
-        answer: j['answer'] as String,
-        choices: (j['choices'] as List?)?.map((e) => e.toString()).toList(),
-        contrarian: j['contrarian'] as bool? ?? false,
-      );
+    questionId: j['questionId'] as String,
+    question: j['question'] as String,
+    answer: j['answer'] as String,
+    choices: (j['choices'] as List?)?.map((e) => e.toString()).toList(),
+    contrarian: j['contrarian'] as bool? ?? false,
+    source: AnswerSource.fromJson(j['source']),
+  );
 }
 
 /// 企画メモ（型: What / 誰に / なぜ / どうやって / 次の一歩）。
@@ -101,6 +127,7 @@ class PlanMemo {
   final String nextStep;
   final DateTime createdAt;
   final int version;
+  final AnswerSource? source;
 
   /// 企画の体力測定（v0.2 項目4）: 作りやすさ／ワクワク度（各1〜3）。
   /// 旧メモには無いので nullable。null のときは表示自体を出さない。
@@ -116,40 +143,56 @@ class PlanMemo {
     required this.version,
     this.ease,
     this.spark,
+    this.source,
   });
+
+  PlanMemo withSource(AnswerSource source) => PlanMemo(
+    what: what,
+    who: who,
+    why: why,
+    how: how,
+    nextStep: nextStep,
+    createdAt: createdAt,
+    version: version,
+    ease: ease,
+    spark: spark,
+    source: source,
+  );
 
   /// 体力測定が1つでも入っているか。
   bool get hasFitness => ease != null || spark != null;
 
   Map<String, dynamic> toJson() => {
-        'what': what,
-        'who': who,
-        'why': why,
-        'how': how,
-        'nextStep': nextStep,
-        'createdAt': createdAt.toIso8601String(),
-        'version': version,
-        'ease': ease,
-        'spark': spark,
-      };
+    'what': what,
+    'who': who,
+    'why': why,
+    'how': how,
+    'nextStep': nextStep,
+    'createdAt': createdAt.toIso8601String(),
+    'version': version,
+    'ease': ease,
+    'spark': spark,
+    if (source != null) 'source': source!.name,
+  };
   factory PlanMemo.fromJson(Map<String, dynamic> j) => PlanMemo(
-        what: j['what'] as String? ?? '',
-        who: j['who'] as String? ?? '',
-        why: j['why'] as String? ?? '',
-        how: j['how'] as String? ?? '',
-        nextStep: j['nextStep'] as String? ?? '',
-        createdAt: DateTime.tryParse(j['createdAt'] as String? ?? '') ?? DateTime.now(),
-        version: j['version'] as int? ?? 1,
-        ease: fitnessValueOrNull(j['ease']),
-        spark: fitnessValueOrNull(j['spark']),
-      );
+    what: j['what'] as String? ?? '',
+    who: j['who'] as String? ?? '',
+    why: j['why'] as String? ?? '',
+    how: j['how'] as String? ?? '',
+    nextStep: j['nextStep'] as String? ?? '',
+    createdAt:
+        DateTime.tryParse(j['createdAt'] as String? ?? '') ?? DateTime.now(),
+    version: j['version'] as int? ?? 1,
+    ease: fitnessValueOrNull(j['ease']),
+    spark: fitnessValueOrNull(j['spark']),
+    source: AnswerSource.fromJson(j['source']),
+  );
 }
 
 /// 体力測定の値を 1〜3 に収める。範囲外・欠落・型違いは null（表示なし）。
 int? fitnessValueOrNull(Object? v) {
-  if (v is! num) return null;
-  final i = v.round();
-  return (i >= 1 && i <= 3) ? i : null;
+  if (v is! num || !v.isFinite || v < 1 || v > 3) return null;
+  return v == v.toInt() ? v.toInt() : null;
 }
 
 /// 体力測定の3段階ドット表示（例: 2 → 「●●○」）。数字で追い詰めない表示用。
