@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../app_config.dart';
+import '../on_device_backend.dart';
 import '../store.dart';
 import '../widgets/glass.dart';
 
@@ -21,6 +22,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
       TextEditingController(text: widget.store.model);
   bool _obscure = true;
   bool _saved = false;
+
+  // v0.3.1: オンデバイスAIの診断表示。
+  bool _checking = false;
+  OnDeviceCheck? _diag;
+
+  Future<void> _runDiagnosis() async {
+    setState(() => _checking = true);
+    final result = await OnDeviceBackend().diagnose();
+    if (!mounted) return;
+    setState(() {
+      _checking = false;
+      _diag = result;
+    });
+  }
+
+  String get _diagLabel => switch (_diag?.status) {
+        OnDeviceStatus.available => '使える状態です',
+        OnDeviceStatus.needsDownload =>
+          'モデルのダウンロードが必要です（初回の深掘りで自動で落とします）',
+        OnDeviceStatus.unavailable => 'この端末では使えない状態です',
+        null => '',
+      };
 
   @override
   void dispose() {
@@ -118,6 +141,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       padding: EdgeInsets.only(top: 8),
                       child: Text('保存しました', textAlign: TextAlign.center),
                     ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            GlassCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text('オンデバイスAI',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 6),
+                  const Text(
+                    '端末の中のAIで深掘りする機能。使えない時は理由を確認できます。',
+                    style: TextStyle(fontSize: 13, height: 1.6),
+                  ),
+                  const SizedBox(height: 12),
+                  OutlinedButton(
+                    onPressed: _checking ? null : _runDiagnosis,
+                    child: Text(_checking ? '確認中…' : '状態を確認する'),
+                  ),
+                  if (_diag != null) ...[
+                    const SizedBox(height: 10),
+                    Text(_diagLabel,
+                        style: const TextStyle(
+                            fontSize: 14, fontWeight: FontWeight.bold)),
+                    if (_diag!.message.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(_diag!.message,
+                            style: const TextStyle(fontSize: 12, height: 1.6)),
+                      ),
+                  ],
                 ],
               ),
             ),

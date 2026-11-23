@@ -7,6 +7,7 @@ import 'package:horihori/on_device_backend.dart';
 /// テスト用のオンデバイスAIクライアント。
 class FakeOnDeviceClient implements OnDeviceTextClient {
   OnDeviceStatus status;
+  String message;
   List<String> responses;
   Duration generateDelay;
   int generateCalls = 0;
@@ -14,12 +15,13 @@ class FakeOnDeviceClient implements OnDeviceTextClient {
 
   FakeOnDeviceClient({
     this.status = OnDeviceStatus.available,
+    this.message = '',
     List<String>? responses,
     this.generateDelay = Duration.zero,
   }) : responses = responses ?? [];
 
   @override
-  Future<OnDeviceStatus> checkStatus() async => status;
+  Future<OnDeviceCheck> checkStatus() async => OnDeviceCheck(status, message);
 
   @override
   Future<void> downloadModel() async {
@@ -119,6 +121,32 @@ void main() {
         b.nextQuestion(idea: _idea(), history: const []),
         throwsA(isA<OnDeviceException>()),
       );
+    });
+  });
+
+  group('診断（v0.3.1）', () {
+    test('diagnose は状態と理由をそのまま返す', () async {
+      final b = OnDeviceBackend(
+          client: FakeOnDeviceClient(
+              status: OnDeviceStatus.unavailable,
+              message: 'AICore is not available'));
+      final check = await b.diagnose();
+      expect(check.status, OnDeviceStatus.unavailable);
+      expect(check.message, contains('AICore'));
+    });
+
+    test('利用不可の理由が lastError と チェーンの lastOnDeviceError に残る',
+        () async {
+      final backend = ResilientBackend(
+        null,
+        onDevice: OnDeviceBackend(
+            client: FakeOnDeviceClient(
+                status: OnDeviceStatus.unavailable,
+                message: 'AICore is not available')),
+      );
+      await backend.nextQuestion(idea: _idea(), history: const []);
+      expect(backend.lastOnDeviceFailed, isTrue);
+      expect(backend.lastOnDeviceError, contains('AICore'));
     });
   });
 
