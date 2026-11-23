@@ -51,7 +51,6 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
   String? _failure;
   String? _selectedChoice;
   final _freeCtrl = TextEditingController();
-  final OnceFlag _fallbackNotice = OnceFlag();
 
   Idea get idea => widget.idea;
   bool get _busy => _loading || _summarizing || _saving;
@@ -124,43 +123,6 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _noticeFallback() {
-    if (!_fallbackNotice.tryConsume()) return;
-    final message =
-        _backend.lastRemoteError?.message ??
-        (_backend.lastSource == AnswerSource.remote
-            ? '端末AIが使えなかったため、Gemini APIで生成しました。'
-            : '端末AIが使えなかったため、定型の質問を表示します。');
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(message)));
-  }
-
-  void _maybeShowKeyGuide() {
-    if (widget.store.hasRemoteKey ||
-        widget.store.keyGuideShown ||
-        _backend.lastSource != AnswerSource.local ||
-        !_backend.lastOnDeviceFailed) {
-      return;
-    }
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      if (!mounted || _leaving || ModalRoute.of(context)?.isCurrent != true) {
-        return;
-      }
-      try {
-        await widget.store.markKeyGuideShown();
-      } catch (_) {
-        return;
-      }
-      if (!mounted || _leaving) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text('設定で端末AIの状態を確認できます。'),
-          action: SnackBarAction(label: '設定', onPressed: _openSettings),
-        ),
-      );
-    });
-  }
-
   void _openSettings() {
     if (_busy || _leaving) return;
     Navigator.push<void>(
@@ -208,10 +170,6 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       await _persist();
       if (!_current(request)) return;
       setState(() => _question = generated);
-      if (_backend.lastOnDeviceFailed || _backend.lastRemoteFailed) {
-        _noticeFallback();
-      }
-      _maybeShowKeyGuide();
     } on AiCancelled {
       return;
     } catch (_) {
@@ -446,6 +404,13 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
           title: Text(idea.title, overflow: TextOverflow.ellipsis),
           backgroundColor: Colors.transparent,
           elevation: 0,
+          actions: [
+            IconButton(
+              tooltip: 'AI設定',
+              onPressed: _busy ? null : _openSettings,
+              icon: const Icon(Icons.settings_outlined),
+            ),
+          ],
         ),
         body: GlassBackground(
           child: Padding(
@@ -510,7 +475,14 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                     child: SingleChildScrollView(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [_questionCard(_question!)],
+                        children: [
+                          if (_backend.lastRemoteError case final failure?)
+                            Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: Text(failure.message),
+                            ),
+                          _questionCard(_question!),
+                        ],
                       ),
                     ),
                   ),
