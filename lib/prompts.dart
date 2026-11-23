@@ -7,6 +7,9 @@ import 'models.dart';
 class Prompts {
   static const int maxTextLength = 500;
   static const int maxChoiceLength = 120;
+  static const int standardBudget = 3200;
+  static const int nanoBudget = 1550;
+  static const int compactNanoBudget = 750;
 
   static bool _safeText(String value) {
     final text = value.trim();
@@ -16,10 +19,38 @@ class Prompts {
     return true;
   }
 
-  static String _historyText(List<QaEntry> history) {
-    if (history.isEmpty) return '（まだ回答なし）';
-    return history.map((a) => 'Q: ${a.question}\nA: ${a.answer}').join('\n');
+  static String _clip(String text, int limit) {
+    final runes = text.trim().runes.take(limit + 1).toList();
+    if (runes.length <= limit) return String.fromCharCodes(runes);
+    return '${String.fromCharCodes(runes.take(limit - 1))}…';
   }
+
+  static String _historyText(List<QaEntry> history, int budget) {
+    if (history.isEmpty) return '（まだ回答なし）';
+    final recent = <String>[];
+    var remaining = budget * 3 ~/ 5;
+    for (final entry in history.reversed.take(10)) {
+      if (remaining < 80) break;
+      final turn =
+          'Q: ${_clip(entry.question, 90)}\n'
+          'A: ${_clip(entry.answer, (remaining - 100).clamp(20, 260))}';
+      if (turn.runes.length > remaining) break;
+      recent.add(turn);
+      remaining -= turn.runes.length + 1;
+    }
+    return [
+      if (recent.length < history.length) '（古い回答は省略）',
+      ...recent.reversed,
+    ].join('\n');
+  }
+
+  static String _memoText(PlanMemo memo, int budget) => [
+    ('What', memo.what),
+    ('誰に', memo.who),
+    ('なぜ', memo.why),
+    ('どうやって', memo.how),
+    ('次の一歩', memo.nextStep),
+  ].map((field) => '${field.$1}: ${_clip(field.$2, budget ~/ 24)}').join('\n');
 
   /// 次の質問を1つだけJSONで返させるプロンプト。
   /// [style] で掘り方（友達／上司）、[viewpoint] で視点掘り、
@@ -32,20 +63,22 @@ class Prompts {
     DigStyle style = DigStyle.friend,
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarian = false,
+    int budget = standardBudget,
   }) {
     final memoPart = latestMemo == null
         ? ''
-        : '\n前回までの企画メモ:\nWhat: ${latestMemo.what}\n誰に: ${latestMemo.who}\nなぜ: ${latestMemo.why}\nどうやって: ${latestMemo.how}\n次の一歩: ${latestMemo.nextStep}\n';
-    final viewpointLine =
-        viewpoint.promptLine == null ? '' : '\n${viewpoint.promptLine}こと。';
+        : '\n前回までの企画メモ:\n${_memoText(latestMemo, budget)}\n';
+    final viewpointLine = viewpoint.promptLine == null
+        ? ''
+        : '\n${viewpoint.promptLine}こと。';
     final contrarianLine = contrarian
         ? '\n今回は逆張りとして、このアイデアが失敗するとしたら何が原因かを聞く質問にすること。'
         : '';
     return '''
 あなたはアプリのアイデアを深掘りするインタビュアーです。あなたの役割: ${style.personaPrompt}
-アイデア: 「$title」${note.isEmpty ? '' : '\nメモ: $note'}$memoPart
+アイデア: 「${_clip(title, 120)}」${note.isEmpty ? '' : '\nメモ: ${_clip(note, budget ~/ 10)}'}$memoPart
 これまでのやりとり:
-${_historyText(history)}
+${_historyText(history, budget)}
 
 次に聞く質問を「1つだけ」考えてください。条件:
 - 企画を具体化するために今いちばん効く質問にする
@@ -63,11 +96,12 @@ ${_historyText(history)}
     required List<QaEntry> history,
     PlanMemo? latestMemo,
     DigStyle style = DigStyle.friend,
+    int budget = standardBudget,
   }) {
     return '''
-アプリのアイデア「$title」について、以下のQ&Aをもとに企画メモを整理してください。あなたの役割: ${style.personaPrompt}
-${_historyText(history)}
-${latestMemo == null ? '' : '前回のメモ（改善してよい）: What: ${latestMemo.what} / 誰に: ${latestMemo.who} / なぜ: ${latestMemo.why} / どうやって: ${latestMemo.how} / 次の一歩: ${latestMemo.nextStep}'}
+アプリのアイデア「${_clip(title, 120)}」について、以下のQ&Aをもとに企画メモを整理してください。あなたの役割: ${style.personaPrompt}
+${_historyText(history, budget)}
+${latestMemo == null ? '' : '前回のメモ（改善してよい）:\n${_memoText(latestMemo, budget)}'}
 各項目は1〜2文の日本語で、Q&Aに無いことは盛らないでください。
 あわせて体力測定として、作りやすさ ease とワクワク度 spark をそれぞれ1〜3の整数で付けてください。
 出力はJSONのみ（コードフェンス禁止）:
@@ -76,13 +110,14 @@ ${latestMemo == null ? '' : '前回のメモ（改善してよい）: What: ${la
   }
 
   /// 名前候補を3つ返させるプロンプト（v0.2 項目6）。
-  static String nameCandidates({required String title, required PlanMemo memo}) {
+  static String nameCandidates({
+    required String title,
+    required PlanMemo memo,
+    int budget = standardBudget,
+  }) {
     return '''
-アプリのアイデア「$title」の企画メモ:
-What: ${memo.what}
-誰に: ${memo.who}
-なぜ: ${memo.why}
-どうやって: ${memo.how}
+アプリのアイデア「${_clip(title, 120)}」の企画メモ:
+${_memoText(memo, budget)}
 
 このアプリの名前の候補をちょうど3つ考えてください。条件:
 - 短く、呼びやすく、覚えやすいこと
@@ -96,10 +131,14 @@ What: ${memo.what}
   static List<String> parseNameCandidates(String text) {
     final j = extractJson(text);
     if (j == null) return [];
-    return (j['candidates'] as List? ?? [])
-        .map((e) => e.toString().trim())
+    final candidates = j['candidates'];
+    if (candidates is! List) return [];
+    return candidates
+        .whereType<String>()
+        .map((e) => e.trim())
         .where((s) => s.isNotEmpty)
         .where((s) => _safeText(s) && s.length <= maxChoiceLength)
+        .toSet()
         .take(3)
         .toList();
   }
@@ -134,6 +173,7 @@ What: ${memo.what}
         .map((choice) => choice.trim())
         .where((s) => s.isNotEmpty)
         .where((s) => _safeText(s) && s.length <= maxChoiceLength)
+        .toSet()
         .take(3)
         .toList();
     if (!_safeText(qText) ||
@@ -152,31 +192,27 @@ What: ${memo.what}
     );
   }
 
-  static PlanMemo? parseMemo(String text, {required int version, DateTime? now}) {
+  static PlanMemo? parseMemo(
+    String text, {
+    required int version,
+    DateTime? now,
+  }) {
     final j = extractJson(text);
     if (j == null) return null;
-    const allowed = {
-      'what',
-      'who',
-      'why',
-      'how',
-      'nextStep',
-      'ease',
-      'spark',
-    };
+    const allowed = {'what', 'who', 'why', 'how', 'nextStep', 'ease', 'spark'};
     if (j.keys.any((key) => !allowed.contains(key))) return null;
-    String v(String k) => (j[k] as String? ?? '').trim();
-    final values = [v('what'), v('who'), v('why'), v('how'), v('nextStep')];
-    if (values.any((value) => value.isEmpty) ||
-        values.any((value) => !_safeText(value))) {
-      return null;
+    final values = <String>[];
+    for (final key in ['what', 'who', 'why', 'how', 'nextStep']) {
+      final value = j[key];
+      if (value is! String || !_safeText(value)) return null;
+      values.add(value.trim());
     }
     return PlanMemo(
-      what: v('what'),
-      who: v('who'),
-      why: v('why'),
-      how: v('how'),
-      nextStep: v('nextStep').isEmpty ? '続きを深掘りする' : v('nextStep'),
+      what: values[0],
+      who: values[1],
+      why: values[2],
+      how: values[3],
+      nextStep: values[4],
       createdAt: now ?? DateTime.now(),
       version: version,
       // 体力測定: 範囲外・欠落は null（表示なし）に倒す。

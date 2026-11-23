@@ -39,11 +39,15 @@ class DevBriefScreen extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(vertical: 13),
               ),
               onPressed: () async {
-                await Clipboard.setData(ClipboardData(text: brief));
+                var message = '指示書をコピーしたよ';
+                try {
+                  await Clipboard.setData(ClipboardData(text: brief));
+                } catch (_) {
+                  message = 'コピーできませんでした。本文を選択してコピーできます。';
+                }
                 if (context.mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('指示書をコピーしたよ')),
-                  );
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(SnackBar(content: Text(message)));
                 }
               },
               icon: const Icon(Icons.copy, size: 19),

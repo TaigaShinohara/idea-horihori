@@ -18,8 +18,10 @@ class HomeScreen extends StatelessWidget {
     return Scaffold(
       backgroundColor: Colors.transparent,
       appBar: AppBar(
-        title: const Text('アイデアホリホリ',
-            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 20)),
+        title: const Text(
+          'アイデアホリホリ',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 20),
+        ),
         backgroundColor: Colors.transparent,
         elevation: 0,
         actions: [
@@ -32,7 +34,8 @@ class HomeScreen extends StatelessWidget {
                 onPressed: () => Navigator.push(
                   context,
                   MaterialPageRoute(
-                      builder: (_) => ArchiveScreen(store: store)),
+                    builder: (_) => ArchiveScreen(store: store),
+                  ),
                 ),
                 icon: Stack(
                   clipBehavior: Clip.none,
@@ -44,7 +47,9 @@ class HomeScreen extends StatelessWidget {
                         top: -6,
                         child: Container(
                           padding: const EdgeInsets.symmetric(
-                              horizontal: 5, vertical: 1),
+                            horizontal: 5,
+                            vertical: 1,
+                          ),
                           decoration: BoxDecoration(
                             color: kButtonFill,
                             borderRadius: BorderRadius.circular(99),
@@ -79,6 +84,20 @@ class HomeScreen extends StatelessWidget {
           animation: store,
           builder: (context, _) {
             if (!store.loaded) {
+              if (store.loadError case final error?) {
+                return Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(error),
+                      TextButton(
+                        onPressed: store.load,
+                        child: const Text('再読み込み'),
+                      ),
+                    ],
+                  ),
+                );
+              }
               return const Center(child: CircularProgressIndicator());
             }
             final ideas = store.visibleIdeas;
@@ -96,98 +115,153 @@ class HomeScreen extends StatelessWidget {
                         style: Theme.of(context).textTheme.titleMedium,
                         textAlign: TextAlign.center,
                       ),
+                      if (store.ideasRecoveryNotice case final notice?)
+                        Text(notice, textAlign: TextAlign.center),
                     ],
                   ),
                 ),
               );
             }
+            final recovery = store.ideasRecoveryNotice;
             return ListView.builder(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 96),
-              itemCount: ideas.length,
-              itemBuilder: (context, i) => Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: _IdeaCard(store: store, idea: ideas[i]),
-              ),
+              itemCount: ideas.length + (recovery == null ? 0 : 1),
+              itemBuilder: (context, i) {
+                if (recovery != null && i == 0) {
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Text(recovery),
+                  );
+                }
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: _IdeaCard(
+                    store: store,
+                    idea: ideas[i - (recovery == null ? 0 : 1)],
+                  ),
+                );
+              },
             );
           },
         ),
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        backgroundColor: kButtonFill,
-        foregroundColor: Colors.white,
-        onPressed: () => _showQuickAdd(context),
-        icon: const Icon(Icons.add),
-        label: const Text('アイデアを追加'),
+      floatingActionButton: AnimatedBuilder(
+        animation: store,
+        builder: (context, _) => FloatingActionButton.extended(
+          backgroundColor: kButtonFill,
+          foregroundColor: Colors.white,
+          onPressed: store.loaded ? () => _showQuickAdd(context) : null,
+          icon: const Icon(Icons.add),
+          label: const Text('アイデアを追加'),
+        ),
       ),
     );
   }
 
-  /// S2 クイック追加シート（入力1つ＋任意メモ）。
-  void _showQuickAdd(BuildContext context) {
-    final titleCtrl = TextEditingController();
-    final noteCtrl = TextEditingController();
-    showModalBottomSheet<void>(
+  Future<void> _showQuickAdd(BuildContext context) async {
+    if (ModalRoute.of(context)?.isCurrent != true) return;
+    await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (sheetCtx) => Padding(
-        padding: EdgeInsets.only(
-          left: 16,
-          right: 16,
-          top: 16,
-          bottom: MediaQuery.of(sheetCtx).viewInsets.bottom + 16,
-        ),
-        child: GlassCard(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              TextField(
-                controller: titleCtrl,
-                autofocus: true,
-                maxLines: 2,
-                minLines: 1,
-                style: const TextStyle(fontSize: 17),
-                decoration: const InputDecoration(
-                  hintText: 'どんなアプリ？ 1行で',
-                  border: InputBorder.none,
-                ),
-              ),
-              TextField(
-                controller: noteCtrl,
-                maxLines: 2,
-                minLines: 1,
-                style: const TextStyle(fontSize: 14),
-                decoration: const InputDecoration(
-                  hintText: 'メモ（任意）',
-                  border: InputBorder.none,
-                ),
-              ),
-              const SizedBox(height: 8),
-              // K4: タイトルが空の間は「ストックする」を無効の見た目にする。
-              ValueListenableBuilder<TextEditingValue>(
-                valueListenable: titleCtrl,
-                builder: (context, value, _) {
-                  final canSave = value.text.trim().isNotEmpty;
-                  return FilledButton(
-                    style:
-                        FilledButton.styleFrom(backgroundColor: kButtonFill),
-                    onPressed: canSave
-                        ? () async {
-                            await store.addIdea(titleCtrl.text, noteCtrl.text);
-                            if (sheetCtx.mounted) Navigator.pop(sheetCtx);
-                          }
-                        : null,
-                    child: const Text('ストックする'),
-                  );
-                },
-              ),
-            ],
-          ),
-        ),
-      ),
+      builder: (_) => _QuickAddSheet(store: store),
     );
   }
+}
+
+class _QuickAddSheet extends StatefulWidget {
+  final IdeaStore store;
+  const _QuickAddSheet({required this.store});
+
+  @override
+  State<_QuickAddSheet> createState() => _QuickAddSheetState();
+}
+
+class _QuickAddSheetState extends State<_QuickAddSheet> {
+  final _title = TextEditingController();
+  final _note = TextEditingController();
+  bool _saving = false;
+  String? _error;
+
+  Future<void> _save() async {
+    if (_saving || _title.text.trim().isEmpty) return;
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    try {
+      await widget.store.addIdea(_title.text, _note.text);
+      if (mounted && ModalRoute.of(context)?.isCurrent == true) {
+        Navigator.pop(context);
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _saving = false;
+          _error = '保存できませんでした。入力内容を残しています。';
+        });
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _title.dispose();
+    _note.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => PopScope<void>(
+    canPop: !_saving,
+    child: SingleChildScrollView(
+      padding: EdgeInsets.fromLTRB(
+        16,
+        16,
+        16,
+        MediaQuery.viewInsetsOf(context).bottom + 16,
+      ),
+      child: GlassCard(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            TextField(
+              controller: _title,
+              autofocus: true,
+              enabled: !_saving,
+              maxLines: 2,
+              minLines: 1,
+              style: const TextStyle(fontSize: 17),
+              decoration: const InputDecoration(
+                hintText: 'どんなアプリ？ 1行で',
+                border: InputBorder.none,
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            TextField(
+              controller: _note,
+              enabled: !_saving,
+              maxLines: 2,
+              minLines: 1,
+              style: const TextStyle(fontSize: 14),
+              decoration: const InputDecoration(
+                hintText: 'メモ（任意）',
+                border: InputBorder.none,
+              ),
+            ),
+            const SizedBox(height: 8),
+            FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: kButtonFill),
+              onPressed: _saving || _title.text.trim().isEmpty ? null : _save,
+              child: Text(_saving ? '保存中…' : 'ストックする'),
+            ),
+            if (_error case final error?) Text(error),
+          ],
+        ),
+      ),
+    ),
+  );
 }
 
 class _IdeaCard extends StatelessWidget {
@@ -195,13 +269,18 @@ class _IdeaCard extends StatelessWidget {
   final Idea idea;
   const _IdeaCard({required this.store, required this.idea});
 
+  void _open(BuildContext context, Widget screen) {
+    if (ModalRoute.of(context)?.isCurrent != true) return;
+    Navigator.push<void>(context, MaterialPageRoute(builder: (_) => screen));
+  }
+
   @override
   Widget build(BuildContext context) {
     final stage = idea.stage;
     return GlassCard(
-      onTap: () => Navigator.push(
+      onTap: () => _open(
         context,
-        MaterialPageRoute(builder: (_) => DetailScreen(store: store, idea: idea)),
+        DetailScreen(store: store, idea: idea),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -229,9 +308,9 @@ class _IdeaCard extends StatelessWidget {
                 backgroundColor: kAccent.withValues(alpha: 0.16),
                 foregroundColor: kAccentDeep,
               ),
-              onPressed: () => Navigator.push(
+              onPressed: () => _open(
                 context,
-                MaterialPageRoute(builder: (_) => DigScreen(store: store, idea: idea)),
+                DigScreen(store: store, idea: idea),
               ),
               icon: const Icon(Icons.terrain, size: 18),
               label: Text(idea.resumableSession != null ? 'つづきを掘る' : '深掘り'),

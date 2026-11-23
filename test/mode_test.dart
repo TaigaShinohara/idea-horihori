@@ -87,7 +87,6 @@ double _contrastRatio(Color a, Color b) {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
-  PlatformSecretStore.resetForTest();
 
   group('K1 モード判定（digModeKind）', () {
     test('キーなしは定型（キー未設定）', () {

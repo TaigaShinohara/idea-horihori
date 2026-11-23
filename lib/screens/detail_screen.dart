@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../ai_backend.dart';
 import '../models.dart';
 import '../store.dart';
 import '../widgets/glass.dart';
@@ -32,157 +33,122 @@ class DetailScreen extends StatefulWidget {
 
 class _DetailScreenState extends State<DetailScreen> {
   late bool _celebrate = widget.highlightLatestMemo;
+  bool _editing = false;
+  bool _archiving = false;
+  bool _namesOpen = false;
+  bool _openingDig = false;
 
   IdeaStore get store => widget.store;
   Idea get idea => widget.idea;
 
-  /// タイトル・メモの編集（v0.2 項目8）。空タイトルは保存不可。
   Future<void> _editIdea(BuildContext context) async {
-    final titleCtrl = TextEditingController(text: idea.title);
-    final noteCtrl = TextEditingController(text: idea.note);
-    final saved = await showDialog<bool>(
-      context: context,
-      builder: (dialogCtx) => StatefulBuilder(
-        builder: (dialogCtx, setDialogState) => AlertDialog(
-          title: const Text('タイトルとメモを編集'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: titleCtrl,
-                autofocus: true,
-                decoration: const InputDecoration(labelText: 'タイトル'),
-                onChanged: (_) => setDialogState(() {}),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: noteCtrl,
-                maxLines: 3,
-                decoration: const InputDecoration(labelText: 'メモ'),
-              ),
-            ],
-          ),
+    if (_editing) return;
+    setState(() => _editing = true);
+    try {
+      final values = await showDialog<(String, String)>(
+        context: context,
+        builder: (_) => _EditIdeaDialog(title: idea.title, note: idea.note),
+      );
+      if (values == null || !mounted) return;
+      final previous = (idea.title, idea.note);
+      idea.title = values.$1;
+      idea.note = values.$2;
+      try {
+        await store.updateIdea(idea);
+      } catch (_) {
+        idea.title = previous.$1;
+        idea.note = previous.$2;
+        if (mounted) _showSaveError();
+      }
+    } finally {
+      if (mounted) setState(() => _editing = false);
+    }
+  }
+
+  Future<void> _showNameCandidates(BuildContext context) async {
+    if (_namesOpen) return;
+    _namesOpen = true;
+    try {
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        builder: (_) => _NameCandidatesSheet(store: store, idea: idea),
+      );
+    } finally {
+      _namesOpen = false;
+    }
+  }
+
+  Future<void> _openDig() async {
+    if (_openingDig || _archiving || _editing) return;
+    _openingDig = true;
+    try {
+      final completed = await Navigator.push<bool>(
+        context,
+        MaterialPageRoute(
+          builder: (_) => DigScreen(store: store, idea: idea, fromDetail: true),
+        ),
+      );
+      if (completed == true && mounted) setState(() => _celebrate = true);
+    } finally {
+      _openingDig = false;
+    }
+  }
+
+  void _showSaveError() => ScaffoldMessenger.of(
+    context,
+  ).showSnackBar(const SnackBar(content: Text('変更を保存できませんでした。もう一度お試しください。')));
+
+  Future<void> _confirmArchive(BuildContext context) async {
+    if (_archiving || _editing) return;
+    setState(() => _archiving = true);
+    try {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (dialogCtx) => AlertDialog(
+          title: const Text('アーカイブする？'),
+          content: const Text('一覧からは消えるけど、あとで戻せるよ。'),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(dialogCtx, false),
               child: const Text('キャンセル'),
             ),
             TextButton(
-              onPressed: titleCtrl.text.trim().isEmpty
-                  ? null
-                  : () => Navigator.pop(dialogCtx, true),
-              child: const Text('保存'),
+              onPressed: () => Navigator.pop(dialogCtx, true),
+              child: const Text('アーカイブする'),
             ),
           ],
         ),
-      ),
-    );
-    if (saved != true || !context.mounted) return;
-    idea.title = titleCtrl.text.trim();
-    idea.note = noteCtrl.text.trim();
-    await store.updateIdea(idea);
-    if (mounted) setState(() {});
-  }
-
-  /// 名前候補を出す（v0.2 項目6）。表示のみで、名前は勝手に変えない。
-  Future<void> _showNameCandidates(BuildContext context) async {
-    final backend = store.backend();
-    await showModalBottomSheet<void>(
-      context: context,
-      builder: (sheetCtx) => FutureBuilder<List<String>>(
-        future: backend.nameCandidates(idea: idea),
-        builder: (sheetCtx, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
-            return const SizedBox(
-              height: 160,
-              child: Center(child: CircularProgressIndicator()),
-            );
-          }
-          final names = snapshot.data ?? const <String>[];
-          return SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    '名前の候補',
-                    style:
-                        TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 10),
-                  if (names.isEmpty)
-                    const Text('候補が出せなかったよ')
-                  else
-                    for (final name in names)
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 8),
-                        child: Row(
-                          children: [
-                            const Icon(Icons.lightbulb_outline,
-                                size: 18, color: kAccentDeep),
-                            const SizedBox(width: 8),
-                            Text(name,
-                                style: const TextStyle(
-                                    fontSize: 16, height: 1.5)),
-                          ],
-                        ),
-                      ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
-    );
-  }
-
-  Future<void> _openDig() async {
-    final completed = await Navigator.push<bool>(
-      context,
-      MaterialPageRoute(
-        builder: (_) => DigScreen(store: store, idea: idea, fromDetail: true),
-      ),
-    );
-    // K2: 詳細から始めた深掘りが完了したら、戻った先で山場を見せる。
-    if (completed == true && mounted) {
-      setState(() => _celebrate = true);
-    }
-  }
-
-  Future<void> _confirmArchive(BuildContext context) async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (dialogCtx) => AlertDialog(
-        title: const Text('アーカイブする？'),
-        content: const Text('一覧からは消えるけど、あとで戻せるよ。'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, false),
-            child: const Text('キャンセル'),
+      );
+      if (ok != true || !context.mounted) return;
+      final messenger = ScaffoldMessenger.of(context);
+      await store.archiveIdea(idea);
+      if (!context.mounted) return;
+      Navigator.pop(context);
+      messenger.showSnackBar(
+        SnackBar(
+          content: const Text('アーカイブした'),
+          action: SnackBarAction(
+            label: '元に戻す',
+            onPressed: () async {
+              try {
+                await store.unarchiveIdea(idea);
+              } catch (_) {
+                if (messenger.mounted) {
+                  messenger.showSnackBar(
+                    const SnackBar(content: Text('アイデアを一覧に戻せませんでした。')),
+                  );
+                }
+              }
+            },
           ),
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('アーカイブする'),
-          ),
-        ],
-      ),
-    );
-    if (ok != true || !context.mounted) return;
-    final messenger = ScaffoldMessenger.of(context);
-    await store.archiveIdea(idea);
-    if (!context.mounted) return;
-    Navigator.pop(context);
-    messenger.showSnackBar(
-      SnackBar(
-        content: const Text('アーカイブした'),
-        action: SnackBarAction(
-          label: '元に戻す',
-          onPressed: () => store.unarchiveIdea(idea),
         ),
-      ),
-    );
+      );
+    } catch (_) {
+      if (mounted) _showSaveError();
+    } finally {
+      if (mounted) setState(() => _archiving = false);
+    }
   }
 
   @override
@@ -197,12 +163,12 @@ class _DetailScreenState extends State<DetailScreen> {
           IconButton(
             icon: const Icon(Icons.edit_outlined),
             tooltip: 'タイトルとメモを編集',
-            onPressed: () => _editIdea(context),
+            onPressed: _editing || _archiving ? null : () => _editIdea(context),
           ),
           IconButton(
             icon: const Icon(Icons.archive_outlined),
             tooltip: 'アーカイブ',
-            onPressed: () => _confirmArchive(context),
+            onPressed: _editing || _archiving ? null : () => _confirmArchive(context),
           ),
         ],
       ),
@@ -386,6 +352,8 @@ class _MemoView extends StatelessWidget {
               style: const TextStyle(
                   fontSize: 13, fontWeight: FontWeight.bold, color: kAccentDeep)),
           const SizedBox(height: 10),
+          if (memo.source case final source?)
+            Text('生成元  ${source.label}', style: const TextStyle(fontSize: 12)),
           _MemoBody(memo: memo),
           // 体力測定（項目4）: 値がある時だけ、末尾に静かに1行添える。
           if (memo.hasFitness) ...[
@@ -507,7 +475,8 @@ class _OldMemoTileState extends State<_OldMemoTile> {
                 children: [
                   Expanded(
                     child: Text(
-                      'メモ v${widget.memo.version}',
+                      'メモ v${widget.memo.version}'
+                      '${widget.memo.source == null ? '' : '  ${widget.memo.source!.label}'}',
                       style: const TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.bold,
@@ -529,4 +498,170 @@ class _OldMemoTileState extends State<_OldMemoTile> {
       ),
     );
   }
+}
+
+class _EditIdeaDialog extends StatefulWidget {
+  final String title;
+  final String note;
+  const _EditIdeaDialog({required this.title, required this.note});
+
+  @override
+  State<_EditIdeaDialog> createState() => _EditIdeaDialogState();
+}
+
+class _EditIdeaDialogState extends State<_EditIdeaDialog> {
+  late final _title = TextEditingController(text: widget.title);
+  late final _note = TextEditingController(text: widget.note);
+
+  @override
+  void dispose() {
+    _title.dispose();
+    _note.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('タイトルとメモを編集'),
+    scrollable: true,
+    content: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        TextField(
+          controller: _title,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'タイトル'),
+          onChanged: (_) => setState(() {}),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _note,
+          maxLines: 3,
+          decoration: const InputDecoration(labelText: 'メモ'),
+        ),
+      ],
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('キャンセル'),
+      ),
+      TextButton(
+        onPressed: _title.text.trim().isEmpty
+            ? null
+            : () => Navigator.pop(context, (
+                _title.text.trim(),
+                _note.text.trim(),
+              )),
+        child: const Text('保存'),
+      ),
+    ],
+  );
+}
+
+class _NameCandidatesSheet extends StatefulWidget {
+  final IdeaStore store;
+  final Idea idea;
+  const _NameCandidatesSheet({required this.store, required this.idea});
+
+  @override
+  State<_NameCandidatesSheet> createState() => _NameCandidatesSheetState();
+}
+
+class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
+    with WidgetsBindingObserver {
+  late final ResilientBackend _backend;
+  late Future<List<String>> _names;
+  AiPhase? _phase;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _backend = widget.store.backend()
+      ..onPhase = (phase) {
+        if (mounted) setState(() => _phase = phase);
+      };
+    _names = _backend.nameCandidates(idea: widget.idea);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused) {
+      _backend.cancelPending();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _backend.cancelPending();
+    super.dispose();
+  }
+
+  void _generate({bool templateOnly = false}) {
+    _phase = null;
+    final names = _backend.nameCandidates(
+      idea: widget.idea,
+      templateOnly: templateOnly,
+    );
+    setState(() => _names = names);
+  }
+
+  @override
+  Widget build(BuildContext context) => PopScope<void>(
+    onPopInvokedWithResult: (didPop, _) {
+      if (didPop) _backend.cancelPending();
+    },
+    child: SafeArea(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        child: FutureBuilder<List<String>>(
+          future: _names,
+          builder: (context, snapshot) {
+            final waiting = snapshot.connectionState != ConnectionState.done;
+            final names = snapshot.data ?? const [];
+            final source = _backend.lastSource;
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  '名前の候補',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 10),
+                if (waiting) ...[
+                  const LinearProgressIndicator(),
+                  const SizedBox(height: 8),
+                  Text(
+                    _phase == AiPhase.cloud
+                        ? 'Gemini APIで生成中…'
+                        : '端末AIを確認・生成中…',
+                  ),
+                  TextButton(
+                    onPressed: () => _generate(templateOnly: true),
+                    child: const Text('定型で続ける'),
+                  ),
+                ] else if (snapshot.hasError || names.isEmpty) ...[
+                  const Text('名前候補の生成が完了しませんでした。'),
+                  TextButton(onPressed: _generate, child: const Text('もう一度試す')),
+                ] else ...[
+                  if (source != null) Text('生成元  ${source.label}'),
+                  if (_backend.lastRemoteError case final failure?)
+                    Text(failure.message),
+                  for (final name in names)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 6),
+                      child: Text(name, style: const TextStyle(fontSize: 16)),
+                    ),
+                ],
+              ],
+            );
+          },
+        ),
+      ),
+    ),
+  );
 }

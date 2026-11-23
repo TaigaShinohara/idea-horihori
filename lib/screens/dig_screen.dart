@@ -36,197 +36,306 @@ class DigScreen extends StatefulWidget {
   State<DigScreen> createState() => _DigScreenState();
 }
 
-class _DigScreenState extends State<DigScreen> {
-  late DigSession _session;
-
-  /// セッション中は同じバックエンドを使い回す（K1: 直近の応答元を保持するため）。
-  late ResilientBackend _backend;
+class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
+  late final DigSession _session;
+  late final ResilientBackend _backend;
   DigQuestion? _question;
-  bool _loading = true;
+  bool _loading = false;
   bool _summarizing = false;
+  bool _saving = false;
+  bool _leaving = false;
+  bool _backgrounded = false;
+  bool _retrySummary = false;
+  int _request = 0;
+  AiPhase? _phase;
+  String? _failure;
   String? _selectedChoice;
   final _freeCtrl = TextEditingController();
-
-  /// 現在のモード表示（K1）。バックエンド呼び出しのたびに更新する。
-  late DigModeKind _modeKind;
-
-  /// API失敗→定型切替の通知はセッションに1回だけ（K1）。
   final OnceFlag _fallbackNotice = OnceFlag();
 
   Idea get idea => widget.idea;
-
+  bool get _busy => _loading || _summarizing || _saving;
   bool get _canAnswer =>
       _selectedChoice != null || _freeCtrl.text.trim().isNotEmpty;
+  bool get _sessionComplete =>
+      _session.answers.length >= AppConfig.questionsPerSession;
 
   @override
   void initState() {
     super.initState();
-    _backend = widget.store.backend();
-    _modeKind = _backend.currentModeKind;
-    _session = idea.resumableSession ??
+    WidgetsBinding.instance.addObserver(this);
+    _backend = widget.store.backend()
+      ..onPhase = (phase) {
+        if (mounted && !_leaving) setState(() => _phase = phase);
+      };
+    _session =
+        idea.resumableSession ??
         DigSession(
           id: DateTime.now().microsecondsSinceEpoch.toString(),
           startedAt: DateTime.now(),
         );
-    if (!idea.sessions.contains(_session)) {
-      idea.sessions.add(_session);
+    if (_sessionComplete) {
+      _summarize();
+    } else {
+      _loadQuestion();
     }
-    _loadQuestion();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _backend.cancelPending();
     _freeCtrl.dispose();
     super.dispose();
   }
 
-  Future<void> _persist() => widget.store.updateIdea(idea);
-
-  /// バックエンドの直近結果からモード表示を更新する（K1）。
-  /// 定型（失敗）へ切り替わった瞬間に1回だけ通知する。
-  void _syncMode({bool notify = true}) {
-    final kind = _backend.currentModeKind;
-    if (kind != _modeKind && mounted) {
-      setState(() => _modeKind = kind);
-    } else {
-      _modeKind = kind;
-    }
-    // v0.3.0 PoC: オンデバイス→次候補への切替も、定型への切替と同じく
-    // セッションに1回だけ静かに知らせる。
-    final fellBack = kind == DigModeKind.templateFailed ||
-        (_backend.lastOnDeviceFailed && kind == DigModeKind.ai);
-    if (notify && fellBack && _fallbackNotice.tryConsume() && mounted) {
-      final msg = kind == DigModeKind.ai
-          ? 'オンデバイスAIが使えなかったので、AI（Gemini）に切り替えたよ'
-          : _backend.lastOnDeviceFailed && !widget.store.hasRemoteKey
-              ? 'オンデバイスAIが使えなかったので、定型の質問に切り替えたよ'
-              : 'AIにつながらなかったので、定型の質問に切り替えたよ';
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(msg),
-          duration: const Duration(seconds: 5),
-        ),
-      );
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _backgrounded =
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached;
+    if (_backgrounded && !_leaving && (_loading || _summarizing)) {
+      _retrySummary = _summarizing;
+      _stopGeneration();
+      setState(() {
+        _loading = false;
+        _summarizing = false;
+        _failure = '生成を中止しました。続きから再開できます。';
+      });
     }
   }
 
-  /// K3: キー未設定で深掘りを始めた時に1回だけ案内を出す。
+  void _stopGeneration() {
+    _request++;
+    _backend.cancelPending();
+  }
+
+  bool _current(int request) => mounted && !_leaving && request == _request;
+
+  Future<void> _persist() async {
+    final newSession = !idea.sessions.contains(_session);
+    if (newSession) idea.sessions.add(_session);
+    try {
+      await widget.store.updateIdea(idea);
+    } catch (_) {
+      if (newSession) idea.sessions.remove(_session);
+      rethrow;
+    }
+  }
+
+  void _noticeFallback() {
+    if (!_fallbackNotice.tryConsume()) return;
+    final message =
+        _backend.lastRemoteError?.message ??
+        (_backend.lastSource == AnswerSource.remote
+            ? '端末AIが使えなかったため、Gemini APIで生成しました。'
+            : '端末AIが使えなかったため、定型の質問を表示します。');
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
+  }
+
   void _maybeShowKeyGuide() {
-    // v0.3.0 PoC: オンデバイスで掘れている間は案内しない。
-    // 定型に落ちた時だけ出す。
     if (widget.store.hasRemoteKey ||
         widget.store.keyGuideShown ||
-        _backend.lastSource != AnswerSource.local) {
+        _backend.lastSource != AnswerSource.local ||
+        !_backend.lastOnDeviceFailed) {
       return;
     }
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      if (!mounted) return;
-      await widget.store.markKeyGuideShown();
-      if (!mounted) return;
+      if (!mounted || _leaving || ModalRoute.of(context)?.isCurrent != true) {
+        return;
+      }
+      try {
+        await widget.store.markKeyGuideShown();
+      } catch (_) {
+        return;
+      }
+      if (!mounted || _leaving) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: const Text('今は定型の質問で掘っているよ。キーを入れるとAIが質問するようになるよ'),
-          duration: const Duration(seconds: 8),
-          action: SnackBarAction(
-            label: 'キーを入れる',
-            onPressed: _openSettings,
-          ),
+          content: const Text('設定で端末AIの状態を確認できます。'),
+          action: SnackBarAction(label: '設定', onPressed: _openSettings),
         ),
       );
     });
   }
 
-  Future<void> _openSettings() async {
-    await Navigator.push(
+  void _openSettings() {
+    if (_busy || _leaving) return;
+    Navigator.push<void>(
       context,
       MaterialPageRoute(builder: (_) => SettingsScreen(store: widget.store)),
     );
-    // 設定でキーが変わった可能性があるのでバックエンドを作り直す。
-    _backend = widget.store.backend();
-    _syncMode(notify: false);
   }
 
-  Future<void> _loadQuestion() async {
-    setState(() => _loading = true);
-    // 再開時: 保存済みの pending があればそれを使う。
-    if (_session.pendingQuestion != null) {
-      _question = _session.pendingQuestion;
-      setState(() => _loading = false);
-      _maybeShowKeyGuide();
+  Future<void> _loadQuestion({bool templateOnly = false}) async {
+    if (_session.pendingQuestion case final question?) {
+      setState(() {
+        _question = question;
+        _loading = false;
+        _failure = null;
+      });
       return;
     }
-    // ローカルのみ（キー未設定）の場合は履歴を現在のセッションだけに絞る:
-    // 全履歴を渡すと LocalBackend の既出スキップで2周目に定型5問が
-    // 最初から出なくなるため。Gemini利用時は従来どおり全履歴。
-    final history = widget.store.hasRemoteKey
-        ? [for (final s in idea.sessions) ...s.answers]
-        : [..._session.answers];
-    final q = await _backend.nextQuestion(
-      idea: idea,
-      history: history,
-      style: widget.store.digStyle,
-      viewpoint: _session.viewpoint,
-      contrarianDue: contrarianDue(_session),
-    );
-    // 逆張り質問を出したら、その場で「出した」ことを記録する（再開時の二重防止）。
-    if (q.isContrarian) _session.contrarianAsked = true;
-    _session.pendingQuestion = q;
-    await _persist();
-    if (!mounted) return;
+    final request = ++_request;
     setState(() {
-      _question = q;
-      _loading = false;
+      _loading = true;
+      _summarizing = false;
+      _retrySummary = false;
+      _phase = null;
+      _failure = null;
     });
-    _syncMode();
-    _maybeShowKeyGuide();
+    final previousContrarian = _session.contrarianAsked;
+    DigQuestion? generated;
+    try {
+      generated = await _backend.nextQuestion(
+        idea: idea,
+        history: [for (final s in idea.sessions) ...s.answers],
+        templateHistory: [..._session.answers],
+        style: widget.store.digStyle,
+        viewpoint: _session.viewpoint,
+        contrarianDue: contrarianDue(_session),
+        templateOnly: templateOnly,
+      );
+      if (!_current(request)) return;
+      if (generated.isContrarian) _session.contrarianAsked = true;
+      _session.pendingQuestion = generated;
+      setState(() {
+        _saving = true;
+        _loading = false;
+      });
+      await _persist();
+      if (!_current(request)) return;
+      setState(() => _question = generated);
+      if (_backend.lastOnDeviceFailed || _backend.lastRemoteFailed) {
+        _noticeFallback();
+      }
+      _maybeShowKeyGuide();
+    } on AiCancelled {
+      return;
+    } catch (_) {
+      if (generated != null && identical(_session.pendingQuestion, generated)) {
+        _session.pendingQuestion = null;
+        _session.contrarianAsked = previousContrarian;
+      }
+      if (_current(request)) {
+        setState(() => _failure = '質問を保存できませんでした。もう一度お試しください。');
+      }
+    } finally {
+      if (_current(request)) {
+        setState(() {
+          _loading = false;
+          _saving = false;
+        });
+      }
+    }
   }
 
   Future<void> _answer() async {
-    final q = _question;
-    if (q == null || !_canAnswer) return;
+    final question = _question;
+    if (_busy || _leaving || question == null || !_canAnswer) return;
     final free = _freeCtrl.text.trim();
     final answer = free.isNotEmpty ? free : _selectedChoice;
     if (answer == null || answer.isEmpty) return;
-    _session.answers.add(
-      QaEntry(
-        questionId: q.id,
-        question: q.text,
-        answer: answer,
-        // 「1問もどる」で質問を復元できるよう選択肢も記録する（項目7）。
-        choices: q.choices,
-        contrarian: q.isContrarian,
-      ),
+    setState(() => _saving = true);
+    final previousContrarian = _session.contrarianAsked;
+    final entry = QaEntry(
+      questionId: question.id,
+      question: question.text,
+      answer: answer,
+      choices: question.choices,
+      contrarian: question.isContrarian,
+      source: question.source,
     );
+    _session.answers.add(entry);
+    if (entry.contrarian) _session.contrarianAsked = true;
     _session.pendingQuestion = null;
+    try {
+      await _persist();
+    } catch (_) {
+      _session.answers.remove(entry);
+      _session.pendingQuestion = question;
+      _session.contrarianAsked = previousContrarian;
+      if (mounted && !_leaving) {
+        setState(() => _saving = false);
+        _showSaveError();
+      }
+      return;
+    }
+    if (!mounted || _leaving) return;
     _freeCtrl.clear();
-    _selectedChoice = null;
-    await _persist();
-    if (!mounted) return;
-    if (_session.answers.length >= AppConfig.questionsPerSession) {
-      await _summarize(auto: true);
+    setState(() {
+      _question = null;
+      _selectedChoice = null;
+      _saving = false;
+    });
+    if (_backgrounded) {
+      setState(() => _failure = '回答を保存しました。続きから再開できます。');
+      return;
+    }
+    if (_sessionComplete) {
+      await _summarize();
     } else {
       await _loadQuestion();
     }
   }
 
-  Future<void> _summarize({bool auto = false}) async {
-    setState(() => _summarizing = true);
-    final history = [
-      for (final s in idea.sessions) ...s.answers,
-    ];
-    final memo = await _backend.summarize(
-          idea: idea,
-          history: history,
-          version: idea.memos.length + 1,
-          style: widget.store.digStyle,
-        );
-    idea.memos.add(memo); // 版として積む（上書きしない）
-    _session.finished = true;
-    await _persist();
-    if (!mounted) return;
-    setState(() => _summarizing = false);
-    // K2: 起動元によらず詳細へ遷移し、完成した最新メモを見せる。
+  Future<void> _summarize({bool templateOnly = false}) async {
+    final request = ++_request;
+    setState(() {
+      _summarizing = true;
+      _loading = false;
+      _phase = null;
+      _failure = null;
+    });
+    PlanMemo? memo;
+    final previousPending = _session.pendingQuestion;
+    try {
+      memo = await _backend.summarize(
+        idea: idea,
+        history: [for (final s in idea.sessions) ...s.answers],
+        version: idea.memos.length + 1,
+        style: widget.store.digStyle,
+        templateOnly: templateOnly,
+      );
+      if (!_current(request)) return;
+      idea.memos.add(memo);
+      _session.finished = true;
+      _session.pendingQuestion = null;
+      setState(() {
+        _summarizing = false;
+        _saving = true;
+      });
+      await _persist();
+    } on AiCancelled {
+      return;
+    } catch (_) {
+      if (memo != null && idea.memos.remove(memo)) {
+        _session.finished = false;
+        _session.pendingQuestion = previousPending;
+      }
+      if (_current(request)) {
+        setState(() {
+          _failure = '企画メモを保存できませんでした。もう一度お試しください。';
+          _retrySummary = true;
+        });
+      }
+      return;
+    } finally {
+      if (_current(request)) {
+        setState(() {
+          _summarizing = false;
+          _saving = false;
+        });
+      }
+    }
+    if (!mounted || !_current(request)) return;
+    final failure = _backend.lastRemoteError;
+    if (failure != null) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(failure.message)));
+    }
     if (widget.fromDetail) {
       Navigator.pop(context, true);
     } else {
@@ -243,107 +352,198 @@ class _DigScreenState extends State<DigScreen> {
     }
   }
 
-  /// 「1問もどる」（項目7）: 最後の回答を取り消し、その質問に戻る。
+  void _useTemplate() {
+    final summary = _summarizing;
+    _stopGeneration();
+    if (summary) {
+      _summarize(templateOnly: true);
+    } else {
+      _loadQuestion(templateOnly: true);
+    }
+  }
+
+  void _retry() {
+    if (_retrySummary || _sessionComplete) {
+      _summarize();
+    } else {
+      _loadQuestion();
+    }
+  }
+
   Future<void> _undo() async {
+    if (_busy || _leaving) return;
+    final previousPending = _session.pendingQuestion;
+    final previousContrarian = _session.contrarianAsked;
     final removed = undoLastAnswer(_session);
     if (removed == null) return;
-    _freeCtrl.clear();
-    _selectedChoice = null;
-    await _persist();
-    if (!mounted) return;
-    setState(() {
-      _question = _session.pendingQuestion;
-      _loading = false;
-    });
+    setState(() => _saving = true);
+    try {
+      await _persist();
+      if (!mounted || _leaving) return;
+      _freeCtrl.clear();
+      setState(() {
+        _selectedChoice = null;
+        _question = _session.pendingQuestion;
+      });
+    } catch (_) {
+      _session.answers.add(removed);
+      _session.pendingQuestion = previousPending;
+      _session.contrarianAsked = previousContrarian;
+      if (mounted && !_leaving) _showSaveError();
+    } finally {
+      if (mounted && !_leaving) setState(() => _saving = false);
+    }
   }
 
-  /// 掘り方スタイルの切り替え（項目1）。セッション途中でも以後へ反映する。
+  void _showSaveError() {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('変更を保存できませんでした。もう一度お試しください。')));
+  }
+
   Future<void> _setStyle(DigStyle style) async {
-    if (widget.store.digStyle == style) return;
-    await widget.store.saveDigStyle(style);
-    if (mounted) setState(() {});
+    if (_busy || widget.store.digStyle == style) return;
+    setState(() => _saving = true);
+    try {
+      await widget.store.saveDigStyle(style);
+    } catch (_) {
+      if (mounted && !_leaving) _showSaveError();
+    } finally {
+      if (mounted && !_leaving) setState(() => _saving = false);
+    }
   }
 
-  /// 視点の切り替え（項目2）。セッションに保存して以後へ反映する。
   Future<void> _setViewpoint(DigViewpoint viewpoint) async {
-    if (_session.viewpoint == viewpoint) return;
-    setState(() => _session.viewpoint = viewpoint);
-    await _persist();
+    if (_busy || _session.viewpoint == viewpoint) return;
+    final previous = _session.viewpoint;
+    setState(() {
+      _session.viewpoint = viewpoint;
+      _saving = true;
+    });
+    try {
+      await _persist();
+    } catch (_) {
+      _session.viewpoint = previous;
+      if (mounted && !_leaving) _showSaveError();
+    } finally {
+      if (mounted && !_leaving) setState(() => _saving = false);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final done = _session.answers.length;
     final canSummarize = done > 0 || idea.totalAnswers > 0;
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      appBar: AppBar(
-        title: Text(idea.title, overflow: TextOverflow.ellipsis),
+    return PopScope<bool>(
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) return;
+        _leaving = true;
+        _stopGeneration();
+      },
+      child: Scaffold(
         backgroundColor: Colors.transparent,
-        elevation: 0,
-      ),
-      body: GlassBackground(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // v0.2.1 ノイズ削減 N3/N4: 進み具合は「n/5問」に一本化
-              // （段階アイコンと成長バーはホーム／詳細が正本）。
-              Align(
-                alignment: Alignment.centerRight,
-                child: Text('$done / ${AppConfig.questionsPerSession}問',
-                    style: const TextStyle(fontSize: 13)),
-              ),
-              const SizedBox(height: 10),
-              _ModeBadge(kind: _modeKind),
-              const SizedBox(height: 10),
-              _styleAndViewpointControls(),
-              const SizedBox(height: 12),
-              if (_loading || _summarizing)
-                const Expanded(
-                  child: Center(child: CircularProgressIndicator()),
-                )
-              else if (_question != null)
-                Expanded(
-                  child: SingleChildScrollView(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
+        appBar: AppBar(
+          title: Text(idea.title, overflow: TextOverflow.ellipsis),
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+        ),
+        body: GlassBackground(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // v0.2.1 ノイズ削減 N3/N4: 進み具合は「n/5問」に一本化
+                // （段階アイコンと成長バーはホーム／詳細が正本）。
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: Text(
+                    '$done / ${AppConfig.questionsPerSession}問',
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                if (!_busy && _question?.source != null)
+                  _ModeBadge(source: _question!.source!),
+                const SizedBox(height: 10),
+                _styleAndViewpointControls(),
+                const SizedBox(height: 12),
+                if (_busy)
+                  Expanded(
+                    child: Center(
+                      child: ListView(
+                        shrinkWrap: true,
+                        children: [
+                          const Center(child: CircularProgressIndicator()),
+                          const SizedBox(height: 12),
+                          Text(
+                            _saving
+                                ? '端末に保存中…'
+                                : _phase == AiPhase.cloud
+                                ? 'Gemini APIで生成中…'
+                                : '端末AIを確認・生成中…',
+                            textAlign: TextAlign.center,
+                          ),
+                          if (!_saving && _phase != null)
+                            TextButton(
+                              onPressed: _useTemplate,
+                              child: const Text('定型で続ける'),
+                            ),
+                        ],
+                      ),
+                    ),
+                  )
+                else if (_failure case final failure?)
+                  Expanded(
+                    child: ListView(
                       children: [
-                        _questionCard(_question!),
+                        Text(failure),
+                        TextButton(
+                          onPressed: _retry,
+                          child: const Text('再開する'),
+                        ),
                       ],
                     ),
-                  ),
-                ),
-              if (!_loading && !_summarizing) ...[
-                FilledButton(
-                  style: FilledButton.styleFrom(
-                    backgroundColor: kButtonFill,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                  ),
-                  // K4: 回答が無い間は無効の見た目にする。
-                  onPressed: _canAnswer ? _answer : null,
-                  child: const Text('答える', style: TextStyle(fontSize: 16)),
-                ),
-                const SizedBox(height: 8),
-                // v0.2.1 ノイズ削減 N7/N8: 補助ボタンは横1行に集約し、
-                // 説明文と「あとで続きを掘る」（戻る操作と重複・自動保存済み）を削除。
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                  children: [
-                    TextButton(
-                      // 項目7: 選択肢の記録がある最新の回答だけ「もどる」対象。
-                      onPressed: canUndoLastAnswer(_session) ? _undo : null,
-                      child: const Text('1問もどる'),
+                  )
+                else if (_question != null)
+                  Expanded(
+                    child: SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [_questionCard(_question!)],
+                      ),
                     ),
-                    TextButton(
-                      onPressed: canSummarize ? () => _summarize() : null,
-                      child: const Text('いったんまとめる'),
+                  ),
+                if (!_busy && _failure == null) ...[
+                  FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: kButtonFill,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
                     ),
-                  ],
-                ),
+                    // K4: 回答が無い間は無効の見た目にする。
+                    onPressed: _question != null && _canAnswer ? _answer : null,
+                    child: const Text('答える', style: TextStyle(fontSize: 16)),
+                  ),
+                  const SizedBox(height: 8),
+                  // v0.2.1 ノイズ削減 N7/N8: 補助ボタンは横1行に集約し、
+                  // 説明文と「あとで続きを掘る」（戻る操作と重複・自動保存済み）を削除。
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      TextButton(
+                        // 項目7: 選択肢の記録がある最新の回答だけ「もどる」対象。
+                        onPressed: canUndoLastAnswer(_session) ? _undo : null,
+                        child: const Text('1問もどる'),
+                      ),
+                      TextButton(
+                        onPressed: canSummarize ? () => _summarize() : null,
+                        child: const Text('いったんまとめる'),
+                      ),
+                    ],
+                  ),
+                ],
               ],
-            ],
+            ),
           ),
         ),
       ),
@@ -372,7 +572,7 @@ class _DigScreenState extends State<DigScreen> {
                 ChoiceChip(
                   label: Text(s.label),
                   selected: style == s,
-                  onSelected: (_) => _setStyle(s),
+                  onSelected: _busy ? null : (_) => _setStyle(s),
                 ),
             ],
           ),
@@ -389,7 +589,7 @@ class _DigScreenState extends State<DigScreen> {
                   label: Text(v.label),
                   selected: _session.viewpoint == v,
                   selectedColor: kAccent.withValues(alpha: 0.35),
-                  onSelected: (_) => _setViewpoint(v),
+                  onSelected: _busy ? null : (_) => _setViewpoint(v),
                 ),
             ],
           ),
@@ -455,14 +655,13 @@ class _DigScreenState extends State<DigScreen> {
 /// 現在のモードを示す小さなバッジ（K1）。常時表示する。
 /// v0.2: 掘り方スタイルも併記する（例: 「AIで深掘り中・友達モード」）。
 class _ModeBadge extends StatelessWidget {
-  final DigModeKind kind;
-  const _ModeBadge({required this.kind});
+  final AnswerSource source;
+  const _ModeBadge({required this.source});
 
   @override
   Widget build(BuildContext context) {
-    final isAi = kind.isAi;
-    // v0.2.1 ノイズ削減 N5: 掘り方は選択中チップが正本。バッジはAI／定型だけ。
-    final fullLabel = kind.label;
+    final isAi = source != AnswerSource.local;
+    final fullLabel = source.label;
     return Semantics(
       container: true,
       label: '現在のモード: $fullLabel',
@@ -479,11 +678,7 @@ class _ModeBadge extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Icon(
-                  isAi
-                      ? Icons.auto_awesome
-                      : (kind == DigModeKind.templateFailed
-                          ? Icons.cloud_off_outlined
-                          : Icons.list_alt_outlined),
+                  isAi ? Icons.auto_awesome : Icons.list_alt_outlined,
                   size: 15,
                   color: kAccentDeep,
                 ),

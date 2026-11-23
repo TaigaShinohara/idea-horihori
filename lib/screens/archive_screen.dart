@@ -73,7 +73,10 @@ class _ArchivedCard extends StatelessWidget {
           Text(
             idea.title,
             style: const TextStyle(
-                fontSize: 16, height: 1.5, fontWeight: FontWeight.w600),
+              fontSize: 16,
+              height: 1.5,
+              fontWeight: FontWeight.w600,
+            ),
           ),
           const SizedBox(height: 10),
           Row(
@@ -81,8 +84,10 @@ class _ArchivedCard extends StatelessWidget {
             children: [
               TextButton(
                 onPressed: () => _confirmDelete(context),
-                child: const Text('完全に削除',
-                    style: TextStyle(color: Colors.redAccent)),
+                child: const Text(
+                  '完全に削除',
+                  style: TextStyle(color: Colors.redAccent),
+                ),
               ),
               const SizedBox(width: 8),
               FilledButton.tonalIcon(
@@ -91,11 +96,15 @@ class _ArchivedCard extends StatelessWidget {
                   foregroundColor: kAccentDeep,
                 ),
                 onPressed: () async {
-                  await store.unarchiveIdea(idea);
+                  try {
+                    await store.unarchiveIdea(idea);
+                  } catch (_) {
+                    if (context.mounted) _showError(context);
+                    return;
+                  }
                   if (context.mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('一覧に戻したよ')),
-                    );
+                    ScaffoldMessenger.of(context)
+                        .showSnackBar(const SnackBar(content: Text('一覧に戻したよ')));
                   }
                 },
                 icon: const Icon(Icons.unarchive_outlined, size: 18),
@@ -121,14 +130,24 @@ class _ArchivedCard extends StatelessWidget {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('削除する',
-                style: TextStyle(color: Colors.redAccent)),
+            child: const Text(
+              '削除する',
+              style: TextStyle(color: Colors.redAccent),
+            ),
           ),
         ],
       ),
     );
-    if (ok == true) {
-      await store.deleteIdea(idea);
+    if (ok == true && context.mounted) {
+      try {
+        await store.deleteIdea(idea);
+      } catch (_) {
+        if (context.mounted) _showError(context);
+      }
     }
   }
+
+  void _showError(BuildContext context) =>
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('変更を保存できませんでした。')));
 }

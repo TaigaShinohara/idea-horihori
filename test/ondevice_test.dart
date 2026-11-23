@@ -104,13 +104,18 @@ void main() {
       expect(memo.spark, 3);
     });
 
-    test('ダウンロードが必要な端末では先にダウンロードする', () async {
+    test('通常の深掘りはモデル取得で待たず、設定からなら準備できる', () async {
       final client = FakeOnDeviceClient(
         status: OnDeviceStatus.needsDownload,
         responses: [_qJson],
       );
       final b = OnDeviceBackend(client: client);
-      final q = await b.nextQuestion(idea: _idea(), history: const []);
+      await expectLater(
+        b.nextQuestion(idea: _idea(), history: const []),
+        throwsA(isA<OnDeviceException>()),
+      );
+      expect(client.downloadCalls, 0);
+      final q = await b.verifyGeneration();
       expect(q.text, '誰に使ってほしい？');
       expect(client.downloadCalls, 1);
     });

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'app_config.dart';
@@ -5,11 +7,11 @@ import 'screens/home_screen.dart';
 import 'store.dart';
 import 'widgets/glass.dart';
 
-Future<void> main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
   final store = IdeaStore();
-  await store.load();
   runApp(HorihoriApp(store: store));
+  unawaited(store.load());
 }
 
 class HorihoriApp extends StatelessWidget {
@@ -29,8 +31,10 @@ class HorihoriApp extends StatelessWidget {
       darkTheme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,
-        colorScheme:
-            ColorScheme.fromSeed(seedColor: kAccent, brightness: Brightness.dark),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: kAccent,
+          brightness: Brightness.dark,
+        ),
         scaffoldBackgroundColor: Colors.transparent,
       ),
       home: HomeScreen(store: store),

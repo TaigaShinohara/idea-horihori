@@ -165,6 +165,7 @@ void main() {
         return switch (call.method) {
           'getAvailability' => {'status': 'available', 'reason': 'ready'},
           'getPlatformInfo' => {'backend': 'androidMlKitGenAi'},
+          'sessionCountTokens' => 100,
           'sessionGetResponse' => {
               'text': '{"id":"q1","text":"どこを歩く？","choices":["公園","川","街"]}',
             },

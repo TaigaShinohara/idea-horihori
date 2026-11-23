@@ -24,9 +24,8 @@ QaEntry? undoLastAnswer(DigSession session) {
     text: last.question,
     choices: last.choices!,
     isContrarian: last.contrarian,
+    source: last.source,
   );
-  if (last.contrarian) {
-    session.contrarianAsked = false;
-  }
+  session.contrarianAsked = session.answers.any((answer) => answer.contrarian);
   return last;
 }
