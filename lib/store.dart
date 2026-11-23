@@ -1,6 +1,8 @@
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'ai_backend.dart';
@@ -11,11 +13,63 @@ import 'models.dart';
 
 /// 端末内のみの保存（SharedPreferences に JSON）。アカウント・同期なし。
 /// APIキーはここに保存するが、ログには決して出さない。
+abstract class SecretStore {
+  Future<String?> read(String key);
+  Future<void> write(String key, String value);
+  Future<void> delete(String key);
+}
+
+class PlatformSecretStore implements SecretStore {
+  final FlutterSecureStorage _storage;
+  static final Map<String, String> _testFallback = {};
+  @visibleForTesting
+  static void resetForTest() => _testFallback.clear();
+  PlatformSecretStore({FlutterSecureStorage? storage})
+      : _storage = storage ?? const FlutterSecureStorage();
+
+  @override
+  Future<String?> read(String key) async {
+    try {
+      return await _storage.read(key: key);
+    } on MissingPluginException {
+      return _testFallback[key];
+    } on PlatformException {
+      return _testFallback[key];
+    }
+  }
+
+  @override
+  Future<void> write(String key, String value) async {
+    try {
+      await _storage.write(key: key, value: value);
+    } on MissingPluginException {
+      _testFallback[key] = value;
+    } on PlatformException {
+      _testFallback[key] = value;
+    }
+  }
+
+  @override
+  Future<void> delete(String key) async {
+    try {
+      await _storage.delete(key: key);
+    } on MissingPluginException {
+      _testFallback.remove(key);
+    } on PlatformException {
+      _testFallback.remove(key);
+    }
+  }
+}
+
 class IdeaStore extends ChangeNotifier {
+  final SecretStore _secrets;
+  IdeaStore({SecretStore? secrets}) : _secrets = secrets ?? PlatformSecretStore();
+
   List<Idea> ideas = [];
   String apiKey = '';
   String model = AppConfig.defaultGeminiModel;
   bool loaded = false;
+  bool remoteConsent = false;
 
   /// K3: キー未設定時の初回案内を出したかどうか（1回だけ出す）。
   bool keyGuideShown = false;
@@ -25,7 +79,17 @@ class IdeaStore extends ChangeNotifier {
 
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
-    apiKey = prefs.getString(AppConfig.prefsApiKeyKey) ?? '';
+    apiKey = await _secrets.read(AppConfig.secureApiKeyKey) ?? '';
+    if (apiKey.isEmpty) {
+      final legacyKey = prefs.getString(AppConfig.prefsApiKeyKey);
+      if (legacyKey != null && legacyKey.isNotEmpty) {
+        await _secrets.write(AppConfig.secureApiKeyKey, legacyKey.trim());
+        apiKey = legacyKey.trim();
+      }
+    }
+    await prefs.remove(AppConfig.prefsApiKeyKey);
+    remoteConsent =
+        prefs.getBool(AppConfig.prefsRemoteConsentKey) ?? false;
     model = prefs.getString(AppConfig.prefsModelKey) ?? AppConfig.defaultGeminiModel;
     keyGuideShown = prefs.getBool(AppConfig.prefsKeyGuideShownKey) ?? false;
     digStyle =
@@ -123,8 +187,28 @@ class IdeaStore extends ChangeNotifier {
 
   Future<void> saveApiKey(String key) async {
     apiKey = key.trim();
+    if (apiKey.isEmpty) {
+      await _secrets.delete(AppConfig.secureApiKeyKey);
+    } else {
+      await _secrets.write(AppConfig.secureApiKeyKey, apiKey);
+    }
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(AppConfig.prefsApiKeyKey, apiKey);
+    await prefs.remove(AppConfig.prefsApiKeyKey);
+    notifyListeners();
+  }
+
+  Future<void> deleteApiKey() async {
+    apiKey = '';
+    await _secrets.delete(AppConfig.secureApiKeyKey);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(AppConfig.prefsApiKeyKey);
+    notifyListeners();
+  }
+
+  Future<void> saveRemoteConsent(bool consent) async {
+    remoteConsent = consent;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(AppConfig.prefsRemoteConsentKey, consent);
     notifyListeners();
   }
 
@@ -139,7 +223,9 @@ class IdeaStore extends ChangeNotifier {
   /// v0.3.0 PoC: 優先順は オンデバイス → Gemini（キーがある場合）→ 定型。
   ResilientBackend backend() {
     return ResilientBackend(
-      apiKey.isEmpty ? null : GeminiBackend(apiKey: apiKey, model: model),
+      apiKey.isEmpty || !remoteConsent
+          ? null
+          : GeminiBackend(apiKey: apiKey, model: model),
       onDevice: OnDeviceBackend(),
     );
   }

@@ -142,11 +142,49 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     },
                     child: const Text('保存する'),
                   ),
+                  if (_keyCtrl.text.isNotEmpty)
+                    TextButton(
+                      onPressed: () async {
+                        await widget.store.deleteApiKey();
+                        _keyCtrl.clear();
+                        await widget.store.saveRemoteConsent(false);
+                        if (!mounted) return;
+                        setState(() => _saved = true);
+                      },
+                      child: const Text('キーを削除する'),
+                    ),
                   if (_saved)
                     const Padding(
                       padding: EdgeInsets.only(top: 8),
                       child: Text('保存しました', textAlign: TextAlign.center),
                     ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            GlassCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text('クラウド送信',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 6),
+                  Material(
+                    type: MaterialType.transparency,
+                    child: SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('オンデバイス失敗時にGeminiへ送る'),
+                      subtitle: const Text(
+                        '送る項目: アイデア名、メモ、回答履歴。未同意なら外部送信しない。',
+                      ),
+                      value: widget.store.remoteConsent,
+                      onChanged: (value) async {
+                        await widget.store.saveRemoteConsent(value);
+                        if (mounted) setState(() {});
+                      },
+                    ),
+                  ),
                 ],
               ),
             ),

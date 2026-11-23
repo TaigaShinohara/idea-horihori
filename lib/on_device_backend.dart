@@ -11,6 +11,17 @@ import 'prompts.dart';
 /// 状態。プラグインの型をアプリ側の言葉に寄せたもの（テスト差し替え用）。
 enum OnDeviceStatus { available, needsDownload, unavailable }
 
+enum OnDeviceLifecycle {
+  idle,
+  checking,
+  ready,
+  downloadable,
+  downloading,
+  unavailable,
+  timedOut,
+  cancelled,
+}
+
 /// 状態確認の結果（プラグインが返す理由メッセージつき）。
 class OnDeviceCheck {
   final OnDeviceStatus status;
@@ -97,6 +108,7 @@ class OnDeviceBackend implements AiBackend {
 
   /// 直近の失敗理由（診断表示用）。成功したら消える。
   String? lastError;
+  OnDeviceLifecycle lifecycle = OnDeviceLifecycle.idle;
 
   OnDeviceBackend({
     OnDeviceTextClient? client,
@@ -115,6 +127,7 @@ class OnDeviceBackend implements AiBackend {
   }
 
   Future<void> _prepare() async {
+    lifecycle = OnDeviceLifecycle.checking;
     try {
       final check = await _client.checkStatus().timeout(
             statusTimeout,
@@ -124,15 +137,23 @@ class OnDeviceBackend implements AiBackend {
       lastError = null;
       switch (check.status) {
         case OnDeviceStatus.available:
+          lifecycle = OnDeviceLifecycle.ready;
+          lastError = null;
           return;
         case OnDeviceStatus.needsDownload:
+          lifecycle = OnDeviceLifecycle.downloading;
           await _client.downloadModel().timeout(
                 downloadTimeout,
-                onTimeout: () =>
-                    throw OnDeviceException('model download timed out'),
+                onTimeout: () {
+                  lifecycle = OnDeviceLifecycle.timedOut;
+                  throw OnDeviceException('model download timed out');
+                },
               );
+          lifecycle = OnDeviceLifecycle.ready;
+          lastError = null;
           return;
         case OnDeviceStatus.unavailable:
+          lifecycle = OnDeviceLifecycle.unavailable;
           throw OnDeviceException(check.message.isEmpty
               ? 'on-device AI unavailable on this device'
               : 'on-device AI unavailable: ${check.message}');
@@ -142,6 +163,13 @@ class OnDeviceBackend implements AiBackend {
       // ようにキャッシュを捨てる。
       _readyFuture = null;
       lastError = e.toString();
+      if (e is OnDeviceException &&
+          (e.message.contains('timed out') ||
+              e.message.contains('timeout'))) {
+        lifecycle = OnDeviceLifecycle.timedOut;
+      } else {
+        lifecycle = OnDeviceLifecycle.unavailable;
+      }
       if (e is OnDeviceException) rethrow;
       throw OnDeviceException('on-device AI preparation failed: $e');
     }
@@ -156,6 +184,11 @@ class OnDeviceBackend implements AiBackend {
     }
   }
 
+  void cancelPending() {
+    lifecycle = OnDeviceLifecycle.cancelled;
+    _readyFuture = null;
+  }
+
   Future<String> _generate(String prompt) async {
     await _ensureReady();
     try {
@@ -167,6 +200,9 @@ class OnDeviceBackend implements AiBackend {
       return text;
     } on OnDeviceException catch (e) {
       lastError = e.toString();
+      if (e.message.contains('timed out')) {
+        lifecycle = OnDeviceLifecycle.timedOut;
+      }
       rethrow;
     } catch (e) {
       lastError = 'generation failed: $e';

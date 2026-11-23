@@ -76,6 +76,7 @@ class _DigScreenState extends State<DigScreen> {
 
   @override
   void dispose() {
+    _backend.cancelPending();
     _freeCtrl.dispose();
     super.dispose();
   }

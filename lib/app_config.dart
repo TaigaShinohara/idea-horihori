@@ -16,6 +16,8 @@ class AppConfig {
   static const String prefsIdeasKey = 'ideas_v1';
   static const String prefsIdeasBackupKey = 'ideas_v1_backup';
   static const String prefsApiKeyKey = 'gemini_api_key';
+  static const String secureApiKeyKey = 'gemini_api_key_secure';
+  static const String prefsRemoteConsentKey = 'gemini_remote_consent_v1';
   static const String prefsModelKey = 'gemini_model';
   static const String prefsKeyGuideShownKey = 'key_guide_shown_v1';
 

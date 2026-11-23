@@ -5,6 +5,17 @@ import 'models.dart';
 
 /// Gemini へ渡すプロンプト生成と、応答JSONの解釈（純ロジック寄り）。
 class Prompts {
+  static const int maxTextLength = 500;
+  static const int maxChoiceLength = 120;
+
+  static bool _safeText(String value) {
+    final text = value.trim();
+    if (text.isEmpty || text.length > maxTextLength) return false;
+    if (text.contains('\u0000')) return false;
+    if (RegExp(r'https?://', caseSensitive: false).hasMatch(text)) return false;
+    return true;
+  }
+
   static String _historyText(List<QaEntry> history) {
     if (history.isEmpty) return '（まだ回答なし）';
     return history.map((a) => 'Q: ${a.question}\nA: ${a.answer}').join('\n');
@@ -88,6 +99,7 @@ What: ${memo.what}
     return (j['candidates'] as List? ?? [])
         .map((e) => e.toString().trim())
         .where((s) => s.isNotEmpty)
+        .where((s) => _safeText(s) && s.length <= maxChoiceLength)
         .take(3)
         .toList();
   }
@@ -117,9 +129,15 @@ What: ${memo.what}
     final choices = (j['choices'] as List? ?? [])
         .map((e) => e.toString().trim())
         .where((s) => s.isNotEmpty)
+        .where((s) => _safeText(s) && s.length <= maxChoiceLength)
         .take(3)
         .toList();
-    if (qText.isEmpty || choices.length < 2) return null;
+    if (!_safeText(qText) ||
+        qText.length > maxChoiceLength ||
+        choices.length < 2 ||
+        choices.length > 3) {
+      return null;
+    }
     return DigQuestion(
       id: (j['id'] as String? ?? 'ai').trim().isEmpty ? 'ai' : j['id'] as String,
       text: qText,
@@ -130,8 +148,22 @@ What: ${memo.what}
   static PlanMemo? parseMemo(String text, {required int version, DateTime? now}) {
     final j = extractJson(text);
     if (j == null) return null;
+    const allowed = {
+      'what',
+      'who',
+      'why',
+      'how',
+      'nextStep',
+      'ease',
+      'spark',
+    };
+    if (j.keys.any((key) => !allowed.contains(key))) return null;
     String v(String k) => (j[k] as String? ?? '').trim();
-    if (v('what').isEmpty && v('who').isEmpty) return null;
+    final values = [v('what'), v('who'), v('why'), v('how'), v('nextStep')];
+    if (values.any((value) => value.isEmpty) ||
+        values.any((value) => !_safeText(value))) {
+      return null;
+    }
     return PlanMemo(
       what: v('what'),
       who: v('who'),

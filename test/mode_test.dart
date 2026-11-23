@@ -10,6 +10,21 @@ import 'package:horihori/store.dart';
 import 'package:horihori/widgets/glass.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+class FakeSecretStore implements SecretStore {
+  final Map<String, String> values = {};
+
+  @override
+  Future<void> delete(String key) async => values.remove(key);
+
+  @override
+  Future<String?> read(String key) async => values[key];
+
+  @override
+  Future<void> write(String key, String value) async {
+    values[key] = value;
+  }
+}
+
 Idea _idea() => Idea(
       id: '1',
       title: '天気で服を決めるアプリ',
@@ -71,6 +86,9 @@ double _contrastRatio(Color a, Color b) {
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  PlatformSecretStore.resetForTest();
+
   group('K1 モード判定（digModeKind）', () {
     test('キーなしは定型（キー未設定）', () {
       expect(
@@ -176,14 +194,14 @@ void main() {
 
     test('初期は false、markKeyGuideShown で true になり再読込でも保たれる',
         () async {
-      final store = IdeaStore();
+      final store = IdeaStore(secrets: FakeSecretStore());
       await store.load();
       expect(store.keyGuideShown, isFalse);
 
       await store.markKeyGuideShown();
       expect(store.keyGuideShown, isTrue);
 
-      final reloaded = IdeaStore();
+      final reloaded = IdeaStore(secrets: FakeSecretStore());
       await reloaded.load();
       expect(reloaded.keyGuideShown, isTrue);
 

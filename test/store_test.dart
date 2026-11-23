@@ -3,11 +3,29 @@ import 'package:horihori/app_config.dart';
 import 'package:horihori/store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+class FakeSecretStore implements SecretStore {
+  final Map<String, String> values = {};
+
+  @override
+  Future<void> delete(String key) async {
+    values.remove(key);
+  }
+
+  @override
+  Future<String?> read(String key) async => values[key];
+
+  @override
+  Future<void> write(String key, String value) async {
+    values[key] = value;
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+    PlatformSecretStore.resetForTest();
   });
 
   group('アーカイブ復元・削除', () {
@@ -77,6 +95,34 @@ void main() {
       expect(store.hasRemoteKey, isFalse);
       await store.saveApiKey('dummy-key');
       expect(store.hasRemoteKey, isTrue);
+    });
+    test('secure storageへ保存し旧SharedPreferences値を削除する', () async {
+      final secrets = FakeSecretStore();
+      SharedPreferences.setMockInitialValues({
+        AppConfig.prefsApiKeyKey: 'legacy-key',
+      });
+      final store = IdeaStore(secrets: secrets);
+      await store.load();
+      expect(store.apiKey, 'legacy-key');
+      expect(secrets.values[AppConfig.secureApiKeyKey], 'legacy-key');
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(AppConfig.prefsApiKeyKey), isNull);
+
+      await store.saveApiKey('new-key');
+      expect(secrets.values[AppConfig.secureApiKeyKey], 'new-key');
+
+      await store.deleteApiKey();
+      expect(store.apiKey, isEmpty);
+      expect(secrets.values[AppConfig.secureApiKeyKey], isNull);
+    });
+    test('リモート同意なしではbackendにGeminiを渡さない', () async {
+      final secrets = FakeSecretStore();
+      final store = IdeaStore(secrets: secrets);
+      await store.load();
+      await store.saveApiKey('dummy-key');
+      expect(store.backend().remote, isNull);
+      await store.saveRemoteConsent(true);
+      expect(store.backend().remote, isNotNull);
     });
   });
 

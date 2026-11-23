@@ -223,6 +223,13 @@ class ResilientBackend implements AiBackend {
   /// 直近のオンデバイス失敗の理由（診断表示用、v0.3.1）。
   String? lastOnDeviceError;
 
+  void cancelPending() {
+    final candidate = onDevice;
+    if (candidate is OnDeviceBackend) {
+      candidate.cancelPending();
+    }
+  }
+
   /// 現在のモード表示（DigScreen のバッジ用）。
   DigModeKind get currentModeKind {
     final s = lastSource;
