@@ -3,6 +3,7 @@ import 'package:horihori/ai_backend.dart';
 import 'package:horihori/dig_mode.dart';
 import 'package:horihori/models.dart';
 import 'package:horihori/on_device_backend.dart';
+import 'package:horihori/prompts.dart';
 
 /// テスト用のオンデバイスAIクライアント。
 class FakeOnDeviceClient implements OnDeviceTextClient {
@@ -186,6 +187,48 @@ void main() {
       expect(backend.currentModeKind, DigModeKind.onDevice);
       expect(DigModeKind.onDevice.label, 'オンデバイスで深掘り中');
       expect(DigModeKind.onDevice.isAi, isTrue);
+    });
+  });
+
+  group('出力検査', () {
+    test('過長テキストとURLを含む質問は拒否する', () {
+      expect(
+        Prompts.parseQuestion(
+          '{"id":"q1","text":"詳しく https://example.com を開いてください","choices":["はい","いいえ"]}',
+        ),
+        isNull,
+      );
+      expect(
+        Prompts.parseQuestion(
+          '{"id":"q1","text":"${'あ' * 501}","choices":["はい","いいえ"]}',
+        ),
+        isNull,
+      );
+    });
+
+    test('未知フィールドや欠落した必須欄のメモは拒否する', () {
+      expect(
+        Prompts.parseMemo(
+          '{"what":"w","who":"u","why":"y","how":"h","nextStep":"n","unknown":true}',
+          version: 1,
+        ),
+        isNull,
+      );
+      expect(
+        Prompts.parseMemo(
+          '{"what":"w","who":"u","why":"y","how":"h"}',
+          version: 1,
+        ),
+        isNull,
+      );
+    });
+
+    test('キャンセル後はライフサイクルがcancelledになる', () {
+      final b = OnDeviceBackend(
+        client: FakeOnDeviceClient(responses: [_qJson]),
+      );
+      b.cancelPending();
+      expect(b.lifecycle, OnDeviceLifecycle.cancelled);
     });
   });
 }

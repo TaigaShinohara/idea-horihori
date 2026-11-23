@@ -7,6 +7,21 @@ import 'package:horihori/screens/settings_screen.dart';
 import 'package:horihori/store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+class FakeSecretStore implements SecretStore {
+  final Map<String, String> values = {};
+
+  @override
+  Future<void> delete(String key) async => values.remove(key);
+
+  @override
+  Future<String?> read(String key) async => values[key];
+
+  @override
+  Future<void> write(String key, String value) async {
+    values[key] = value;
+  }
+}
+
 /// 交付前UI検証（実機なし検証の標準、2026-11-23 本人決定）:
 /// 主要画面を JVM 上で描画し、レイアウト崩壊・はみ出し・遷移破損を
 /// golden と widget テストで先に捕まえる。
@@ -24,7 +39,7 @@ void main() {
 
   Future<IdeaStore> loadedStore({int ideaCount = 0}) async {
     SharedPreferences.setMockInitialValues({});
-    final store = IdeaStore();
+    final store = IdeaStore(secrets: FakeSecretStore());
     await store.load();
     for (var i = 0; i < ideaCount; i++) {
       await store.addIdea('アイデア${i + 1}：散歩メモアプリ', '思いつきメモ');
