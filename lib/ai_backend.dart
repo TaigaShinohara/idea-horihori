@@ -11,6 +11,7 @@ import 'fallback.dart';
 import 'models.dart';
 import 'name_candidates.dart';
 import 'prompts.dart';
+import 'session_logic.dart';
 
 export 'models.dart' show AnswerSource;
 
@@ -317,18 +318,52 @@ class LocalBackend implements AiBackend {
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
   }) async {
-    // 逆張り（項目3）: 指定があり、まだ出していなければ固定文を出す（1回だけ）。
-    if (contrarianDue && !history.any((a) => a.contrarian)) {
-      return FallbackQuestions.contrarianQuestion;
+    final priorRound = hasCompletedPriorRound(idea);
+    final allAskedIds = <String>{
+      for (final s in idea.sessions)
+        for (final a in s.answers) a.questionId,
+      for (final a in history) a.questionId,
+    };
+
+    // R-01: 定型モード1周目は基本5スロット完走を優先し、逆張りは2周目以降に発火する。
+    if (priorRound && contrarianDue && !history.any((a) => a.contrarian)) {
+      return FallbackQuestions.styled(
+        FallbackQuestions.contrarianQuestion,
+        style,
+      );
     }
-    // 既出の定型質問は飛ばし、次の未出題を出す。
+
+    // R-03: 視点が明示選択されている場合、その視点の未出題質問を出題する。
+    if (viewpoint != DigViewpoint.none) {
+      final pool = FallbackQuestions.viewpointQuestions[viewpoint] ?? const [];
+      for (final q in pool) {
+        if (!allAskedIds.contains(q.id)) {
+          return FallbackQuestions.styled(q, style);
+        }
+      }
+    }
+
+    // 基本5問のうち未出題のものを順に出す（2周目以降は過去セッションも既出とみなす）。
+    final basicAskedIds = priorRound
+        ? allAskedIds
+        : history.map((a) => a.questionId).toSet();
     for (final q in FallbackQuestions.questions) {
-      if (!history.any((a) => a.questionId == q.id)) {
+      if (!basicAskedIds.contains(q.id)) {
         return FallbackQuestions.styled(q, style);
       }
     }
+
+    // 2周目以降で基本5問をすべて回答済みなら、2周目用の深掘り質問を出す（ループ防止）。
+    if (priorRound) {
+      for (final q in FallbackQuestions.deepeningQuestions) {
+        if (!allAskedIds.contains(q.id)) {
+          return FallbackQuestions.styled(q, style);
+        }
+      }
+    }
+
     // 定型を使い切ったら汎用の広げ質問を出す。
-    final n = history.length + 1;
+    final n = (priorRound ? allAskedIds.length : history.length) + 1;
     return FallbackQuestions.styled(
       DigQuestion(
         id: 'extra$n',
@@ -396,6 +431,26 @@ class ResilientBackend implements AiBackend {
   /// 直近のオンデバイス失敗の理由（診断表示用、v0.3.1）。
   String? lastOnDeviceError;
 
+  /// 直近の呼び出しがユーザー手動の「定型で続ける」だったか（R-04）。
+  bool lastManualTemplate = false;
+
+  /// 直近のオンデバイス状態（R-04）。
+  OnDeviceStatus? get lastOnDeviceStatus =>
+      onDevice is OnDeviceBackend ? (onDevice as OnDeviceBackend).lastStatus : null;
+
+  /// 定型モードに落ちた理由（R-04）。AI応答時は null。
+  FallbackReason? fallbackReason({
+    required bool hasRemoteKey,
+    required bool remoteConsent,
+  }) => fallbackReasonFor(
+    isLocalSource: lastSource == AnswerSource.local,
+    hasRemoteKey: hasRemoteKey,
+    remoteConsent: remoteConsent,
+    lastRemoteFailed: lastRemoteFailed,
+    onDeviceNeedsDownload: lastOnDeviceStatus == OnDeviceStatus.needsDownload,
+    manualTemplate: lastManualTemplate,
+  );
+
   void cancelPending() {
     final active = _active;
     if (active == null || active.isCompleted) return;
@@ -455,6 +510,7 @@ class ResilientBackend implements AiBackend {
     lastRemoteFailed = false;
     lastRemoteError = null;
     lastOnDeviceError = null;
+    lastManualTemplate = templateOnly;
     if (!templateOnly && onDevice != null) {
       onPhase?.call(AiPhase.onDevice);
       try {

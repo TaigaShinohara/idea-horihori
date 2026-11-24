@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:horihori/app_config.dart';
+import 'package:horihori/on_device_backend.dart';
 import 'package:horihori/store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -152,6 +153,33 @@ void main() {
       await store.addIdea('普通のアイデア', '');
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getString(AppConfig.prefsIdeasBackupKey), isNull);
+    });
+
+    test('退避成功（ideasWritable == true）のときだけ復旧通知を閉じられる（R-06）', () async {
+      SharedPreferences.setMockInitialValues({
+        AppConfig.prefsIdeasKey: '{broken json',
+      });
+      final store = IdeaStore();
+      await store.load();
+      expect(store.ideasWritable, isTrue);
+      expect(store.ideasRecoveryNotice, isNotNull);
+      expect(store.dismissRecoveryNotice(), isTrue);
+      expect(store.ideasRecoveryNotice, isNull);
+      // 既に空なら false
+      expect(store.dismissRecoveryNotice(), isFalse);
+    });
+  });
+
+  group('端末AI状態キャッシュ（R-04）', () {
+    test('updateOnDeviceStatusCache / clearOnDeviceStatusCache が動作する', () {
+      final store = IdeaStore(secrets: FakeSecretStore());
+      expect(store.cachedOnDeviceStatus, isNull);
+      store.updateOnDeviceStatusCache(
+        const OnDeviceCheck(OnDeviceStatus.unavailable, 'not supported'),
+      );
+      expect(store.cachedOnDeviceStatus?.status, OnDeviceStatus.unavailable);
+      store.clearOnDeviceStatusCache();
+      expect(store.cachedOnDeviceStatus, isNull);
     });
   });
 }

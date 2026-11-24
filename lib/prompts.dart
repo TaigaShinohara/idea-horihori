@@ -6,16 +6,18 @@ import 'models.dart';
 /// Gemini へ渡すプロンプト生成と、応答JSONの解釈（純ロジック寄り）。
 class Prompts {
   static const int maxTextLength = 500;
+  static const int maxQuestionLength = 200;
   static const int maxChoiceLength = 120;
   static const int standardBudget = 3200;
   static const int nanoBudget = 1550;
   static const int compactNanoBudget = 750;
 
+  /// AI出力の安全検証（S-03: UI側で自動リンク化しないプレーンテキスト表示前提）。
+  /// 制御文字・空文字・過大長を拒否する。
   static bool _safeText(String value) {
     final text = value.trim();
     if (text.isEmpty || text.length > maxTextLength) return false;
-    if (text.contains('\u0000')) return false;
-    if (RegExp(r'https?://', caseSensitive: false).hasMatch(text)) return false;
+    if (RegExp(r'[\x00-\x08\x0B\x0C\x0E-\x1F]').hasMatch(text)) return false;
     return true;
   }
 
@@ -177,7 +179,7 @@ ${_memoText(memo, budget)}
         .take(3)
         .toList();
     if (!_safeText(qText) ||
-        qText.length > maxChoiceLength ||
+        qText.length > maxQuestionLength ||
         choices.length < 2 ||
         choices.length > 3) {
       return null;
@@ -199,8 +201,6 @@ ${_memoText(memo, budget)}
   }) {
     final j = extractJson(text);
     if (j == null) return null;
-    const allowed = {'what', 'who', 'why', 'how', 'nextStep', 'ease', 'spark'};
-    if (j.keys.any((key) => !allowed.contains(key))) return null;
     final values = <String>[];
     for (final key in ['what', 'who', 'why', 'how', 'nextStep']) {
       final value = j[key];

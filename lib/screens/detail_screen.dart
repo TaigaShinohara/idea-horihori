@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../ai_backend.dart';
 import '../models.dart';
@@ -32,11 +33,12 @@ class DetailScreen extends StatefulWidget {
 }
 
 class _DetailScreenState extends State<DetailScreen> {
-  late bool _celebrate = widget.highlightLatestMemo;
+  late int _celebrateCount = widget.highlightLatestMemo ? 1 : 0;
   bool _editing = false;
   bool _archiving = false;
   bool _namesOpen = false;
   bool _openingDig = false;
+  bool _openingBrief = false;
 
   IdeaStore get store => widget.store;
   Idea get idea => widget.idea;
@@ -72,10 +74,24 @@ class _DetailScreenState extends State<DetailScreen> {
       await showModalBottomSheet<void>(
         context: context,
         isScrollControlled: true,
+        backgroundColor: Colors.transparent,
         builder: (_) => _NameCandidatesSheet(store: store, idea: idea),
       );
     } finally {
       _namesOpen = false;
+    }
+  }
+
+  Future<void> _openBrief() async {
+    if (_openingBrief || _archiving || _editing) return;
+    _openingBrief = true;
+    try {
+      await Navigator.push<void>(
+        context,
+        MaterialPageRoute(builder: (_) => DevBriefScreen(idea: idea)),
+      );
+    } finally {
+      _openingBrief = false;
     }
   }
 
@@ -89,7 +105,9 @@ class _DetailScreenState extends State<DetailScreen> {
           builder: (_) => DigScreen(store: store, idea: idea, fromDetail: true),
         ),
       );
-      if (completed == true && mounted) setState(() => _celebrate = true);
+      if (completed == true && mounted) {
+        setState(() => _celebrateCount++);
+      }
     } finally {
       _openingDig = false;
     }
@@ -106,8 +124,8 @@ class _DetailScreenState extends State<DetailScreen> {
       final ok = await showDialog<bool>(
         context: context,
         builder: (dialogCtx) => AlertDialog(
-          title: const Text('アーカイブする？'),
-          content: const Text('一覧からは消えるけど、あとで戻せるよ。'),
+          title: const Text('アーカイブしますか？'),
+          content: const Text('一覧からは隠れますが、あとで戻せます。'),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(dialogCtx, false),
@@ -127,7 +145,7 @@ class _DetailScreenState extends State<DetailScreen> {
       Navigator.pop(context);
       messenger.showSnackBar(
         SnackBar(
-          content: const Text('アーカイブした'),
+          content: const Text('アーカイブしました'),
           action: SnackBarAction(
             label: '元に戻す',
             onPressed: () async {
@@ -153,32 +171,37 @@ class _DetailScreenState extends State<DetailScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      appBar: AppBar(
-        title: const Text('企画メモ'),
+    final accentText = accentTextColor(context);
+    return GlassBackground(
+      child: Scaffold(
         backgroundColor: Colors.transparent,
-        elevation: 0,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.edit_outlined),
-            tooltip: 'タイトルとメモを編集',
-            onPressed: _editing || _archiving ? null : () => _editIdea(context),
-          ),
-          IconButton(
-            icon: const Icon(Icons.archive_outlined),
-            tooltip: 'アーカイブ',
-            onPressed: _editing || _archiving ? null : () => _confirmArchive(context),
-          ),
-        ],
-      ),
-      body: GlassBackground(
-        child: AnimatedBuilder(
+        appBar: AppBar(
+          title: const Text('企画メモ'),
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.edit_outlined),
+              tooltip: 'タイトルとメモを編集',
+              onPressed: _editing || _archiving ? null : () => _editIdea(context),
+            ),
+            IconButton(
+              icon: const Icon(Icons.archive_outlined),
+              tooltip: 'アーカイブ',
+              onPressed:
+                  _editing || _archiving ? null : () => _confirmArchive(context),
+            ),
+          ],
+        ),
+        body: AnimatedBuilder(
           animation: store,
           builder: (context, _) {
             final memos = idea.memos.reversed.toList();
             final latest = memos.isEmpty ? null : memos.first;
             final older = memos.length <= 1 ? <PlanMemo>[] : memos.sublist(1);
+            final hasAnswers = idea.sessions.any((s) => s.answers.isNotEmpty);
+            final hasResumable = idea.resumableSession != null;
             return ListView(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
               children: [
@@ -191,51 +214,82 @@ class _DetailScreenState extends State<DetailScreen> {
                       child: Text(
                         idea.title,
                         style: const TextStyle(
-                            fontSize: 19, fontWeight: FontWeight.bold, height: 1.5),
+                          fontSize: 19,
+                          fontWeight: FontWeight.bold,
+                          height: 1.5,
+                        ),
                       ),
                     ),
                   ],
                 ),
                 if (idea.note.isNotEmpty) ...[
                   const SizedBox(height: 8),
-                  Text(idea.note, style: const TextStyle(fontSize: 14, height: 1.6)),
+                  Text(
+                    idea.note,
+                    style: const TextStyle(fontSize: 14, height: 1.6),
+                  ),
                 ],
                 const SizedBox(height: 12),
                 GrowthBar(
+                  key: ValueKey('growth-$_celebrateCount'),
                   value: idea.growthValue,
                   stage: idea.stage,
-                  animate: _celebrate,
+                  animate: _celebrateCount > 0,
                 ),
                 const SizedBox(height: 16),
                 if (latest == null) ...[
-                  // メモがまだ無い時だけ、深掘りCTAが主役でよい。
+                  GlassCard(
+                    child: Text(
+                      hasAnswers
+                          ? '深掘りの途中です。続きに答えると企画メモにまとまります。'
+                          : 'まだ企画メモはありません',
+                      style: const TextStyle(fontSize: 14, height: 1.6),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
                   FilledButton.icon(
                     style: FilledButton.styleFrom(
                       backgroundColor: kButtonFill,
+                      foregroundColor: Colors.white,
                       padding: const EdgeInsets.symmetric(vertical: 13),
                     ),
                     onPressed: _openDig,
-                    icon: const Icon(Icons.terrain, size: 19),
-                    label: const Text('深掘りする'),
+                    icon: const Icon(Icons.chat_bubble_outline, size: 19),
+                    label: Text(hasResumable ? 'つづきを掘る' : '深掘りする'),
                   ),
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 24),
-                    child: Center(child: Text('まだメモはないよ')),
-                  ),
+                  if (hasAnswers) ...[
+                    const SizedBox(height: 20),
+                    const Text(
+                      '深掘りの記録',
+                      style:
+                          TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    for (final session in idea.sessions)
+                      if (session.answers.isNotEmpty) ...[
+                        _SessionHistoryTile(session: session),
+                        const SizedBox(height: 10),
+                      ],
+                  ],
                 ] else ...[
-                  // K5: 最新メモが主役（最初・最大）。
-                  _MemoView(memo: latest),
+                  // K5: 最新メモが主役（最初・最大）。S-01: 完了直後は静かなフェードイン。
+                  _CelebratedFadeIn(
+                    key: ValueKey('memo-$_celebrateCount-${latest.version}'),
+                    animate: _celebrateCount > 0,
+                    child: _MemoView(memo: latest),
+                  ),
                   const SizedBox(height: 14),
                   // K5: CTAはメモの後へ降格し、トーンも落とす。
                   FilledButton.tonalIcon(
                     style: FilledButton.styleFrom(
-                      backgroundColor: kAccent.withValues(alpha: 0.16),
-                      foregroundColor: kAccentDeep,
+                      backgroundColor: accentTonalFill(context),
+                      foregroundColor: accentText,
                       padding: const EdgeInsets.symmetric(vertical: 12),
                     ),
                     onPressed: _openDig,
-                    icon: const Icon(Icons.terrain, size: 19),
-                    label: const Text('もっと深掘り'),
+                    icon: const Icon(Icons.chat_bubble_outline, size: 19),
+                    label: Text(hasResumable ? 'つづきを掘る' : 'もっと深掘り'),
                   ),
                   const SizedBox(height: 10),
                   // v0.2 項目5・6: メモがある時だけ出せる書き出し／名前候補。
@@ -243,14 +297,11 @@ class _DetailScreenState extends State<DetailScreen> {
                     children: [
                       Expanded(
                         child: OutlinedButton.icon(
-                          onPressed: () => Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) => DevBriefScreen(idea: idea),
-                            ),
+                          onPressed: _openBrief,
+                          icon: const Icon(
+                            Icons.description_outlined,
+                            size: 18,
                           ),
-                          icon: const Icon(Icons.description_outlined,
-                              size: 18),
                           label: const Text('指示書'),
                         ),
                       ),
@@ -264,7 +315,7 @@ class _DetailScreenState extends State<DetailScreen> {
                       ),
                     ],
                   ),
-                  if (idea.sessions.any((s) => s.answers.isNotEmpty)) ...[
+                  if (hasAnswers) ...[
                     const SizedBox(height: 20),
                     const Text(
                       '深掘りの記録',
@@ -301,6 +352,29 @@ class _DetailScreenState extends State<DetailScreen> {
   }
 }
 
+/// 完了直後の静かな出現アニメーション（300msフェード。disableAnimationsOf を尊重）。
+class _CelebratedFadeIn extends StatelessWidget {
+  final bool animate;
+  final Widget child;
+  const _CelebratedFadeIn({
+    super.key,
+    required this.animate,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (!animate || MediaQuery.disableAnimationsOf(context)) return child;
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOut,
+      builder: (context, value, child) => Opacity(opacity: value, child: child),
+      child: child,
+    );
+  }
+}
+
 /// メモの中身（型の5欄）。最新メモ・旧メモ共通。
 class _MemoBody extends StatelessWidget {
   final PlanMemo memo;
@@ -308,29 +382,38 @@ class _MemoBody extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final labelColor = Theme.of(context).colorScheme.onSurfaceVariant;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _row('何を作る', memo.what),
-        _row('誰に', memo.who),
-        _row('なぜ', memo.why),
-        _row('どうやって', memo.how),
-        _row('次の一歩', memo.nextStep, last: true),
+        _row('何を作る', memo.what, labelColor),
+        _row('誰に', memo.who, labelColor),
+        _row('なぜ', memo.why, labelColor),
+        _row('どうやって', memo.how, labelColor),
+        _row('次の一歩', memo.nextStep, labelColor, last: true),
       ],
     );
   }
 
-  Widget _row(String label, String value, {bool last = false}) {
+  Widget _row(String label, String value, Color labelColor, {bool last = false}) {
     return Padding(
       padding: EdgeInsets.only(bottom: last ? 0 : 12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(label,
-              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 2),
-          Text(value.isEmpty ? '—' : value,
-              style: const TextStyle(fontSize: 15, height: 1.6)),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.bold,
+              color: labelColor,
+            ),
+          ),
+          const SizedBox(height: 3),
+          Text(
+            value.isEmpty ? '—' : value,
+            style: const TextStyle(fontSize: 15, height: 1.6),
+          ),
         ],
       ),
     );
@@ -344,28 +427,53 @@ class _MemoView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final accentText = accentTextColor(context);
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+    final fitnessVisual = [
+      if (memo.ease != null) '作りやすさ ${fitnessDots(memo.ease!)}',
+      if (memo.spark != null) 'ワクワク度 ${fitnessDots(memo.spark!)}',
+    ].join(' ／ ');
+    final fitnessSemantics = [
+      if (memo.ease != null) '作りやすさ 3段階中${memo.ease!.clamp(1, 3)}',
+      if (memo.spark != null) 'ワクワク度 3段階中${memo.spark!.clamp(1, 3)}',
+    ].join('、');
+
     return ReadingGlass(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('メモ v${memo.version}',
-              style: const TextStyle(
-                  fontSize: 13, fontWeight: FontWeight.bold, color: kAccentDeep)),
-          const SizedBox(height: 10),
-          if (memo.source case final source?)
-            Text('生成元  ${source.label}', style: const TextStyle(fontSize: 12)),
+          Row(
+            children: [
+              Text(
+                'メモ v${memo.version}',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                  color: accentText,
+                ),
+              ),
+              const Spacer(),
+              if (memo.source case final source?)
+                Text(
+                  source.label,
+                  style: TextStyle(fontSize: 13, color: muted),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
           _MemoBody(memo: memo),
           // 体力測定（項目4）: 値がある時だけ、末尾に静かに1行添える。
           if (memo.hasFitness) ...[
-            const SizedBox(height: 12),
-            Text(
-              [
-                if (memo.ease != null)
-                  '作りやすさ ${fitnessDots(memo.ease!)}',
-                if (memo.spark != null)
-                  'ワクワク度 ${fitnessDots(memo.spark!)}',
-              ].join(' ／ '),
-              style: const TextStyle(fontSize: 13, color: kAccentDeep),
+            const SizedBox(height: 14),
+            Semantics(
+              container: true,
+              label: fitnessSemantics,
+              child: ExcludeSemantics(
+                child: Text(
+                  fitnessVisual,
+                  style: TextStyle(fontSize: 13, color: accentText),
+                ),
+              ),
             ),
           ],
         ],
@@ -390,29 +498,41 @@ class _SessionHistoryTileState extends State<_SessionHistoryTile> {
   Widget build(BuildContext context) {
     final s = widget.session;
     final d = s.startedAt;
+    final accentText = accentTextColor(context);
     return GlassCard(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          InkWell(
-            onTap: () => setState(() => _expanded = !_expanded),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      '${d.year}/${d.month}/${d.day} の深掘り（${s.answers.length}問）',
-                      style: const TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.bold,
-                          color: kAccentDeep),
-                    ),
+          Semantics(
+            button: true,
+            expanded: _expanded,
+            child: Material(
+              type: MaterialType.transparency,
+              child: InkWell(
+                onTap: () => setState(() => _expanded = !_expanded),
+                borderRadius: BorderRadius.circular(12),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(minHeight: 48),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          '${d.year}/${d.month}/${d.day} の深掘り（${s.answers.length}問）',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                            color: accentText,
+                          ),
+                        ),
+                      ),
+                      Icon(
+                        _expanded ? Icons.expand_less : Icons.expand_more,
+                        size: 20,
+                      ),
+                    ],
                   ),
-                  Icon(_expanded ? Icons.expand_less : Icons.expand_more,
-                      size: 20),
-                ],
+                ),
               ),
             ),
           ),
@@ -428,14 +548,18 @@ class _SessionHistoryTileState extends State<_SessionHistoryTile> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('Q: ${a.question}',
-                              style: const TextStyle(
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.bold,
-                                  height: 1.5)),
-                          Text('A: ${a.answer}',
-                              style:
-                                  const TextStyle(fontSize: 14, height: 1.6)),
+                          Text(
+                            'Q: ${a.question}',
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.bold,
+                              height: 1.5,
+                            ),
+                          ),
+                          Text(
+                            'A: ${a.answer}',
+                            style: const TextStyle(fontSize: 14, height: 1.6),
+                          ),
                         ],
                       ),
                     ),
@@ -448,7 +572,7 @@ class _SessionHistoryTileState extends State<_SessionHistoryTile> {
   }
 }
 
-/// 旧メモの折りたたみ（K5）。見出しは「メモ vN」だけ、タップで展開する。
+/// 旧メモの折りたたみ（K5）。閉じた見出しは「メモ vN」だけ、展開内ヘッダ右端に生成元。
 class _OldMemoTile extends StatefulWidget {
   final PlanMemo memo;
   const _OldMemoTile({required this.memo});
@@ -462,37 +586,64 @@ class _OldMemoTileState extends State<_OldMemoTile> {
 
   @override
   Widget build(BuildContext context) {
+    final accentText = accentTextColor(context);
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
     return GlassCard(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          InkWell(
-            onTap: () => setState(() => _expanded = !_expanded),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      'メモ v${widget.memo.version}'
-                      '${widget.memo.source == null ? '' : '  ${widget.memo.source!.label}'}',
-                      style: const TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.bold,
-                          color: kAccentDeep),
-                    ),
+          Semantics(
+            button: true,
+            expanded: _expanded,
+            child: Material(
+              type: MaterialType.transparency,
+              child: InkWell(
+                onTap: () => setState(() => _expanded = !_expanded),
+                borderRadius: BorderRadius.circular(12),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(minHeight: 48),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'メモ v${widget.memo.version}',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                            color: accentText,
+                          ),
+                        ),
+                      ),
+                      Icon(
+                        _expanded ? Icons.expand_less : Icons.expand_more,
+                        size: 20,
+                      ),
+                    ],
                   ),
-                  Icon(_expanded ? Icons.expand_less : Icons.expand_more,
-                      size: 20),
-                ],
+                ),
               ),
             ),
           ),
           if (_expanded)
             Padding(
               padding: const EdgeInsets.only(bottom: 12),
-              child: _MemoBody(memo: widget.memo),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (widget.memo.source case final source?) ...[
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: Text(
+                        source.label,
+                        style: TextStyle(fontSize: 13, color: muted),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                  ],
+                  _MemoBody(memo: widget.memo),
+                ],
+              ),
             ),
         ],
       ),
@@ -530,14 +681,14 @@ class _EditIdeaDialogState extends State<_EditIdeaDialog> {
         TextField(
           controller: _title,
           autofocus: true,
-          decoration: const InputDecoration(labelText: 'タイトル'),
+          decoration: glassInputDecoration(context, labelText: 'タイトル'),
           onChanged: (_) => setState(() {}),
         ),
         const SizedBox(height: 12),
         TextField(
           controller: _note,
           maxLines: 3,
-          decoration: const InputDecoration(labelText: 'メモ'),
+          decoration: glassInputDecoration(context, labelText: 'メモ'),
         ),
       ],
     ),
@@ -572,15 +723,15 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
     with WidgetsBindingObserver {
   late final ResilientBackend _backend;
   late Future<List<String>> _names;
-  AiPhase? _phase;
+  bool _applying = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _backend = widget.store.backend()
-      ..onPhase = (phase) {
-        if (mounted) setState(() => _phase = phase);
+      ..onPhase = (_) {
+        if (mounted) setState(() {});
       };
     _names = _backend.nameCandidates(idea: widget.idea);
   }
@@ -601,7 +752,6 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
   }
 
   void _generate({bool templateOnly = false}) {
-    _phase = null;
     final names = _backend.nameCandidates(
       idea: widget.idea,
       templateOnly: templateOnly,
@@ -609,14 +759,73 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
     setState(() => _names = names);
   }
 
+  Future<void> _copyName(String name) async {
+    var message = '「$name」をコピーしました';
+    try {
+      await Clipboard.setData(ClipboardData(text: name));
+    } catch (_) {
+      message = 'コピーできませんでした。';
+    }
+    if (mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
+  Future<void> _confirmApplyTitle(String name) async {
+    if (_applying) return;
+    setState(() => _applying = true);
+    try {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (dialogCtx) => AlertDialog(
+          title: const Text('タイトルを変更しますか？'),
+          content: Text('「$name」をアイデアのタイトルに設定します。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogCtx, false),
+              child: const Text('キャンセル'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogCtx, true),
+              child: const Text('変更する'),
+            ),
+          ],
+        ),
+      );
+      if (ok != true || !mounted) return;
+      final previous = widget.idea.title;
+      widget.idea.title = name;
+      try {
+        await widget.store.updateIdea(widget.idea);
+        if (mounted) {
+          Navigator.pop(context);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('タイトルを「$name」に変更しました')),
+          );
+        }
+      } catch (_) {
+        widget.idea.title = previous;
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('タイトルを変更できませんでした。')),
+          );
+        }
+      }
+    } finally {
+      if (mounted) setState(() => _applying = false);
+    }
+  }
+
   @override
-  Widget build(BuildContext context) => PopScope<void>(
-    onPopInvokedWithResult: (didPop, _) {
-      if (didPop) _backend.cancelPending();
-    },
-    child: SafeArea(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+  Widget build(BuildContext context) {
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+    final accentText = accentTextColor(context);
+    return PopScope<void>(
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) _backend.cancelPending();
+      },
+      child: GlassSheetSurface(
         child: FutureBuilder<List<String>>(
           future: _names,
           builder: (context, snapshot) {
@@ -627,34 +836,101 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const Text(
-                  '名前の候補',
-                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                Row(
+                  children: [
+                    const Text(
+                      '名前の候補',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const Spacer(),
+                    if (!waiting && source != null)
+                      Text(
+                        source.label,
+                        style: TextStyle(fontSize: 13, color: muted),
+                      ),
+                  ],
                 ),
-                const SizedBox(height: 10),
+                const SizedBox(height: 12),
                 if (waiting) ...[
                   const LinearProgressIndicator(),
-                  const SizedBox(height: 8),
-                  Text(
-                    _phase == AiPhase.cloud
-                        ? 'Gemini APIで生成中…'
-                        : '端末AIを確認・生成中…',
-                  ),
-                  TextButton(
-                    onPressed: () => _generate(templateOnly: true),
-                    child: const Text('定型で続ける'),
+                  const SizedBox(height: 10),
+                  const Text('名前の候補を考えています…'),
+                  const SizedBox(height: 4),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton(
+                      onPressed: () => _generate(templateOnly: true),
+                      child: const Text('定型で続ける'),
+                    ),
                   ),
                 ] else if (snapshot.hasError || names.isEmpty) ...[
-                  const Text('名前候補の生成が完了しませんでした。'),
-                  TextButton(onPressed: _generate, child: const Text('もう一度試す')),
+                  const Text('名前の候補をつくれませんでした。'),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton(
+                      onPressed: _generate,
+                      child: const Text('もう一度試す'),
+                    ),
+                  ),
                 ] else ...[
-                  if (source != null) Text('生成元  ${source.label}'),
-                  if (_backend.lastRemoteError case final failure?)
-                    Text(failure.message),
+                  if (_backend.lastRemoteError case final failure?) ...[
+                    Text(
+                      failure.message,
+                      style: TextStyle(fontSize: 13, color: muted),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
                   for (final name in names)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 6),
-                      child: Text(name, style: const TextStyle(fontSize: 16)),
+                    Material(
+                      type: MaterialType.transparency,
+                      child: InkWell(
+                        onTap: () => _copyName(name),
+                        borderRadius: BorderRadius.circular(12),
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(minHeight: 48),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 6,
+                            ),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    name,
+                                    style: const TextStyle(fontSize: 16),
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: '$nameをコピー',
+                                  onPressed: () => _copyName(name),
+                                  icon: Icon(
+                                    Icons.copy,
+                                    size: 18,
+                                    color: muted,
+                                  ),
+                                ),
+                                TextButton(
+                                  onPressed: _applying
+                                      ? null
+                                      : () => _confirmApplyTitle(name),
+                                  child: Text(
+                                    'タイトルにする',
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      color: accentText,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
                     ),
                 ],
               ],
@@ -662,6 +938,6 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
           },
         ),
       ),
-    ),
-  );
+    );
+  }
 }

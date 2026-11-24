@@ -4,6 +4,7 @@ import '../ai_backend.dart';
 import '../app_config.dart';
 import '../dig_mode.dart';
 import '../models.dart';
+import '../on_device_backend.dart';
 import '../session_logic.dart';
 import '../store.dart';
 import '../widgets/glass.dart';
@@ -12,13 +13,6 @@ import 'settings_screen.dart';
 
 /// S3 深掘りセッション。質問は1画面に1つ、3択チップ＋自由入力。
 /// 1セッション5問を目安に区切り、途中保存・再開できる。
-///
-/// v0.1.2 の変更:
-/// - K1: 現在のモード（AI／定型）をバッジで常時表示。API失敗時は
-///   セッションに1回だけ静かな通知で定型への切替を知らせる。
-/// - K2: まとめ完了後は起動元によらず詳細へ遷移し、完成メモを見せる。
-/// - K3: キー未設定の初回だけ、キー案内＋設定への導線を1回出す。
-/// - K4: 「答える」は回答がある時だけ有効。まとめ無効時は理由を1行出す。
 class DigScreen extends StatefulWidget {
   final IdeaStore store;
   final Idea idea;
@@ -38,7 +32,7 @@ class DigScreen extends StatefulWidget {
 
 class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
   late final DigSession _session;
-  late final ResilientBackend _backend;
+  late ResilientBackend _backend;
   DigQuestion? _question;
   bool _loading = false;
   bool _summarizing = false;
@@ -46,9 +40,12 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
   bool _leaving = false;
   bool _backgrounded = false;
   bool _retrySummary = false;
+  bool _returnedFromSettings = false;
+  bool _guidePrompted = false;
   int _request = 0;
   AiPhase? _phase;
   String? _failure;
+  String? _retryNotice;
   String? _selectedChoice;
   final _freeCtrl = TextEditingController();
 
@@ -63,10 +60,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _backend = widget.store.backend()
-      ..onPhase = (phase) {
-        if (mounted && !_leaving) setState(() => _phase = phase);
-      };
+    _initBackend();
     _session =
         idea.resumableSession ??
         DigSession(
@@ -78,6 +72,13 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     } else {
       _loadQuestion();
     }
+  }
+
+  void _initBackend() {
+    _backend = widget.store.backend()
+      ..onPhase = (phase) {
+        if (mounted && !_leaving) setState(() => _phase = phase);
+      };
   }
 
   @override
@@ -123,12 +124,55 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _openSettings() {
+  Future<void> _openSettings() async {
     if (_busy || _leaving) return;
-    Navigator.push<void>(
+    await Navigator.push<void>(
       context,
       MaterialPageRoute(builder: (_) => SettingsScreen(store: widget.store)),
     );
+    if (!mounted || _leaving) return;
+    _backend.cancelPending();
+    _initBackend();
+    setState(() {
+      _returnedFromSettings = _question?.source == AnswerSource.local;
+      _retryNotice = null;
+    });
+  }
+
+  FallbackReason? _currentFallbackReason() {
+    if (_busy || _question?.source != AnswerSource.local) return null;
+    final fromBackend = _backend.fallbackReason(
+      hasRemoteKey: widget.store.hasRemoteKey,
+      remoteConsent: widget.store.remoteConsent,
+    );
+    if (fromBackend != null) return fromBackend;
+    final cachedStatus = widget.store.cachedOnDeviceStatus?.status;
+    return fallbackReasonFor(
+      isLocalSource: true,
+      hasRemoteKey: widget.store.hasRemoteKey,
+      remoteConsent: widget.store.remoteConsent,
+      lastRemoteFailed: _backend.lastRemoteError != null,
+      onDeviceNeedsDownload: cachedStatus == OnDeviceStatus.needsDownload,
+      manualTemplate: _backend.lastManualTemplate,
+    );
+  }
+
+  bool _canRetryWithAi() {
+    if (_busy || _question?.source != AnswerSource.local) return false;
+    if (_returnedFromSettings) return true;
+    if (_backend.lastRemoteError != null) return true;
+    if (widget.store.hasRemoteKey && widget.store.remoteConsent) return true;
+    if (widget.store.cachedOnDeviceStatus?.status == OnDeviceStatus.available) {
+      return true;
+    }
+    return false;
+  }
+
+  void _maybeMarkKeyGuideShown(FallbackReason? reason) {
+    if (_guidePrompted || reason == null || !reason.suggestsSettings) return;
+    if (widget.store.keyGuideShown) return;
+    _guidePrompted = true;
+    widget.store.markKeyGuideShown();
   }
 
   Future<void> _loadQuestion({bool templateOnly = false}) async {
@@ -137,6 +181,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
         _question = question;
         _loading = false;
         _failure = null;
+        _retryNotice = null;
       });
       return;
     }
@@ -147,6 +192,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       _retrySummary = false;
       _phase = null;
       _failure = null;
+      _retryNotice = null;
     });
     final previousContrarian = _session.contrarianAsked;
     DigQuestion? generated;
@@ -169,7 +215,10 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       });
       await _persist();
       if (!_current(request)) return;
-      setState(() => _question = generated);
+      setState(() {
+        _question = generated;
+        _returnedFromSettings = false;
+      });
     } on AiCancelled {
       return;
     } catch (_) {
@@ -190,12 +239,95 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// R-04: 未回答の定型フォールバック質問を、ユーザー操作でAIへ聞き直す。
+  /// 成功時のみ pendingQuestion を上書き保存し、失敗・キャンセル時は元へロールバックする。
+  Future<void> _retryQuestionWithAi() async {
+    final previousQuestion = _question;
+    if (_busy || _leaving || previousQuestion?.source != AnswerSource.local) {
+      return;
+    }
+    final previousPending = _session.pendingQuestion;
+    final previousContrarian = _session.contrarianAsked;
+    final request = ++_request;
+    setState(() {
+      _loading = true;
+      _summarizing = false;
+      _phase = null;
+      _failure = null;
+      _retryNotice = null;
+    });
+    DigQuestion? generated;
+    try {
+      generated = await _backend.nextQuestion(
+        idea: idea,
+        history: [for (final s in idea.sessions) ...s.answers],
+        templateHistory: [..._session.answers],
+        style: widget.store.digStyle,
+        viewpoint: _session.viewpoint,
+        contrarianDue: contrarianDue(_session),
+        templateOnly: false,
+      );
+      if (!_current(request)) return;
+      if (generated.source == AnswerSource.local) {
+        final reason = _backend.fallbackReason(
+          hasRemoteKey: widget.store.hasRemoteKey,
+          remoteConsent: widget.store.remoteConsent,
+        );
+        setState(() {
+          _question = previousQuestion;
+          _retryNotice =
+              _backend.lastRemoteError?.message ??
+              reason?.message ??
+              'AIでの聞き直しができませんでした。このまま定型で続けられます。';
+        });
+        return;
+      }
+      _session.pendingQuestion = generated;
+      _session.contrarianAsked =
+          previousContrarian || generated.isContrarian;
+      setState(() {
+        _saving = true;
+        _loading = false;
+      });
+      await _persist();
+      if (!_current(request)) return;
+      _freeCtrl.clear();
+      setState(() {
+        _question = generated;
+        _selectedChoice = null;
+        _returnedFromSettings = false;
+        _retryNotice = null;
+      });
+    } on AiCancelled {
+      _session.pendingQuestion = previousPending;
+      _session.contrarianAsked = previousContrarian;
+      return;
+    } catch (_) {
+      _session.pendingQuestion = previousPending;
+      _session.contrarianAsked = previousContrarian;
+      if (_current(request)) {
+        setState(() {
+          _question = previousQuestion;
+          _retryNotice = 'AIでの聞き直しに失敗しました。元の質問のまま続けられます。';
+        });
+      }
+    } finally {
+      if (_current(request)) {
+        setState(() {
+          _loading = false;
+          _saving = false;
+        });
+      }
+    }
+  }
+
   Future<void> _answer() async {
     final question = _question;
     if (_busy || _leaving || question == null || !_canAnswer) return;
     final free = _freeCtrl.text.trim();
     final answer = free.isNotEmpty ? free : _selectedChoice;
     if (answer == null || answer.isEmpty) return;
+    FocusScope.of(context).unfocus();
     setState(() => _saving = true);
     final previousContrarian = _session.contrarianAsked;
     final entry = QaEntry(
@@ -227,6 +359,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       _question = null;
       _selectedChoice = null;
       _saving = false;
+      _retryNotice = null;
     });
     if (_backgrounded) {
       setState(() => _failure = '回答を保存しました。続きから再開できます。');
@@ -246,6 +379,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       _loading = false;
       _phase = null;
       _failure = null;
+      _retryNotice = null;
     });
     PlanMemo? memo;
     final previousPending = _session.pendingQuestion;
@@ -342,6 +476,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       setState(() {
         _selectedChoice = null;
         _question = _session.pendingQuestion;
+        _retryNotice = null;
       });
     } catch (_) {
       _session.answers.add(removed);
@@ -388,244 +523,522 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _openOptionsSheet() async {
+    if (_busy || _leaving) return;
+    FocusScope.of(context).unfocus();
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _DigOptionsSheet(
+        initialStyle: widget.store.digStyle,
+        initialViewpoint: _session.viewpoint,
+        onStyleChanged: (s) async => _setStyle(s),
+        onViewpointChanged: (v) async => _setViewpoint(v),
+      ),
+    );
+    if (mounted) setState(() {});
+  }
+
+  String _shortStyleLabel(DigStyle style) => switch (style) {
+    DigStyle.friend => '友達',
+    DigStyle.boss => '上司',
+  };
+
   @override
   Widget build(BuildContext context) {
     final done = _session.answers.length;
-    final canSummarize = done > 0 || idea.totalAnswers > 0;
+    final canSummarize = canSummarizeSession(_session);
+    final displaySource = _question?.source ?? _backend.lastSource;
+    final fallbackReason = _currentFallbackReason();
+    final showOneTimeSettings =
+        fallbackReason != null &&
+        fallbackReason.suggestsSettings &&
+        (!widget.store.keyGuideShown || _guidePrompted);
+    if (showOneTimeSettings && !_guidePrompted) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _maybeMarkKeyGuideShown(fallbackReason);
+      });
+    }
+    final canRetryAi = _canRetryWithAi();
+    final reduceMotion = MediaQuery.disableAnimationsOf(context);
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+
     return PopScope<bool>(
+      canPop: !_saving,
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop) return;
         _leaving = true;
         _stopGeneration();
       },
-      child: Scaffold(
-        backgroundColor: Colors.transparent,
-        appBar: AppBar(
-          title: Text(idea.title, overflow: TextOverflow.ellipsis),
+      child: GlassBackground(
+        child: Scaffold(
           backgroundColor: Colors.transparent,
-          elevation: 0,
-          actions: [
-            IconButton(
-              tooltip: 'AI設定',
-              onPressed: _busy ? null : _openSettings,
-              icon: const Icon(Icons.settings_outlined),
-            ),
-          ],
-        ),
-        body: GlassBackground(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                // v0.2.1 ノイズ削減 N3/N4: 進み具合は「n/5問」に一本化
-                // （段階アイコンと成長バーはホーム／詳細が正本）。
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: Text(
-                    '$done / ${AppConfig.questionsPerSession}問',
-                    style: const TextStyle(fontSize: 13),
-                  ),
-                ),
-                const SizedBox(height: 10),
-                if (!_busy && _question?.source != null)
-                  _ModeBadge(source: _question!.source!),
-                const SizedBox(height: 10),
-                _styleAndViewpointControls(),
-                const SizedBox(height: 12),
-                if (_busy)
-                  Expanded(
-                    child: Center(
-                      child: ListView(
-                        shrinkWrap: true,
-                        children: [
-                          const Center(child: CircularProgressIndicator()),
-                          const SizedBox(height: 12),
-                          Text(
-                            _saving
-                                ? '端末に保存中…'
-                                : _phase == AiPhase.cloud
-                                ? 'Gemini APIで生成中…'
-                                : '端末AIを確認・生成中…',
-                            textAlign: TextAlign.center,
-                          ),
-                          if (!_saving && _phase != null)
-                            TextButton(
-                              onPressed: _useTemplate,
-                              child: const Text('定型で続ける'),
-                            ),
-                        ],
-                      ),
-                    ),
-                  )
-                else if (_failure case final failure?)
-                  Expanded(
-                    child: ListView(
+          appBar: AppBar(
+            title: Text(idea.title, overflow: TextOverflow.ellipsis),
+            backgroundColor: Colors.transparent,
+            elevation: 0,
+            scrolledUnderElevation: 0,
+            actions: [
+              IconButton(
+                tooltip: 'AI設定',
+                onPressed: _busy ? null : _openSettings,
+                icon: const Icon(Icons.settings_outlined),
+              ),
+            ],
+          ),
+          body: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTap: () => FocusScope.of(context).unfocus(),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // R-03: 1行固定最小高さヘッダ（モード／現在値チップ／進捗）。
+                  // 留意1・M-01: Flexible + ellipsis と minHeight で狭幅・文字拡大時の溢れを防ぐ。
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(minHeight: 36),
+                    child: Row(
                       children: [
-                        Text(failure),
-                        TextButton(
-                          onPressed: _retry,
-                          child: const Text('再開する'),
+                        if (displaySource != null)
+                          _ModeBadge(source: displaySource)
+                        else
+                          const SizedBox(width: 4),
+                        const SizedBox(width: 8),
+                        Flexible(
+                          child: Align(
+                            alignment: Alignment.centerRight,
+                            child: _StyleViewpointChip(
+                              label:
+                                  '${_shortStyleLabel(widget.store.digStyle)}・${_session.viewpoint.label}',
+                              enabled: !_busy,
+                              onTap: _openOptionsSheet,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          '$done / ${AppConfig.questionsPerSession}問',
+                          style: TextStyle(fontSize: 13, color: muted),
                         ),
                       ],
                     ),
-                  )
-                else if (_question != null)
-                  Expanded(
-                    child: SingleChildScrollView(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          if (_backend.lastRemoteError case final failure?)
-                            Padding(
-                              padding: const EdgeInsets.only(bottom: 8),
-                              child: Text(failure.message),
-                            ),
-                          _questionCard(_question!),
-                        ],
-                      ),
-                    ),
                   ),
-                if (!_busy && _failure == null) ...[
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: _busy
+                        ? Center(
+                            child: GlassCard(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const CircularProgressIndicator(),
+                                  const SizedBox(height: 14),
+                                  Text(
+                                    _saving
+                                        ? '保存しています…'
+                                        : _summarizing
+                                        ? '企画メモにまとめています…'
+                                        : 'つぎの質問を考えています…',
+                                    textAlign: TextAlign.center,
+                                    style: const TextStyle(fontSize: 15),
+                                  ),
+                                  if (!_saving && _phase != null) ...[
+                                    const SizedBox(height: 8),
+                                    TextButton(
+                                      onPressed: _useTemplate,
+                                      child: const Text('定型で続ける'),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                          )
+                        : _failure != null
+                        ? Center(
+                            child: GlassCard(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    _failure!,
+                                    textAlign: TextAlign.center,
+                                    style: const TextStyle(
+                                      fontSize: 14,
+                                      height: 1.6,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 12),
+                                  FilledButton(
+                                    style: FilledButton.styleFrom(
+                                      backgroundColor: kButtonFill,
+                                      foregroundColor: Colors.white,
+                                    ),
+                                    onPressed: _retry,
+                                    child: const Text('再開する'),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          )
+                        : _question != null
+                        ? SingleChildScrollView(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                AnimatedSwitcher(
+                                  duration: reduceMotion
+                                      ? Duration.zero
+                                      : const Duration(milliseconds: 220),
+                                  child: KeyedSubtree(
+                                    key: ValueKey(_question!.id),
+                                    child: _questionCard(_question!),
+                                  ),
+                                ),
+                                if (_retryNotice != null ||
+                                    _backend.lastRemoteError != null ||
+                                    fallbackReason != null) ...[
+                                  const SizedBox(height: 10),
+                                  _FallbackBanner(
+                                    message:
+                                        _retryNotice ??
+                                        _backend.lastRemoteError?.message ??
+                                        fallbackReason!.message,
+                                    showSettings: showOneTimeSettings,
+                                    onOpenSettings: _openSettings,
+                                    showRetryAi: canRetryAi,
+                                    onRetryAi: _retryQuestionWithAi,
+                                  ),
+                                ],
+                              ],
+                            ),
+                          )
+                        : const SizedBox.shrink(),
+                  ),
+                  const SizedBox(height: 12),
+                  // P1-1 #3: ロード中も下部操作枠を維持し、毎問の縦ジャンプを防ぐ。
                   FilledButton(
                     style: FilledButton.styleFrom(
                       backgroundColor: kButtonFill,
+                      foregroundColor: Colors.white,
                       padding: const EdgeInsets.symmetric(vertical: 14),
                     ),
-                    // K4: 回答が無い間は無効の見た目にする。
-                    onPressed: _question != null && _canAnswer ? _answer : null,
+                    onPressed:
+                        !_busy &&
+                            _failure == null &&
+                            _question != null &&
+                            _canAnswer
+                        ? _answer
+                        : null,
                     child: const Text('答える', style: TextStyle(fontSize: 16)),
                   ),
-                  const SizedBox(height: 8),
-                  // v0.2.1 ノイズ削減 N7/N8: 補助ボタンは横1行に集約し、
-                  // 説明文と「あとで続きを掘る」（戻る操作と重複・自動保存済み）を削除。
+                  const SizedBox(height: 6),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
                       TextButton(
-                        // 項目7: 選択肢の記録がある最新の回答だけ「もどる」対象。
-                        onPressed: canUndoLastAnswer(_session) ? _undo : null,
+                        onPressed:
+                            !_busy &&
+                                _failure == null &&
+                                canUndoLastAnswer(_session)
+                            ? _undo
+                            : null,
                         child: const Text('1問もどる'),
                       ),
                       TextButton(
-                        onPressed: canSummarize ? () => _summarize() : null,
+                        onPressed:
+                            !_busy && _failure == null && canSummarize
+                            ? () => _summarize()
+                            : null,
                         child: const Text('いったんまとめる'),
                       ),
                     ],
                   ),
                 ],
-              ],
+              ),
             ),
           ),
         ),
       ),
-    );
-  }
-
-  /// 掘り方スタイル（友達／上司）と視点（通常／お金／技術／使う人）の切替UI。
-  /// v0.2.1 ノイズ削減: 支援項目なので既定は畳む（質問が主役）。
-  /// 見出しは現在の選択が閉じたままでも分かる形にする。
-  Widget _styleAndViewpointControls() {
-    final style = widget.store.digStyle;
-    return ExpansionTile(
-      tilePadding: EdgeInsets.zero,
-      title: Text(
-        '掘り方・視点（${style.label}／${_session.viewpoint.label}）',
-        style: const TextStyle(fontSize: 13),
-      ),
-      children: [
-        Align(
-          alignment: Alignment.centerLeft,
-          child: Wrap(
-            spacing: 8,
-            runSpacing: 4,
-            children: [
-              for (final s in DigStyle.values)
-                ChoiceChip(
-                  label: Text(s.label),
-                  selected: style == s,
-                  onSelected: _busy ? null : (_) => _setStyle(s),
-                ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 6),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: Wrap(
-            spacing: 8,
-            runSpacing: 4,
-            children: [
-              for (final v in DigViewpoint.values)
-                ChoiceChip(
-                  label: Text(v.label),
-                  selected: _session.viewpoint == v,
-                  selectedColor: kAccent.withValues(alpha: 0.35),
-                  onSelected: _busy ? null : (_) => _setViewpoint(v),
-                ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 8),
-      ],
     );
   }
 
   Widget _questionCard(DigQuestion q) {
     return GlassCard(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              q.text,
-              style: const TextStyle(
-                  fontSize: 20, fontWeight: FontWeight.bold, height: 1.6),
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            q.text,
+            style: const TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+              height: 1.6,
             ),
-            const SizedBox(height: 16),
+          ),
+          const SizedBox(height: 16),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: q.choices
+                .map(
+                  (c) => ChoiceChip(
+                    label: Text(c),
+                    selected: _selectedChoice == c,
+                    onSelected: (selected) => setState(() {
+                      _selectedChoice = selected ? c : null;
+                      if (selected) _freeCtrl.clear();
+                    }),
+                  ),
+                )
+                .toList(),
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: _freeCtrl,
+            maxLines: 3,
+            minLines: 1,
+            style: const TextStyle(fontSize: 15),
+            decoration: glassInputDecoration(
+              context,
+              hintText: '自分の言葉で書いても大丈夫です',
+            ),
+            onChanged: (_) => setState(() {
+              if (_freeCtrl.text.trim().isNotEmpty) _selectedChoice = null;
+            }),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _StyleViewpointChip extends StatelessWidget {
+  final String label;
+  final bool enabled;
+  final VoidCallback onTap;
+  const _StyleViewpointChip({
+    required this.label,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final accentText = accentTextColor(context);
+    return Semantics(
+      button: true,
+      label: '掘り方と視点を変更。現在：$label',
+      child: ExcludeSemantics(
+        child: Material(
+          type: MaterialType.transparency,
+          child: InkWell(
+            onTap: enabled ? onTap : null,
+            borderRadius: BorderRadius.circular(99),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: barTrackColor(context),
+                borderRadius: BorderRadius.circular(99),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: enabled
+                            ? accentText
+                            : accentText.withValues(alpha: 0.45),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 2),
+                  Icon(
+                    Icons.arrow_drop_down,
+                    size: 16,
+                    color: enabled
+                        ? accentText
+                        : accentText.withValues(alpha: 0.45),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DigOptionsSheet extends StatefulWidget {
+  final DigStyle initialStyle;
+  final DigViewpoint initialViewpoint;
+  final Future<void> Function(DigStyle) onStyleChanged;
+  final Future<void> Function(DigViewpoint) onViewpointChanged;
+  const _DigOptionsSheet({
+    required this.initialStyle,
+    required this.initialViewpoint,
+    required this.onStyleChanged,
+    required this.onViewpointChanged,
+  });
+
+  @override
+  State<_DigOptionsSheet> createState() => _DigOptionsSheetState();
+}
+
+class _DigOptionsSheetState extends State<_DigOptionsSheet> {
+  late DigStyle _style = widget.initialStyle;
+  late DigViewpoint _viewpoint = widget.initialViewpoint;
+  bool _saving = false;
+
+  Future<void> _selectStyle(DigStyle style) async {
+    if (_saving || _style == style) return;
+    setState(() {
+      _style = style;
+      _saving = true;
+    });
+    await widget.onStyleChanged(style);
+    if (mounted) setState(() => _saving = false);
+  }
+
+  Future<void> _selectViewpoint(DigViewpoint viewpoint) async {
+    if (_saving || _viewpoint == viewpoint) return;
+    setState(() {
+      _viewpoint = viewpoint;
+      _saving = true;
+    });
+    await widget.onViewpointChanged(viewpoint);
+    if (mounted) setState(() => _saving = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+    return GlassSheetSurface(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            '掘り方・視点',
+            style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            '掘り方',
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: [
+              for (final s in DigStyle.values)
+                ChoiceChip(
+                  label: Text(s.label),
+                  selected: _style == s,
+                  onSelected: _saving ? null : (_) => _selectStyle(s),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            '視点',
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: [
+              for (final v in DigViewpoint.values)
+                ChoiceChip(
+                  label: Text(v.label),
+                  selected: _viewpoint == v,
+                  selectedColor: kAccent.withValues(alpha: 0.35),
+                  onSelected: _saving ? null : (_) => _selectViewpoint(v),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            '変更は次の質問から反映されます。',
+            style: TextStyle(fontSize: 13, color: muted),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FallbackBanner extends StatelessWidget {
+  final String message;
+  final bool showSettings;
+  final VoidCallback onOpenSettings;
+  final bool showRetryAi;
+  final VoidCallback onRetryAi;
+  const _FallbackBanner({
+    required this.message,
+    required this.showSettings,
+    required this.onOpenSettings,
+    required this.showRetryAi,
+    required this.onRetryAi,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+    final accentText = accentTextColor(context);
+    return GlassCard(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            message,
+            style: TextStyle(fontSize: 13, color: muted, height: 1.5),
+          ),
+          if (showSettings || showRetryAi) ...[
+            const SizedBox(height: 4),
             Wrap(
               spacing: 8,
-              runSpacing: 8,
-              children: q.choices
-                  .map(
-                    (c) => ChoiceChip(
-                      label: Text(c),
-                      selected: _selectedChoice == c,
-                      onSelected: (_) => setState(() {
-                        _selectedChoice = c;
-                        _freeCtrl.clear();
-                      }),
+              children: [
+                if (showRetryAi)
+                  TextButton(
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      foregroundColor: accentText,
                     ),
-                  )
-                  .toList(),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _freeCtrl,
-              maxLines: 3,
-              minLines: 1,
-              style: const TextStyle(fontSize: 15),
-              decoration: InputDecoration(
-                hintText: '自分の言葉で書いてもいいよ',
-                filled: true,
-                fillColor: glassInputFill(context),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(14),
-                  borderSide: BorderSide.none,
-                ),
-              ),
-              onChanged: (_) => setState(() {
-                if (_freeCtrl.text.trim().isNotEmpty) _selectedChoice = null;
-              }),
+                    onPressed: onRetryAi,
+                    child: const Text('AIで聞き直す'),
+                  ),
+                if (showSettings)
+                  TextButton(
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      foregroundColor: accentText,
+                    ),
+                    onPressed: onOpenSettings,
+                    child: const Text('設定を開く'),
+                  ),
+              ],
             ),
           ],
-        ),
+        ],
+      ),
     );
   }
 }
 
 /// 現在のモードを示す小さなバッジ（K1）。常時表示する。
-/// v0.2: 掘り方スタイルも併記する（例: 「AIで深掘り中・友達モード」）。
 class _ModeBadge extends StatelessWidget {
   final AnswerSource source;
   const _ModeBadge({required this.source});
@@ -634,37 +1047,35 @@ class _ModeBadge extends StatelessWidget {
   Widget build(BuildContext context) {
     final isAi = source != AnswerSource.local;
     final fullLabel = source.label;
+    final accentText = accentTextColor(context);
     return Semantics(
       container: true,
       label: '現在のモード: $fullLabel',
       child: ExcludeSemantics(
-        child: Align(
-          alignment: Alignment.centerLeft,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-            decoration: BoxDecoration(
-              color: (isAi ? kAccent : Colors.black).withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(99),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  isAi ? Icons.auto_awesome : Icons.list_alt_outlined,
-                  size: 15,
-                  color: kAccentDeep,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(
+            color: isAi ? accentTonalFill(context) : barTrackColor(context),
+            borderRadius: BorderRadius.circular(99),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                isAi ? Icons.auto_awesome : Icons.list_alt_outlined,
+                size: 14,
+                color: accentText,
+              ),
+              const SizedBox(width: 5),
+              Text(
+                fullLabel,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: accentText,
                 ),
-                const SizedBox(width: 6),
-                Text(
-                  fullLabel,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold,
-                    color: kAccentDeep,
-                  ),
-                ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),

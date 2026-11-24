@@ -11,6 +11,7 @@ class FakeOnDeviceClient implements OnDeviceTextClient {
   String message;
   List<String> responses;
   Duration generateDelay;
+  int checkStatusCalls = 0;
   int generateCalls = 0;
   int downloadCalls = 0;
 
@@ -22,7 +23,10 @@ class FakeOnDeviceClient implements OnDeviceTextClient {
   }) : responses = responses ?? [];
 
   @override
-  Future<OnDeviceCheck> checkStatus() async => OnDeviceCheck(status, message);
+  Future<OnDeviceCheck> checkStatus() async {
+    checkStatusCalls++;
+    return OnDeviceCheck(status, message);
+  }
 
   @override
   Future<void> downloadModel() async {
@@ -209,30 +213,75 @@ void main() {
     });
   });
 
+  group('モデル単独準備とキャッシュ（R-04）', () {
+    test('prepareModel は生成テストなしでモデルを準備しキャッシュを更新する', () async {
+      final client = FakeOnDeviceClient(status: OnDeviceStatus.needsDownload);
+      OnDeviceCheck? cached;
+      final backend = OnDeviceBackend(
+        client: client,
+        readCachedStatus: () => cached,
+        writeCachedStatus: (s) => cached = s,
+      );
+
+      final result = await backend.prepareModel();
+      expect(result.status, OnDeviceStatus.available);
+      expect(client.downloadCalls, 1);
+      expect(client.generateCalls, 0);
+      expect(cached?.status, OnDeviceStatus.available);
+    });
+
+    test('非対応または未準備がキャッシュされていれば通常深掘りで checkStatus をスキップする', () async {
+      final client = FakeOnDeviceClient(status: OnDeviceStatus.unavailable);
+      OnDeviceCheck? cached = const OnDeviceCheck(OnDeviceStatus.unavailable);
+      final backend = OnDeviceBackend(
+        client: client,
+        readCachedStatus: () => cached,
+        writeCachedStatus: (s) => cached = s,
+      );
+
+      await expectLater(
+        backend.nextQuestion(idea: _idea(), history: const []),
+        throwsA(isA<OnDeviceException>()),
+      );
+      expect(client.checkStatusCalls, 0);
+      expect(backend.lastStatus, OnDeviceStatus.unavailable);
+    });
+  });
+
   group('出力検査', () {
-    test('過長テキストとURLを含む質問は拒否する', () {
+    test('過長テキストと制御文字は拒否し、プレーンテキスト前提でURLや150字質問は許容する（S-03）', () {
+      final withUrl = Prompts.parseQuestion(
+        '{"id":"q1","text":"参考例 https://example.com のような仕組みにしますか？","choices":["はい","いいえ"]}',
+      );
+      expect(withUrl, isNotNull);
+      expect(withUrl!.text, contains('https://example.com'));
+
+      final longOk = Prompts.parseQuestion(
+        '{"id":"q1","text":"${'あ' * 150}","choices":["はい","いいえ"]}',
+      );
+      expect(longOk, isNotNull);
+
       expect(
         Prompts.parseQuestion(
-          '{"id":"q1","text":"詳しく https://example.com を開いてください","choices":["はい","いいえ"]}',
+          '{"id":"q1","text":"${'あ' * 201}","choices":["はい","いいえ"]}',
         ),
         isNull,
       );
       expect(
         Prompts.parseQuestion(
-          '{"id":"q1","text":"${'あ' * 501}","choices":["はい","いいえ"]}',
+          '{"id":"q1","text":"テスト\u0000文字列","choices":["はい","いいえ"]}',
         ),
         isNull,
       );
     });
 
-    test('未知フィールドや欠落した必須欄のメモは拒否する', () {
-      expect(
-        Prompts.parseMemo(
-          '{"what":"w","who":"u","why":"y","how":"h","nextStep":"n","unknown":true}',
-          version: 1,
-        ),
-        isNull,
+    test('未知フィールドは無視してメモ解釈し、欠落した必須欄は拒否する', () {
+      final withExtra = Prompts.parseMemo(
+        '{"what":"w","who":"u","why":"y","how":"h","nextStep":"n","unknown":true}',
+        version: 1,
       );
+      expect(withExtra, isNotNull);
+      expect(withExtra!.what, 'w');
       expect(
         Prompts.parseMemo(
           '{"what":"w","who":"u","why":"y","how":"h"}',

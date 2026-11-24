@@ -158,14 +158,19 @@ class OnDeviceBackend implements AiBackend {
   final Duration statusTimeout;
   final Duration downloadTimeout;
   final Duration generateTimeout;
+  final OnDeviceCheck? Function()? readCachedStatus;
+  final void Function(OnDeviceCheck)? writeCachedStatus;
   int _revision = 0;
 
   String? lastError;
+  OnDeviceStatus? lastStatus;
   OnDeviceLifecycle lifecycle = OnDeviceLifecycle.idle;
 
   OnDeviceBackend({
     OnDeviceTextClient? client,
     void Function(double?)? onDownloadProgress,
+    this.readCachedStatus,
+    this.writeCachedStatus,
     this.statusTimeout = const Duration(seconds: 6),
     this.downloadTimeout = const Duration(seconds: 120),
     this.generateTimeout = const Duration(seconds: 18),
@@ -187,23 +192,35 @@ class OnDeviceBackend implements AiBackend {
 
   Future<void> _prepare(int revision, {required bool allowDownload}) async {
     lifecycle = OnDeviceLifecycle.checking;
-    final check = await _client.checkStatus().timeout(statusTimeout);
-    _checkCurrent(revision);
+    final OnDeviceCheck check;
+    final cached = allowDownload ? null : readCachedStatus?.call();
+    if (cached != null &&
+        (cached.status == OnDeviceStatus.unavailable ||
+            cached.status == OnDeviceStatus.needsDownload)) {
+      check = cached;
+    } else {
+      check = await _client.checkStatus().timeout(statusTimeout);
+      _checkCurrent(revision);
+      writeCachedStatus?.call(check);
+    }
+    lastStatus = check.status;
     switch (check.status) {
       case OnDeviceStatus.available:
         break;
       case OnDeviceStatus.needsDownload:
         lifecycle = OnDeviceLifecycle.downloadable;
         if (!allowDownload) {
-          throw const OnDeviceException('設定でGemini Nanoのモデルを準備してください。');
+          throw const OnDeviceException('設定で端末AIのモデルを準備してください。');
         }
         lifecycle = OnDeviceLifecycle.downloading;
         await _client.downloadModel().timeout(downloadTimeout);
         _checkCurrent(revision);
+        lastStatus = OnDeviceStatus.available;
+        writeCachedStatus?.call(const OnDeviceCheck(OnDeviceStatus.available));
       case OnDeviceStatus.unavailable || OnDeviceStatus.checkFailed:
         lifecycle = OnDeviceLifecycle.unavailable;
         throw OnDeviceException(
-          check.message.isEmpty ? 'Gemini Nanoは現在利用できません。' : check.message,
+          check.message.isEmpty ? '端末AIは現在利用できません。' : check.message,
         );
     }
     lifecycle = OnDeviceLifecycle.ready;
@@ -211,14 +228,51 @@ class OnDeviceBackend implements AiBackend {
 
   Future<OnDeviceCheck> diagnose() async {
     try {
-      return await _client.checkStatus().timeout(statusTimeout);
+      final result = await _client.checkStatus().timeout(statusTimeout);
+      lastStatus = result.status;
+      writeCachedStatus?.call(result);
+      return result;
     } on TimeoutException {
+      lastStatus = OnDeviceStatus.checkFailed;
       return const OnDeviceCheck(
         OnDeviceStatus.checkFailed,
         'AICoreから時間内に応答がありませんでした。',
       );
     } catch (error) {
+      lastStatus = OnDeviceStatus.checkFailed;
       return OnDeviceCheck(OnDeviceStatus.checkFailed, error.toString());
+    }
+  }
+
+  /// 生成テストを伴わない単独のモデル準備（R-04）。
+  Future<OnDeviceCheck> prepareModel() async {
+    final revision = ++_revision;
+    lastError = null;
+    try {
+      await _prepare(revision, allowDownload: true);
+      return const OnDeviceCheck(OnDeviceStatus.available);
+    } on TimeoutException {
+      _checkCurrent(revision);
+      final phase = lifecycle;
+      cancelPending();
+      lifecycle = OnDeviceLifecycle.timedOut;
+      lastError = switch (phase) {
+        OnDeviceLifecycle.checking => 'AICoreから時間内に応答がありませんでした。',
+        OnDeviceLifecycle.downloading => '時間内にモデルを取得できませんでした。',
+        _ => '端末AIから時間内に応答がありませんでした。',
+      };
+      throw OnDeviceException(lastError!);
+    } on AiCancelled {
+      rethrow;
+    } catch (error) {
+      _checkCurrent(revision);
+      final failure = error is OnDeviceException
+          ? error
+          : OnDeviceException(
+              '端末AIの準備に失敗しました。${error is OnDeviceAiException ? ' ${error.message}' : ''}',
+            );
+      lastError = failure.message;
+      throw failure;
     }
   }
 

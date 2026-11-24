@@ -236,4 +236,71 @@ void main() {
       expect(_contrastRatio(Colors.white, kAccent), lessThan(4.5));
     });
   });
+
+  group('R-02 / R-04 生成元ラベルと定型落ち理由', () {
+    test('AnswerSource ラベルが 端末AI / クラウドAI / 定型 に統一されている', () {
+      expect(AnswerSource.onDevice.label, '端末AI');
+      expect(AnswerSource.remote.label, 'クラウドAI');
+      expect(AnswerSource.local.label, '定型');
+    });
+
+    test('fallbackReasonFor が状態に応じて適切な理由を返す', () {
+      expect(
+        fallbackReasonFor(
+          isLocalSource: false,
+          hasRemoteKey: false,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+        ),
+        isNull,
+      );
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: false,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+          manualTemplate: true,
+        ),
+        FallbackReason.manualTemplate,
+      );
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: true,
+          remoteConsent: true,
+          lastRemoteFailed: true,
+        ),
+        FallbackReason.remoteFailed,
+      );
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: true,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+        ),
+        FallbackReason.remoteConsentOff,
+      );
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: false,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+          onDeviceNeedsDownload: true,
+        ),
+        FallbackReason.onDeviceNeedsDownload,
+      );
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: false,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+        ),
+        FallbackReason.noRemoteKey,
+      );
+    });
+  });
 }

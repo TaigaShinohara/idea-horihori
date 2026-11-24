@@ -59,6 +59,9 @@ class IdeaStore extends ChangeNotifier {
   String? keyStorageError;
   String? ideasRecoveryNotice;
   bool _ideasWritable = true;
+  bool get ideasWritable => _ideasWritable;
+  OnDeviceCheck? _cachedOnDeviceStatus;
+  OnDeviceCheck? get cachedOnDeviceStatus => _cachedOnDeviceStatus;
   final _cloudChanges = ChangeNotifier();
   int _cloudRevision = 0;
   int _consentRevision = 0;
@@ -256,23 +259,48 @@ class IdeaStore extends ChangeNotifier {
     notifyListeners();
   });
 
-  /// K3: 初回案内を表示済みにし、以後は再表示しない。
-  Future<void> markKeyGuideShown() async {
-    keyGuideShown = true;
-    final prefs = await SharedPreferences.getInstance();
-    _checkWrite(await prefs.setBool(AppConfig.prefsKeyGuideShownKey, true));
+  /// R-06: 復旧通知を閉じる。元データ保護中（ideasWritable == false）は閉じられない。
+  bool dismissRecoveryNotice() {
+    if (!_ideasWritable || ideasRecoveryNotice == null) return false;
+    ideasRecoveryNotice = null;
+    notifyListeners();
+    return true;
+  }
+
+  /// R-04: 端末AI診断結果のメモリ内キャッシュを更新する。
+  void updateOnDeviceStatusCache(OnDeviceCheck status) {
+    if (_cachedOnDeviceStatus?.status == status.status &&
+        _cachedOnDeviceStatus?.message == status.message) {
+      return;
+    }
+    _cachedOnDeviceStatus = status;
     notifyListeners();
   }
 
+  /// R-04: 端末AI診断結果のキャッシュをクリアする。
+  void clearOnDeviceStatusCache() {
+    if (_cachedOnDeviceStatus == null) return;
+    _cachedOnDeviceStatus = null;
+    notifyListeners();
+  }
+
+  /// K3: 初回案内を表示済みにし、以後は再表示しない。
+  Future<void> markKeyGuideShown() => _saveSettings(() async {
+    final prefs = await SharedPreferences.getInstance();
+    _checkWrite(await prefs.setBool(AppConfig.prefsKeyGuideShownKey, true));
+    keyGuideShown = true;
+    notifyListeners();
+  });
+
   /// 掘り方スタイルを保存する（v0.2 項目1）。
-  Future<void> saveDigStyle(DigStyle style) async {
+  Future<void> saveDigStyle(DigStyle style) => _saveSettings(() async {
     final prefs = await SharedPreferences.getInstance();
     _checkWrite(
       await prefs.setString(AppConfig.prefsDigStyleKey, style.storageValue),
     );
     digStyle = style;
     notifyListeners();
-  }
+  });
 
   void _invalidateCloud() {
     _cloudRevision++;
@@ -405,9 +433,16 @@ class IdeaStore extends ChangeNotifier {
     );
   }
 
+  OnDeviceBackend onDeviceBackend({void Function(double?)? onDownloadProgress}) =>
+      OnDeviceBackend(
+        onDownloadProgress: onDownloadProgress,
+        readCachedStatus: () => _cachedOnDeviceStatus,
+        writeCachedStatus: updateOnDeviceStatusCache,
+      );
+
   ResilientBackend backend() => ResilientBackend(
     null,
-    onDevice: OnDeviceBackend(),
+    onDevice: onDeviceBackend(),
     remoteFactory: _remote,
   );
 

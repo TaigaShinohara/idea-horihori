@@ -3,8 +3,8 @@ import 'dart:math' as math;
 import 'dig_mode.dart';
 
 enum AnswerSource {
-  onDevice('Gemini Nano'),
-  remote('Gemini API'),
+  onDevice('端末AI'),
+  remote('クラウドAI'),
   local('定型');
 
   const AnswerSource(this.label);
