@@ -24,7 +24,8 @@ void main() {
 
   Future<IdeaStore> loadedStore({int ideaCount = 0}) async {
     SharedPreferences.setMockInitialValues({});
-    final store = IdeaStore();
+    // セキュア保存チャネルは widget テストでハングするため差し替える。
+    final store = IdeaStore(chatGptChecker: () async => false);
     await store.load();
     for (var i = 0; i < ideaCount; i++) {
       await store.addIdea('アイデア${i + 1}：散歩メモアプリ', '思いつきメモ');

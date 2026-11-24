@@ -7,6 +7,9 @@ enum DigModeKind {
   /// オンデバイスAI（Gemini Nano）が質問している（v0.3.0 PoC）。
   onDevice,
 
+  /// ChatGPT（本人のサブスクリプション）が質問している（v0.4.0）。
+  chatGpt,
+
   /// Gemini（AI）が質問している。
   ai,
 
@@ -95,12 +98,16 @@ extension DigModeKindX on DigModeKind {
   /// バッジに出す1行。
   String get label => switch (this) {
         DigModeKind.onDevice => 'オンデバイスで深掘り中',
+        DigModeKind.chatGpt => 'ChatGPTで深掘り中',
         DigModeKind.ai => 'AIで深掘り中',
         DigModeKind.templateNoKey => '定型モード（キー未設定）',
         DigModeKind.templateFailed => '定型モード（AIにつながらなかった）',
       };
 
-  bool get isAi => this == DigModeKind.ai || this == DigModeKind.onDevice;
+  bool get isAi =>
+      this == DigModeKind.ai ||
+      this == DigModeKind.onDevice ||
+      this == DigModeKind.chatGpt;
 }
 
 /// 「1回だけ出す」ための消費フラグ（通知の出しすぎ防止）。

@@ -5,6 +5,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'ai_backend.dart';
 import 'app_config.dart';
+import 'chatgpt_auth_service.dart';
+import 'chatgpt_backend.dart';
 import 'on_device_backend.dart';
 import 'dig_mode.dart';
 import 'models.dart';
@@ -12,6 +14,15 @@ import 'models.dart';
 /// 端末内のみの保存（SharedPreferences に JSON）。アカウント・同期なし。
 /// APIキーはここに保存するが、ログには決して出さない。
 class IdeaStore extends ChangeNotifier {
+  /// ChatGPT サインイン状態の確認方法（テストでは差し替える）。
+  /// セキュア保存のプラットフォームチャネルは widget テストの
+  /// フェイク非同期と相性が悪くハングするため、注入可能にしている。
+  final Future<bool> Function() _chatGptChecker;
+
+  IdeaStore({Future<bool> Function()? chatGptChecker})
+    : _chatGptChecker =
+          chatGptChecker ?? (() => ChatGptAuthService().isSignedIn);
+
   List<Idea> ideas = [];
   String apiKey = '';
   String model = AppConfig.defaultGeminiModel;
@@ -22,6 +33,23 @@ class IdeaStore extends ChangeNotifier {
 
   /// 掘り方スタイル（v0.2 項目1）。既定は友達モード。再起動後も保持する。
   DigStyle digStyle = DigStyle.friend;
+
+  /// ChatGPT にサインイン済みか（v0.4.0）。実体はセキュア保存のトークンで、
+  /// ここは backend() 組み立て用のキャッシュ。load() と設定画面で更新する。
+  bool chatGptSignedIn = false;
+
+  /// ChatGPT サインイン状態を再確認してキャッシュを更新する。
+  Future<void> refreshChatGptStatus() async {
+    try {
+      chatGptSignedIn = await _chatGptChecker().timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => false,
+      );
+    } catch (_) {
+      chatGptSignedIn = false;
+    }
+    notifyListeners();
+  }
 
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -43,6 +71,14 @@ class IdeaStore extends ChangeNotifier {
         await prefs.setString(AppConfig.prefsIdeasBackupKey, raw);
         ideas = [];
       }
+    }
+    try {
+      chatGptSignedIn = await _chatGptChecker().timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => false,
+      );
+    } catch (_) {
+      chatGptSignedIn = false;
     }
     loaded = true;
     notifyListeners();
@@ -136,11 +172,12 @@ class IdeaStore extends ChangeNotifier {
   }
 
   /// 現在の設定でバックエンドを組む。
-  /// v0.3.0 PoC: 優先順は オンデバイス → Gemini（キーがある場合）→ 定型。
+  /// 優先順は オンデバイス → ChatGPT（サインイン時）→ Gemini（キーがある場合）→ 定型。
   ResilientBackend backend() {
     return ResilientBackend(
       apiKey.isEmpty ? null : GeminiBackend(apiKey: apiKey, model: model),
       onDevice: OnDeviceBackend(),
+      chatGpt: chatGptSignedIn ? ChatGptBackend() : null,
     );
   }
 }

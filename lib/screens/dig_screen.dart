@@ -94,13 +94,18 @@ class _DigScreenState extends State<DigScreen> {
     // v0.3.0 PoC: オンデバイス→次候補への切替も、定型への切替と同じく
     // セッションに1回だけ静かに知らせる。
     final fellBack = kind == DigModeKind.templateFailed ||
-        (_backend.lastOnDeviceFailed && kind == DigModeKind.ai);
+        (_backend.lastOnDeviceFailed &&
+            (kind == DigModeKind.ai || kind == DigModeKind.chatGpt));
     if (notify && fellBack && _fallbackNotice.tryConsume() && mounted) {
-      final msg = kind == DigModeKind.ai
-          ? 'オンデバイスAIが使えなかったので、AI（Gemini）に切り替えたよ'
-          : _backend.lastOnDeviceFailed && !widget.store.hasRemoteKey
-              ? 'オンデバイスAIが使えなかったので、定型の質問に切り替えたよ'
-              : 'AIにつながらなかったので、定型の質問に切り替えたよ';
+      final msg = kind == DigModeKind.chatGpt
+          ? 'オンデバイスAIが使えなかったので、ChatGPTに切り替えたよ'
+          : kind == DigModeKind.ai
+              ? 'オンデバイスAIが使えなかったので、AI（Gemini）に切り替えたよ'
+              : _backend.lastOnDeviceFailed &&
+                      !widget.store.hasRemoteKey &&
+                      !widget.store.chatGptSignedIn
+                  ? 'オンデバイスAIが使えなかったので、定型の質問に切り替えたよ'
+                  : 'AIにつながらなかったので、定型の質問に切り替えたよ';
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(msg),
