@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter_device_ai/flutter_device_ai.dart';
 
@@ -111,14 +110,17 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
     }
   }
 
+  static int _estimateTokens(String prompt) =>
+      (prompt.runes.length * 1.2).ceil();
+
   Future<int> _countTokens(OnDeviceAiSession session, String prompt) async {
     try {
       return await session.countTokens(text: prompt)
           .timeout(const Duration(seconds: 2));
     } on OnDeviceAiException {
-      return utf8.encode(prompt).length;
+      return _estimateTokens(prompt);
     } on TimeoutException {
-      return utf8.encode(prompt).length;
+      return _estimateTokens(prompt);
     }
   }
 
@@ -247,6 +249,7 @@ class OnDeviceBackend implements AiBackend {
   /// 生成テストを伴わない単独のモデル準備（R-04）。
   Future<OnDeviceCheck> prepareModel() async {
     final revision = ++_revision;
+    _cancelClient();
     lastError = null;
     try {
       await _prepare(revision, allowDownload: true);
@@ -298,6 +301,7 @@ class OnDeviceBackend implements AiBackend {
     bool allowDownload = false,
   }) async {
     final revision = ++_revision;
+    _cancelClient();
     lastError = null;
     try {
       await _prepare(revision, allowDownload: allowDownload);
@@ -333,16 +337,22 @@ class OnDeviceBackend implements AiBackend {
     T? Function(String text) parse,
   ) async {
     var budget = Prompts.nanoBudget;
+    var inputTooLong = false;
     for (var attempt = 0; attempt < 2; attempt++) {
       _checkCurrent(revision);
+      inputTooLong = false;
       try {
         final text = await _client.generate(prompt(budget));
         _checkCurrent(revision);
         final value = parse(text);
         if (value != null) return value;
       } on _OnDeviceInputTooLong {
+        inputTooLong = true;
         budget = Prompts.compactNanoBudget;
       }
+    }
+    if (inputTooLong) {
+      throw const OnDeviceException('入力が長すぎるためGemini Nanoで処理できませんでした。');
     }
     throw const OnDeviceException('Gemini Nanoから使える形式の応答が返りませんでした。');
   }

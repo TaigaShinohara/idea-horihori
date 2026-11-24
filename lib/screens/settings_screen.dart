@@ -96,6 +96,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }, () => 'APIキーを削除しました。');
 
   Future<void> _verifyConnection() async {
+    if (_connection != null || _editing) return;
     final connection = GeminiBackend(apiKey: _key.text, model: _model.text);
     setState(() {
       _connection = connection;
@@ -111,6 +112,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (_) {
       if (mounted) setState(() => _apiMessage = '接続を確認できませんでした。');
     } finally {
+      connection.dispose();
       if (mounted) setState(() => _connection = null);
     }
   }
@@ -124,12 +126,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _nanoMessage = null;
       }
     });
-    final result = await _nano.diagnose();
-    if (!mounted || attempt != _nanoAttempt) return;
-    setState(() {
-      _checking = false;
-      _diagnosis = result;
-    });
+    try {
+      final result = await _nano.diagnose();
+      if (!mounted || attempt != _nanoAttempt) return;
+      setState(() => _diagnosis = result);
+    } catch (_) {
+      if (mounted && attempt == _nanoAttempt) {
+        setState(() {
+          _diagnosis = const OnDeviceCheck(OnDeviceStatus.checkFailed);
+        });
+      }
+    } finally {
+      if (mounted && attempt == _nanoAttempt) {
+        setState(() => _checking = false);
+      }
+    }
   }
 
   void _downloadProgress(double? value) {
@@ -217,7 +228,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
-    _connection?.cancelPending();
+    _connection?.dispose();
     _nano.cancelPending();
     _key.dispose();
     _model.dispose();
@@ -233,18 +244,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final canToggleConsent =
         widget.store.hasRemoteKey || widget.store.remoteConsent;
 
-    return GlassBackground(
-      child: Scaffold(
-        backgroundColor: Colors.transparent,
-        appBar: AppBar(
-          title: const Text('設定'),
+    return PopScope(
+      canPop: !_editing,
+      child: GlassBackground(
+        child: Scaffold(
           backgroundColor: Colors.transparent,
-          elevation: 0,
-          scrolledUnderElevation: 0,
-        ),
-        body: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-          children: [
+          appBar: AppBar(
+            title: const Text('設定'),
+            backgroundColor: Colors.transparent,
+            elevation: 0,
+            scrolledUnderElevation: 0,
+          ),
+          body: ListView(
+            padding: EdgeInsets.fromLTRB(
+              16,
+              8,
+              16,
+              24 + MediaQuery.paddingOf(context).bottom,
+            ),
+            children: [
             // 1. 端末AI（通常面は状態1行＋未取得時のみ「モデルを準備する」）
             GlassCard(
               child: Column(
@@ -488,7 +506,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
             ),
-          ],
+            ],
+          ),
         ),
       ),
     );
