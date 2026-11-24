@@ -110,6 +110,57 @@ extension DigModeKindX on DigModeKind {
       this == DigModeKind.chatGpt;
 }
 
+/// 定型モードにフォールバックした理由（R-04）。
+/// 深掘り画面で1行開示し、必要に応じて設定画面へ案内するために使う。
+enum FallbackReason {
+  onDeviceNeedsDownload(
+    '端末AIのモデルが未準備のため定型で進めています。',
+    suggestsSettings: true,
+  ),
+  noRemoteKey(
+    'AI設定が未完了のため定型で進めています。',
+    suggestsSettings: true,
+  ),
+  remoteConsentOff(
+    'クラウド送信がオフのため定型で進めています。',
+    suggestsSettings: true,
+  ),
+  remoteFailed(
+    'クラウドAIに接続できなかったため定型で進めています。',
+    suggestsSettings: false,
+  ),
+  onDeviceUnavailable(
+    '端末AIが利用できないため定型で進めています。',
+    suggestsSettings: true,
+  ),
+  manualTemplate(
+    '定型モードで進めています。',
+    suggestsSettings: false,
+  );
+
+  const FallbackReason(this.message, {required this.suggestsSettings});
+  final String message;
+  final bool suggestsSettings;
+}
+
+/// 現在の設定・失敗状態から定型モードの理由を判定する純関数（R-04）。
+FallbackReason? fallbackReasonFor({
+  required bool isLocalSource,
+  required bool hasRemoteKey,
+  required bool remoteConsent,
+  required bool lastRemoteFailed,
+  bool onDeviceNeedsDownload = false,
+  bool manualTemplate = false,
+}) {
+  if (!isLocalSource) return null;
+  if (manualTemplate) return FallbackReason.manualTemplate;
+  if (lastRemoteFailed) return FallbackReason.remoteFailed;
+  if (hasRemoteKey && !remoteConsent) return FallbackReason.remoteConsentOff;
+  if (onDeviceNeedsDownload) return FallbackReason.onDeviceNeedsDownload;
+  if (!hasRemoteKey) return FallbackReason.noRemoteKey;
+  return FallbackReason.onDeviceUnavailable;
+}
+
 /// 「1回だけ出す」ための消費フラグ（通知の出しすぎ防止）。
 /// 一度 tryConsume が true を返したら、以後は reset するまで false。
 class OnceFlag {

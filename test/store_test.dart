@@ -1,7 +1,25 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:horihori/app_config.dart';
+import 'package:horihori/on_device_backend.dart';
 import 'package:horihori/store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+class FakeSecretStore implements SecretStore {
+  final Map<String, String> values = {};
+
+  @override
+  Future<void> delete(String key) async {
+    values.remove(key);
+  }
+
+  @override
+  Future<String?> read(String key) async => values[key];
+
+  @override
+  Future<void> write(String key, String value) async {
+    values[key] = value;
+  }
+}
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -72,11 +90,39 @@ void main() {
 
   group('hasRemoteKey', () {
     test('キー未設定なら false、保存すると true', () async {
-      final store = IdeaStore();
+      final store = IdeaStore(secrets: FakeSecretStore());
       await store.load();
       expect(store.hasRemoteKey, isFalse);
       await store.saveApiKey('dummy-key');
       expect(store.hasRemoteKey, isTrue);
+    });
+    test('secure storageへ保存し旧SharedPreferences値を削除する', () async {
+      final secrets = FakeSecretStore();
+      SharedPreferences.setMockInitialValues({
+        AppConfig.prefsApiKeyKey: 'legacy-key',
+      });
+      final store = IdeaStore(secrets: secrets);
+      await store.load();
+      expect(store.apiKey, 'legacy-key');
+      expect(secrets.values[AppConfig.secureApiKeyKey], 'legacy-key');
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(AppConfig.prefsApiKeyKey), isNull);
+
+      await store.saveApiKey('new-key');
+      expect(secrets.values[AppConfig.secureApiKeyKey], 'new-key');
+
+      await store.deleteApiKey();
+      expect(store.apiKey, isEmpty);
+      expect(secrets.values[AppConfig.secureApiKeyKey], isNull);
+    });
+    test('リモート同意なしではbackendにGeminiを渡さない', () async {
+      final secrets = FakeSecretStore();
+      final store = IdeaStore(secrets: secrets);
+      await store.load();
+      await store.saveApiKey('dummy-key');
+      expect(store.backend().remote, isNull);
+      await store.saveRemoteConsent(true);
+      expect(store.backend().remote, isNotNull);
     });
   });
 
@@ -107,6 +153,33 @@ void main() {
       await store.addIdea('普通のアイデア', '');
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getString(AppConfig.prefsIdeasBackupKey), isNull);
+    });
+
+    test('退避成功（ideasWritable == true）のときだけ復旧通知を閉じられる（R-06）', () async {
+      SharedPreferences.setMockInitialValues({
+        AppConfig.prefsIdeasKey: '{broken json',
+      });
+      final store = IdeaStore();
+      await store.load();
+      expect(store.ideasWritable, isTrue);
+      expect(store.ideasRecoveryNotice, isNotNull);
+      expect(store.dismissRecoveryNotice(), isTrue);
+      expect(store.ideasRecoveryNotice, isNull);
+      // 既に空なら false
+      expect(store.dismissRecoveryNotice(), isFalse);
+    });
+  });
+
+  group('端末AI状態キャッシュ（R-04）', () {
+    test('updateOnDeviceStatusCache / clearOnDeviceStatusCache が動作する', () {
+      final store = IdeaStore(secrets: FakeSecretStore());
+      expect(store.cachedOnDeviceStatus, isNull);
+      store.updateOnDeviceStatusCache(
+        const OnDeviceCheck(OnDeviceStatus.unavailable, 'not supported'),
+      );
+      expect(store.cachedOnDeviceStatus?.status, OnDeviceStatus.unavailable);
+      store.clearOnDeviceStatusCache();
+      expect(store.cachedOnDeviceStatus, isNull);
     });
   });
 }

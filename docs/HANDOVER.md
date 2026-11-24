@@ -27,6 +27,7 @@
 
 ## ビルド
 - `./build.sh` が再現手順（プロジェクト専用 Flutter SDK コピー `.local/flutter-sdk` を使用）
+- Macのデバッグ検証はFlutter SDK、JDK 17、Android SDKを用意し、`flutter build apk --debug --target-platform android-arm64` を使う。Flutter経由のGradleはリポジトリのwrapper指定に従う。
 - 署名： 専用キーストア `.local/horihori.keystore`（`.local/` は git 管理外。このマシン上で作業する場合はそのまま使える）
 - APK のファイル名はドット1つだけ（例 `アイデアホリホリ_v0-2-0.apk`）
 

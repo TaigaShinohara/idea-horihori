@@ -21,12 +21,14 @@ class LocalNameCandidates {
 
     final raw = <String>[
       short,
-      whatWord.isNotEmpty && whatWord != short ? whatWord : '$shortノート',
-      '$shortホリホリ',
+      whatWord.isNotEmpty && whatWord != short ? whatWord : '$shortメモ',
+      '$shortノート',
+      '$shortログ',
     ];
     // 重複を避けながら必ず3件にする。
     final result = <String>[];
     for (final c in raw) {
+      if (result.length >= 3) break;
       var candidate = c;
       var n = 2;
       while (result.contains(candidate)) {
@@ -35,6 +37,6 @@ class LocalNameCandidates {
       }
       result.add(candidate);
     }
-    return result.take(3).toList();
+    return result;
   }
 }

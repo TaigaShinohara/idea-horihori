@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding;
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'ai_backend.dart';
@@ -13,20 +16,94 @@ import 'models.dart';
 
 /// 端末内のみの保存（SharedPreferences に JSON）。アカウント・同期なし。
 /// APIキーはここに保存するが、ログには決して出さない。
-class IdeaStore extends ChangeNotifier {
-  /// ChatGPT サインイン状態の確認方法（テストでは差し替える）。
-  /// セキュア保存のプラットフォームチャネルは widget テストの
-  /// フェイク非同期と相性が悪くハングするため、注入可能にしている。
-  final Future<bool> Function() _chatGptChecker;
+abstract class SecretStore {
+  Future<String?> read(String key);
+  Future<void> write(String key, String value);
+  Future<void> delete(String key);
+}
 
-  IdeaStore({Future<bool> Function()? chatGptChecker})
-    : _chatGptChecker =
-          chatGptChecker ?? (() => ChatGptAuthService().isSignedIn);
+class PlatformSecretStore implements SecretStore {
+  final FlutterSecureStorage _storage;
+  PlatformSecretStore({FlutterSecureStorage? storage})
+    : _storage = storage ?? const FlutterSecureStorage();
+
+  @override
+  Future<String?> read(String key) => _storage.read(key: key);
+
+  @override
+  Future<void> write(String key, String value) =>
+      _storage.write(key: key, value: value);
+
+  @override
+  Future<void> delete(String key) => _storage.delete(key: key);
+}
+
+class StoreFailure implements Exception {
+  const StoreFailure(this.message);
+  final String message;
+}
+
+/// store の [SecretStore] を ChatGPT 認証の [TokenStore] として使うアダプタ。
+/// インターフェース形状が同一のため、そのまま委譲する。
+class _SecretStoreTokenStore implements TokenStore {
+  final SecretStore _secrets;
+  _SecretStoreTokenStore(this._secrets);
+
+  @override
+  Future<String?> read(String key) => _secrets.read(key);
+
+  @override
+  Future<void> write(String key, String value) => _secrets.write(key, value);
+
+  @override
+  Future<void> delete(String key) => _secrets.delete(key);
+}
+
+class IdeaStore extends ChangeNotifier {
+  final SecretStore _secrets;
+
+  /// ChatGPT サインイン状態の確認方法の差し替え（テスト用）。
+  /// 既定では [_secrets] 経由で確認する（下記 [_checkChatGptSignedIn]）。
+  final Future<bool> Function()? _chatGptChecker;
+
+  IdeaStore({SecretStore? secrets, this._chatGptChecker})
+    : _secrets = secrets ?? PlatformSecretStore();
+
+  /// ChatGPT サインイン状態を確認する。
+  /// 既定の経路は APIキーと同じ [SecretStore] 経由にする: 本番では
+  /// flutter_secure_storage（ChatGPT トークンの保存先と同一）を見て、
+  /// テストでは注入された FakeSecretStore が即答する。プラットフォーム
+  /// チャネルを直接叩くと widget テストのフェイク非同期で応答が返らず
+  /// load() がハングするため、この経路に統一している。
+  Future<bool> _checkChatGptSignedIn() {
+    final checker = _chatGptChecker;
+    if (checker != null) return checker();
+    return ChatGptAuthService(
+      store: _SecretStoreTokenStore(_secrets),
+    ).isSignedIn;
+  }
 
   List<Idea> ideas = [];
-  String apiKey = '';
-  String model = AppConfig.defaultGeminiModel;
+  String _apiKey = '';
+  String get apiKey => _apiKey;
+  String _model = AppConfig.defaultGeminiModel;
+  String get model => _model;
   bool loaded = false;
+  bool _loading = false;
+  String? loadError;
+  bool _remoteConsent = false;
+  bool get remoteConsent => _remoteConsent;
+  String? keyStorageError;
+  String? ideasRecoveryNotice;
+  bool _ideasWritable = true;
+  bool get ideasWritable => _ideasWritable;
+  OnDeviceCheck? _cachedOnDeviceStatus;
+  OnDeviceCheck? get cachedOnDeviceStatus => _cachedOnDeviceStatus;
+  final _cloudChanges = ChangeNotifier();
+  int _cloudRevision = 0;
+  int _consentRevision = 0;
+  Future<void> _settingsQueue = Future.value();
+  Future<void> _ideasQueue = Future.value();
 
   /// K3: キー未設定時の初回案内を出したかどうか（1回だけ出す）。
   bool keyGuideShown = false;
@@ -41,7 +118,7 @@ class IdeaStore extends ChangeNotifier {
   /// ChatGPT サインイン状態を再確認してキャッシュを更新する。
   Future<void> refreshChatGptStatus() async {
     try {
-      chatGptSignedIn = await _chatGptChecker().timeout(
+      chatGptSignedIn = await _checkChatGptSignedIn().timeout(
         const Duration(seconds: 5),
         onTimeout: () => false,
       );
@@ -52,44 +129,130 @@ class IdeaStore extends ChangeNotifier {
   }
 
   Future<void> load() async {
-    final prefs = await SharedPreferences.getInstance();
-    apiKey = prefs.getString(AppConfig.prefsApiKeyKey) ?? '';
-    model = prefs.getString(AppConfig.prefsModelKey) ?? AppConfig.defaultGeminiModel;
-    keyGuideShown = prefs.getBool(AppConfig.prefsKeyGuideShownKey) ?? false;
-    digStyle =
-        DigStyleX.fromStorage(prefs.getString(AppConfig.prefsDigStyleKey));
-    final raw = prefs.getString(AppConfig.prefsIdeasKey);
-    if (raw != null && raw.isNotEmpty) {
+    if (_loading) return;
+    _loading = true;
+    loadError = null;
+    notifyListeners();
+    try {
+      await _readPreferences(
+        await SharedPreferences.getInstance().timeout(
+          const Duration(seconds: 6),
+        ),
+      );
+      loaded = true;
+    } catch (_) {
+      loadError = '端末のデータを読み込めませんでした。';
+    } finally {
+      _loading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _readPreferences(SharedPreferences prefs) async {
+    keyStorageError = null;
+    _remoteConsent = false;
+    _invalidateCloud();
+    try {
+      await _loadApiKey(prefs);
+      _remoteConsent =
+          hasRemoteKey && prefs.get(AppConfig.prefsRemoteConsentKey) == true;
+    } catch (_) {
+      _apiKey = '';
+      keyStorageError = 'APIキーを安全な保存先から読み込めませんでした。設定で確認してください。';
+    }
+    final storedModel = prefs.get(AppConfig.prefsModelKey);
+    _model = AppConfig.geminiModel(storedModel is String ? storedModel : null);
+    if (storedModel is String && storedModel != _model) {
       try {
-        final list = jsonDecode(raw) as List;
-        ideas = list
-            .map((e) => Idea.fromJson(e as Map<String, dynamic>))
-            .toList();
+        await prefs.setString(AppConfig.prefsModelKey, _model);
       } catch (_) {
-        // パース失敗でデータを握りつぶさない: 原文を別キーへ退避してから
-        // 空で開始する（次の保存で壊れた原文ごと消える事故を防ぐ）。
-        await prefs.setString(AppConfig.prefsIdeasBackupKey, raw);
-        ideas = [];
+        // 次回も読み込み時に旧モデルを移行する。
       }
     }
+    // v0.4.0: ChatGPT サインイン状態をキャッシュする（失敗時は未サインイン扱い）。
     try {
-      chatGptSignedIn = await _chatGptChecker().timeout(
+      chatGptSignedIn = await _checkChatGptSignedIn().timeout(
         const Duration(seconds: 5),
         onTimeout: () => false,
       );
     } catch (_) {
       chatGptSignedIn = false;
     }
-    loaded = true;
-    notifyListeners();
+    keyGuideShown = prefs.get(AppConfig.prefsKeyGuideShownKey) == true;
+    final style = prefs.get(AppConfig.prefsDigStyleKey);
+    digStyle = DigStyleX.fromStorage(style is String ? style : null);
+    await _loadIdeas(prefs);
+  }
+
+  Future<void> _loadApiKey(SharedPreferences prefs) async {
+    _apiKey = await _readKey() ?? '';
+    final legacy = prefs.get(AppConfig.prefsApiKeyKey);
+    if (legacy is! String || legacy.isEmpty) return;
+    if (_apiKey.isEmpty && legacy.trim().isNotEmpty) {
+      await _writeKey(legacy.trim());
+      _apiKey = legacy.trim();
+    }
+    _checkWrite(await prefs.remove(AppConfig.prefsApiKeyKey));
+  }
+
+  Future<void> _loadIdeas(SharedPreferences prefs) async {
+    ideas = [];
+    ideasRecoveryNotice = null;
+    _ideasWritable = true;
+    final raw = prefs.get(AppConfig.prefsIdeasKey);
+    if (raw == null || raw == '') return;
+    var damaged = 0;
+    try {
+      final records = jsonDecode(raw as String) as List;
+      for (final record in records) {
+        try {
+          ideas.add(Idea.fromJson(record as Map<String, dynamic>));
+        } catch (_) {
+          damaged++;
+        }
+      }
+    } catch (_) {
+      damaged++;
+    }
+    if (damaged == 0) return;
+    try {
+      final original = raw is String ? raw : jsonEncode(raw);
+      final backup = prefs.get(AppConfig.prefsIdeasBackupKey);
+      final alreadySaved = backup == original || prefs.getKeys().any(
+        (key) => key.startsWith('${AppConfig.prefsIdeasBackupKey}_') &&
+            prefs.get(key) == original,
+      );
+      if (!alreadySaved) {
+        final key = backup == null
+            ? AppConfig.prefsIdeasBackupKey
+            : '${AppConfig.prefsIdeasBackupKey}_${DateTime.now().microsecondsSinceEpoch}';
+        _checkWrite(await prefs.setString(key, original));
+      }
+      ideasRecoveryNotice = '読み込めないアイデアデータを端末内に退避しました。';
+    } catch (_) {
+      _ideasWritable = false;
+      ideasRecoveryNotice = '元データを保護するため、現在は変更を保存できません。';
+    }
   }
 
   Future<void> _saveIdeas() async {
+    if (!_ideasWritable) throw StoreFailure(ideasRecoveryNotice!);
+    final snapshot = jsonEncode(ideas.map((e) => e.toJson()).toList());
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-      AppConfig.prefsIdeasKey,
-      jsonEncode(ideas.map((e) => e.toJson()).toList()),
+    _checkWrite(await prefs.setString(AppConfig.prefsIdeasKey, snapshot));
+  }
+
+  Future<T> _changeIdeas<T>(Future<T> Function() change) {
+    final write = _ideasQueue.then((_) => change());
+    _ideasQueue = write.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
     );
+    return write;
+  }
+
+  static void _checkWrite(bool saved) {
+    if (!saved) throw const StoreFailure('端末に保存できませんでした。もう一度お試しください。');
   }
 
   List<Idea> get visibleIdeas =>
@@ -103,81 +266,256 @@ class IdeaStore extends ChangeNotifier {
   /// リモート（Gemini）を使える設定かどうか。
   bool get hasRemoteKey => apiKey.isNotEmpty;
 
-  Future<Idea> addIdea(String title, String note) async {
+  Future<Idea> addIdea(String title, String note) => _changeIdeas(() async {
+    final now = DateTime.now();
     final idea = Idea(
-      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      id: now.microsecondsSinceEpoch.toString(),
       title: title.trim(),
       note: note.trim(),
-      createdAt: DateTime.now(),
+      createdAt: now,
     );
     ideas.add(idea);
-    await _saveIdeas();
+    try {
+      await _saveIdeas();
+    } catch (_) {
+      ideas.remove(idea);
+      rethrow;
+    }
     notifyListeners();
     return idea;
-  }
+  });
 
-  Future<void> updateIdea(Idea idea) async {
+  Future<void> updateIdea(Idea idea) => _changeIdeas(() async {
+    if (!ideas.contains(idea)) throw const StoreFailure('アイデアを確認できませんでした。');
     await _saveIdeas();
     notifyListeners();
-  }
+  });
 
-  Future<void> archiveIdea(Idea idea) async {
-    idea.archived = true;
-    await _saveIdeas();
-    notifyListeners();
-  }
+  Future<void> archiveIdea(Idea idea) => _setArchived(idea, true);
 
   /// アーカイブから一覧へ戻す。
-  Future<void> unarchiveIdea(Idea idea) async {
-    idea.archived = false;
-    await _saveIdeas();
+  Future<void> unarchiveIdea(Idea idea) => _setArchived(idea, false);
+
+  Future<void> _setArchived(Idea idea, bool archived) => _changeIdeas(() async {
+    if (!ideas.contains(idea) || idea.archived == archived) return;
+    idea.archived = archived;
+    try {
+      await _saveIdeas();
+    } catch (_) {
+      idea.archived = !archived;
+      rethrow;
+    }
+    notifyListeners();
+  });
+
+  /// 完全に削除する（復元不可。呼び出し側で確認を取ること）。
+  Future<void> deleteIdea(Idea idea) => _changeIdeas(() async {
+    final index = ideas.indexOf(idea);
+    if (index < 0) return;
+    ideas.removeAt(index);
+    try {
+      await _saveIdeas();
+    } catch (_) {
+      ideas.insert(index, idea);
+      rethrow;
+    }
+    notifyListeners();
+  });
+
+  /// R-06: 復旧通知を閉じる。元データ保護中（ideasWritable == false）は閉じられない。
+  bool dismissRecoveryNotice() {
+    if (!_ideasWritable || ideasRecoveryNotice == null) return false;
+    ideasRecoveryNotice = null;
+    notifyListeners();
+    return true;
+  }
+
+  /// R-04: 端末AI診断結果のメモリ内キャッシュを更新する。
+  void updateOnDeviceStatusCache(OnDeviceCheck status) {
+    if (_cachedOnDeviceStatus?.status == status.status &&
+        _cachedOnDeviceStatus?.message == status.message) {
+      return;
+    }
+    _cachedOnDeviceStatus = status;
     notifyListeners();
   }
 
-  /// 完全に削除する（復元不可。呼び出し側で確認を取ること）。
-  Future<void> deleteIdea(Idea idea) async {
-    ideas.remove(idea);
-    await _saveIdeas();
+  /// R-04: 端末AI診断結果のキャッシュをクリアする。
+  void clearOnDeviceStatusCache() {
+    if (_cachedOnDeviceStatus == null) return;
+    _cachedOnDeviceStatus = null;
     notifyListeners();
   }
 
   /// K3: 初回案内を表示済みにし、以後は再表示しない。
-  Future<void> markKeyGuideShown() async {
-    keyGuideShown = true;
+  Future<void> markKeyGuideShown() => _saveSettings(() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(AppConfig.prefsKeyGuideShownKey, true);
+    _checkWrite(await prefs.setBool(AppConfig.prefsKeyGuideShownKey, true));
+    keyGuideShown = true;
     notifyListeners();
-  }
+  });
 
   /// 掘り方スタイルを保存する（v0.2 項目1）。
-  Future<void> saveDigStyle(DigStyle style) async {
+  Future<void> saveDigStyle(DigStyle style) => _saveSettings(() async {
+    final prefs = await SharedPreferences.getInstance();
+    _checkWrite(
+      await prefs.setString(AppConfig.prefsDigStyleKey, style.storageValue),
+    );
     digStyle = style;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(AppConfig.prefsDigStyleKey, style.storageValue);
     notifyListeners();
+  });
+
+  void _invalidateCloud() {
+    _cloudRevision++;
+    _cloudChanges.notifyListeners();
   }
 
-  Future<void> saveApiKey(String key) async {
-    apiKey = key.trim();
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(AppConfig.prefsApiKeyKey, apiKey);
-    notifyListeners();
+  Future<void> _saveSettings(Future<void> Function() action) {
+    final write = _settingsQueue.then((_) => action());
+    _settingsQueue = write.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return write;
   }
 
-  Future<void> saveModel(String m) async {
-    model = m.trim().isEmpty ? AppConfig.defaultGeminiModel : m.trim();
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(AppConfig.prefsModelKey, model);
-    notifyListeners();
+  Future<void> _writeKey(String value) async {
+    await _secrets
+        .write(AppConfig.secureApiKeyKey, value)
+        .timeout(const Duration(seconds: 6));
+    if (await _readKey() != value) {
+      throw const StoreFailure('APIキーを保存先から読み戻せませんでした。');
+    }
   }
+
+  Future<String?> _readKey() => _secrets
+      .read(AppConfig.secureApiKeyKey)
+      .timeout(const Duration(seconds: 6));
+
+  void _revokeCloud() {
+    _consentRevision++;
+    _remoteConsent = false;
+    _invalidateCloud();
+  }
+
+  Future<void> saveApiKey(String key) {
+    final value = key.trim();
+    if (value.isEmpty) return deleteApiKey();
+    if (value == _apiKey && keyStorageError == null) return Future.value();
+    _revokeCloud();
+    return _saveSettings(() async {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        _checkWrite(
+          await prefs.setBool(AppConfig.prefsRemoteConsentKey, false),
+        );
+        await _writeKey(value);
+        _checkWrite(await prefs.remove(AppConfig.prefsApiKeyKey));
+        _apiKey = value;
+        keyStorageError = null;
+      } catch (_) {
+        keyStorageError = 'APIキーの保存を確認できませんでした。';
+        throw StoreFailure(keyStorageError!);
+      } finally {
+        notifyListeners();
+      }
+    });
+  }
+
+  Future<void> deleteApiKey() {
+    _revokeCloud();
+    return _saveSettings(() async {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        _checkWrite(
+          await prefs.setBool(AppConfig.prefsRemoteConsentKey, false),
+        );
+        _checkWrite(await prefs.remove(AppConfig.prefsApiKeyKey));
+        await _secrets
+            .delete(AppConfig.secureApiKeyKey)
+            .timeout(const Duration(seconds: 6));
+        if (await _readKey() != null) {
+          throw const StoreFailure('削除後もキーが残っています。');
+        }
+        _apiKey = '';
+        keyStorageError = null;
+      } catch (_) {
+        keyStorageError = 'APIキーの削除を確認できませんでした。';
+        throw StoreFailure(keyStorageError!);
+      } finally {
+        notifyListeners();
+      }
+    });
+  }
+
+  Future<void> saveRemoteConsent(bool consent) {
+    if (!consent) _revokeCloud();
+    final revision = ++_consentRevision;
+    return _saveSettings(() async {
+      if (consent && (!hasRemoteKey || keyStorageError != null)) {
+        throw const StoreFailure('先にAPIキーを保存してください。');
+      }
+      final prefs = await SharedPreferences.getInstance();
+      _checkWrite(
+        await prefs.setBool(AppConfig.prefsRemoteConsentKey, consent),
+      );
+      if (_consentRevision == revision) {
+        _remoteConsent = consent;
+        notifyListeners();
+      }
+    });
+  }
+
+  Future<void> saveModel(String value) {
+    final next = AppConfig.geminiModel(value);
+    if (!AppConfig.validGeminiModel(next)) {
+      return Future.error(const StoreFailure('モデル名の形式を確認してください。'));
+    }
+    return _saveSettings(() async {
+      final prefs = await SharedPreferences.getInstance();
+      _checkWrite(await prefs.setString(AppConfig.prefsModelKey, next));
+      if (_model != next) _invalidateCloud();
+      _model = next;
+      notifyListeners();
+    });
+  }
+
+  GeminiBackend? _remote() {
+    if (!remoteConsent || !hasRemoteKey || keyStorageError != null) return null;
+    final grant = _cloudRevision;
+    return GeminiBackend(
+      apiKey: _apiKey,
+      model: _model,
+      consentChanges: _cloudChanges,
+      maySend: () {
+        final state = WidgetsBinding.instance.lifecycleState;
+        return remoteConsent &&
+            _cloudRevision == grant &&
+            (state == null || state == AppLifecycleState.resumed);
+      },
+    );
+  }
+
+  OnDeviceBackend onDeviceBackend({void Function(double?)? onDownloadProgress}) =>
+      OnDeviceBackend(
+        onDownloadProgress: onDownloadProgress,
+        readCachedStatus: () => _cachedOnDeviceStatus,
+        writeCachedStatus: updateOnDeviceStatusCache,
+      );
 
   /// 現在の設定でバックエンドを組む。
-  /// 優先順は オンデバイス → ChatGPT（サインイン時）→ Gemini（キーがある場合）→ 定型。
-  ResilientBackend backend() {
-    return ResilientBackend(
-      apiKey.isEmpty ? null : GeminiBackend(apiKey: apiKey, model: model),
-      onDevice: OnDeviceBackend(),
-      chatGpt: chatGptSignedIn ? ChatGptBackend() : null,
-    );
+  /// 優先順は オンデバイス → ChatGPT（サインイン時）→ Gemini（キー＋同意がある場合）→ 定型。
+  ResilientBackend backend() => ResilientBackend(
+    null,
+    onDevice: onDeviceBackend(),
+    chatGpt: chatGptSignedIn ? ChatGptBackend() : null,
+    remoteFactory: _remote,
+  );
+
+  @override
+  void dispose() {
+    _invalidateCloud();
+    _cloudChanges.dispose();
+    super.dispose();
   }
 }

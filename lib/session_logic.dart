@@ -7,6 +7,15 @@ import 'models.dart';
 bool contrarianDue(DigSession session) =>
     !session.contrarianAsked && session.answers.length == 3;
 
+/// 今セッションを企画メモにまとめられるか（S-02）。
+/// 2周目0問目での誤爆を防ぐため、今セッションの回答が1件以上あるときのみ true。
+bool canSummarizeSession(DigSession session) => session.answers.isNotEmpty;
+
+/// アイデアがすでに1周目（確定メモまたは完了済み回答）を終えているか（R-01）。
+bool hasCompletedPriorRound(Idea idea) =>
+    idea.memos.isNotEmpty ||
+    idea.sessions.any((s) => s.finished && s.answers.isNotEmpty);
+
 /// 「1問もどる」が使えるか（項目7）。
 /// 回答が1件以上あり、最新の回答に選択肢の記録がある場合だけ可。
 /// 旧データの回答（choices 無し）は復元できないので対象外。
@@ -24,9 +33,8 @@ QaEntry? undoLastAnswer(DigSession session) {
     text: last.question,
     choices: last.choices!,
     isContrarian: last.contrarian,
+    source: last.source,
   );
-  if (last.contrarian) {
-    session.contrarianAsked = false;
-  }
+  session.contrarianAsked = session.answers.any((answer) => answer.contrarian);
   return last;
 }

@@ -38,6 +38,8 @@ DigSession _session(List<QaEntry> answers) => DigSession(
     );
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   group('旧データ互換（v0.2 共通ルール）', () {
     test('旧形式JSON（新キーなし）がそのまま読める', () {
       final oldJson = <String, dynamic>{
@@ -215,15 +217,36 @@ void main() {
       expect(p, contains('失敗するとしたら'));
     });
 
-    test('定型経路では due のとき固定文が出て、回答後は二度出ない', () async {
+    test('定型1周目は基本5問完走を優先し、2周目以降の due で逆張りが出て二度出ない（R-01）', () async {
       final backend = LocalBackend();
       final history = [
         const QaEntry(questionId: 'who', question: '', answer: 'x'),
         const QaEntry(questionId: 'why', question: '', answer: 'x'),
         const QaEntry(questionId: 'what', question: '', answer: 'x'),
       ];
-      final q = await backend.nextQuestion(
+      // 1周目（メモ・過去セッションなし）では 4問目でも how が出る
+      final firstRoundQ4 = await backend.nextQuestion(
         idea: _idea(),
+        history: history,
+        contrarianDue: true,
+      );
+      expect(firstRoundQ4.id, 'how');
+      expect(firstRoundQ4.isContrarian, isFalse);
+
+      // 5問目で next が出て基本5スロットを完走できる
+      final firstRoundQ5 = await backend.nextQuestion(
+        idea: _idea(),
+        history: [
+          ...history,
+          QaEntry(questionId: 'how', question: firstRoundQ4.text, answer: 'x'),
+        ],
+      );
+      expect(firstRoundQ5.id, 'next');
+
+      // 2周目（メモあり）では due のとき逆張りが出る
+      final secondRoundIdea = _idea(memos: [_memo()]);
+      final q = await backend.nextQuestion(
+        idea: secondRoundIdea,
         history: history,
         contrarianDue: true,
       );
@@ -232,7 +255,7 @@ void main() {
       expect(q.text, contains('失敗するとしたら'));
       expect(q.choices, ['需要がない', '作りきれない', '続けられない']);
 
-      // 逆張りに答えた後の履歴では、due 指定でも定型に戻る
+      // 逆張りに答えた後の履歴では、due 指定でも二度出ない
       final after = [
         ...history,
         QaEntry(
@@ -244,12 +267,91 @@ void main() {
         ),
       ];
       final q2 = await backend.nextQuestion(
-        idea: _idea(),
+        idea: secondRoundIdea,
         history: after,
         contrarianDue: true,
       );
       expect(q2.id, isNot('contrarian'));
       expect(q2.isContrarian, isFalse);
+    });
+
+    test('LocalMemoBuilder は逆張り・視点回答を nextStep へ絶対に流さない（R-01/R-03）', () {
+      final memo = LocalMemoBuilder.build(
+        title: '天気アプリ',
+        answers: const [
+          QaEntry(questionId: 'who', question: '誰の？', answer: '個人'),
+          QaEntry(questionId: 'why', question: '困っていることは？', answer: '服選び'),
+          QaEntry(questionId: 'what', question: '形は？', answer: 'サッと記録する'),
+          QaEntry(questionId: 'how', question: 'どうやって？', answer: '通知'),
+          QaEntry(
+            questionId: 'contrarian',
+            question: '失敗するとしたら？',
+            answer: '需要がない',
+            contrarian: true,
+          ),
+          QaEntry(
+            questionId: 'money_1',
+            question: 'お金を払うのは誰？',
+            answer: '使う本人',
+          ),
+        ],
+        version: 1,
+      );
+      expect(memo.nextStep, '続きを深掘りする');
+      expect(memo.nextStep, isNot('需要がない'));
+      expect(memo.what, contains('需要がない'));
+      // タイトルに「アプリ」が含まれるため「アプリ」が重複しない
+      expect(memo.what, isNot(contains('サッと記録するアプリ')));
+    });
+
+    test('定型モードでも視点選択が次の質問に反映され、2周目は基本5問をループしない（R-03）', () async {
+      final backend = LocalBackend();
+      final moneyQ = await backend.nextQuestion(
+        idea: _idea(),
+        history: const [],
+        viewpoint: DigViewpoint.money,
+      );
+      expect(moneyQ.id, startsWith('money_'));
+
+      final techQ = await backend.nextQuestion(
+        idea: _idea(),
+        history: const [],
+        viewpoint: DigViewpoint.tech,
+      );
+      expect(techQ.id, startsWith('tech_'));
+
+      final userQ = await backend.nextQuestion(
+        idea: _idea(),
+        history: const [],
+        viewpoint: DigViewpoint.user,
+      );
+      expect(userQ.id, startsWith('user_'));
+
+      // 1周目完了済みアイデアで2周目を始めると deep_1 が出る（who へ戻らない）
+      final finishedFirst = DigSession(
+        id: 's1',
+        startedAt: DateTime(2026, 11, 21),
+        finished: true,
+        answers: FallbackQuestions.questions
+            .map((q) => QaEntry(questionId: q.id, question: q.text, answer: 'a'))
+            .toList(),
+      );
+      final secondRound = _idea(sessions: [finishedFirst], memos: [_memo()]);
+      final nextQ = await backend.nextQuestion(
+        idea: secondRound,
+        history: const [],
+      );
+      expect(nextQ.id, startsWith('deep_'));
+    });
+
+    test('canSummarizeSession は今セッションの回答が1件以上のときだけ true（S-02）', () {
+      expect(canSummarizeSession(_session([])), isFalse);
+      expect(
+        canSummarizeSession(
+          _session([const QaEntry(questionId: 'who', question: 'Q', answer: 'A')]),
+        ),
+        isTrue,
+      );
     });
   });
 
@@ -317,13 +419,14 @@ void main() {
   });
 
   group('項目6 名前決めアシスト', () {
-    test('ローカル候補は必ず3件・重複なし', () {
+    test('ローカル候補は必ず3件・重複なし・自然な名称', () {
       final names = LocalNameCandidates.generate(
         title: '天気で服を決めるアプリ',
         memo: _memo(),
       );
       expect(names, hasLength(3));
       expect(names.toSet(), hasLength(3));
+      expect(names.any((n) => n.contains('ホリホリ')), isFalse);
       final backend = LocalBackend();
       expectLater(
         backend.nameCandidates(idea: _idea(memos: [_memo()])),

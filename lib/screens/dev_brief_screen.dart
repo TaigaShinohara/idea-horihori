@@ -15,39 +15,55 @@ class DevBriefScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final brief = buildDevBrief(idea);
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      appBar: AppBar(
-        title: const Text('開発指示書'),
+    return GlassBackground(
+      child: Scaffold(
         backgroundColor: Colors.transparent,
-        elevation: 0,
-      ),
-      body: GlassBackground(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+        appBar: AppBar(
+          title: const Text('開発指示書'),
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+        ),
+        body: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            ReadingGlass(
-              child: SelectableText(
-                brief,
-                style: const TextStyle(fontSize: 14, height: 1.7),
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                child: ReadingGlass(
+                  child: SelectableText(
+                    brief,
+                    style: const TextStyle(fontSize: 14, height: 1.7),
+                  ),
+                ),
               ),
             ),
-            const SizedBox(height: 16),
-            FilledButton.icon(
-              style: FilledButton.styleFrom(
-                backgroundColor: kButtonFill,
-                padding: const EdgeInsets.symmetric(vertical: 13),
+            SafeArea(
+              top: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                child: FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: kButtonFill,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 13),
+                  ),
+                  onPressed: () async {
+                    var message = '指示書をコピーしました';
+                    try {
+                      await Clipboard.setData(ClipboardData(text: brief));
+                    } catch (_) {
+                      message = 'コピーできませんでした。本文を選択してコピーできます。';
+                    }
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context)
+                          .showSnackBar(SnackBar(content: Text(message)));
+                    }
+                  },
+                  icon: const Icon(Icons.copy, size: 19),
+                  label: const Text('コピー'),
+                ),
               ),
-              onPressed: () async {
-                await Clipboard.setData(ClipboardData(text: brief));
-                if (context.mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('指示書をコピーしたよ')),
-                  );
-                }
-              },
-              icon: const Icon(Icons.copy, size: 19),
-              label: const Text('コピー'),
             ),
           ],
         ),

@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show Listenable;
 import 'package:http/http.dart' as http;
 
 import 'app_config.dart';
@@ -10,9 +12,31 @@ import 'fallback.dart';
 import 'models.dart';
 import 'name_candidates.dart';
 import 'prompts.dart';
+import 'session_logic.dart';
 
 /// 応答がどこから来たか（K1: モード開示のために画面へ伝える）。
-enum AnswerSource { onDevice, chatGpt, remote, local }
+/// 本体は models.dart（v0.4.0 で chatGpt を追加）。
+export 'models.dart' show AnswerSource;
+
+class AiCancelled implements Exception {
+  const AiCancelled();
+}
+
+enum AiPhase { onDevice, cloud }
+
+enum GeminiFailure implements Exception {
+  invalidKey('APIキーが拒否されました。Google AI Studioでキーとアクセス権を確認してください。'),
+  invalidModel('このモデルを利用できません。モデル名と利用権を確認してください。'),
+  quota('利用上限に達しました。時間を置くか、Google AI Studioで利用枠を確認してください。'),
+  network('Geminiに接続できませんでした。通信状況を確認してください。'),
+  timeout('Geminiから時間内に応答がありませんでした。'),
+  unavailable('Geminiで一時的な障害が発生しています。少し待って再試行してください。'),
+  invalidResponse('Geminiからこの機能で使える応答が返りませんでした。'),
+  revoked('クラウド送信を停止しました。');
+
+  const GeminiFailure(this.message);
+  final String message;
+}
 
 /// AIバックエンドの抽象化。v1の既定は Gemini、差し替え口だけ用意する。
 /// v0.2: 掘り方スタイル／視点／逆張り指定と、名前候補の取得口を追加。
@@ -40,50 +64,188 @@ abstract class AiBackend {
 class GeminiBackend implements AiBackend {
   final String apiKey;
   final String model;
-  final http.Client _client;
-  GeminiBackend({required this.apiKey, String? model, http.Client? client})
-      : model = model ?? AppConfig.defaultGeminiModel,
-        _client = client ?? http.Client();
+  final http.Client? _client;
+  final Listenable? consentChanges;
+  final bool Function()? maySend;
+  final Duration timeout;
+  Completer<void>? _activeRequest;
+
+  GeminiBackend({
+    required this.apiKey,
+    String? model,
+    this._client,
+    this.consentChanges,
+    this.maySend,
+    this.timeout = const Duration(seconds: 12),
+  }) : model = AppConfig.geminiModel(model);
 
   @override
   bool get isRemote => true;
 
-  Future<String> _generate(String prompt) async {
-    final uri = Uri.parse('${AppConfig.geminiEndpoint}/$model:generateContent');
-    final res = await _client
-        .post(
-          uri,
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': apiKey,
-          },
-          body: jsonEncode({
-            'contents': [
-              {
-                'parts': [
-                  {'text': prompt}
-                ]
-              }
-            ],
-            'generationConfig': {'temperature': 0.7},
-          }),
-        )
-        .timeout(const Duration(seconds: 30));
-    if (res.statusCode != 200) {
-      throw Exception('Gemini API error: ${res.statusCode}');
+  void cancelPending() {
+    final request = _activeRequest;
+    if (request != null && !request.isCompleted) request.complete();
+  }
+
+  Future<Map<String, dynamic>> _request({Map<String, Object>? body}) async {
+    if (apiKey.trim().isEmpty) throw GeminiFailure.invalidKey;
+    if (!AppConfig.validGeminiModel(model)) throw GeminiFailure.invalidModel;
+    if (maySend?.call() == false) throw GeminiFailure.revoked;
+
+    final abort = Completer<void>();
+    void stop() {
+      if (!abort.isCompleted) abort.complete();
     }
-    final decoded = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
-    final candidates = decoded['candidates'] as List? ?? [];
-    if (candidates.isEmpty) throw Exception('Gemini API: empty response');
-    final content = (candidates.first as Map<String, dynamic>)['content']
-        as Map<String, dynamic>?;
-    final parts = content?['parts'] as List? ?? [];
+
+    _activeRequest = abort;
+    final request =
+        http.AbortableRequest(
+            body == null ? 'GET' : 'POST',
+            Uri.parse(
+              '${AppConfig.geminiEndpoint}/$model'
+              '${body == null ? '' : ':generateContent'}',
+            ),
+            abortTrigger: abort.future,
+          )
+          ..followRedirects = false
+          ..headers['x-goog-api-key'] = apiKey.trim();
+    if (body != null) {
+      request.headers['Content-Type'] = 'application/json; charset=utf-8';
+      request.body = jsonEncode(body);
+    }
+    final client = _client ?? http.Client();
+    consentChanges?.addListener(stop);
+    try {
+      final res = await client
+          .send(request)
+          .then(http.Response.fromStream)
+          .timeout(timeout);
+      if (abort.isCompleted || maySend?.call() == false) {
+        throw GeminiFailure.revoked;
+      }
+      switch (res.statusCode) {
+        case 200:
+          final decoded = jsonDecode(utf8.decode(res.bodyBytes));
+          if (decoded is Map<String, dynamic>) return decoded;
+          throw GeminiFailure.invalidResponse;
+        case 401 || 403:
+          throw GeminiFailure.invalidKey;
+        case 400:
+          final error = jsonDecode(utf8.decode(res.bodyBytes));
+          final details = error is Map ? error['error'] : null;
+          final items = details is Map ? details['details'] : null;
+          if (items is List &&
+              items.whereType<Map>().any(
+                (e) => e['reason'] == 'API_KEY_INVALID',
+              )) {
+            throw GeminiFailure.invalidKey;
+          }
+          throw GeminiFailure.invalidModel;
+        case 404:
+          throw GeminiFailure.invalidModel;
+        case 429:
+          throw GeminiFailure.quota;
+        case >= 500:
+          throw GeminiFailure.unavailable;
+        default:
+          throw GeminiFailure.invalidResponse;
+      }
+    } on TimeoutException {
+      throw GeminiFailure.timeout;
+    } on http.RequestAbortedException {
+      throw GeminiFailure.revoked;
+    } on http.ClientException {
+      throw GeminiFailure.network;
+    } on FormatException {
+      throw GeminiFailure.invalidResponse;
+    } finally {
+      consentChanges?.removeListener(stop);
+      stop();
+      if (identical(_activeRequest, abort)) _activeRequest = null;
+      if (_client == null) client.close();
+    }
+  }
+
+  /// キーとモデルを検査する。アイデアの内容や生成リクエストは送らない。
+  Future<void> verifyConnection() async {
+    final modelInfo = await _request();
+    final methods = modelInfo['supportedGenerationMethods'];
+    if (methods is! List || !methods.contains('generateContent')) {
+      throw GeminiFailure.invalidModel;
+    }
+  }
+
+  Future<String> _generate(String prompt, Map<String, Object> schema) async {
+    final decoded = await _request(
+      body: {
+        'contents': [
+          {
+            'parts': [
+              {'text': prompt},
+            ],
+          },
+        ],
+        'generationConfig': {
+          'temperature': 0.5,
+          'maxOutputTokens': 2048,
+          'responseMimeType': 'application/json',
+          'responseJsonSchema': schema,
+        },
+      },
+    );
+    final candidates = decoded['candidates'];
+    if (candidates is! List || candidates.isEmpty || candidates.first is! Map) {
+      throw GeminiFailure.invalidResponse;
+    }
+    final candidate = candidates.first as Map;
+    if (candidate['finishReason'] != null &&
+        candidate['finishReason'] != 'STOP') {
+      throw GeminiFailure.invalidResponse;
+    }
+    final content = candidate['content'];
+    final parts = content is Map ? content['parts'] : null;
+    if (parts is! List) throw GeminiFailure.invalidResponse;
     final text = parts
-        .map((p) => (p as Map<String, dynamic>)['text']?.toString() ?? '')
+        .whereType<Map>()
+        .where((part) => part['thought'] != true)
+        .map((part) => part['text'])
+        .whereType<String>()
         .join();
-    if (text.trim().isEmpty) throw Exception('Gemini API: empty text');
+    if (text.trim().isEmpty) throw GeminiFailure.invalidResponse;
     return text;
   }
+
+  static const _text = {'type': 'string'};
+  static const _choices = {
+    'type': 'array',
+    'items': _text,
+    'minItems': 3,
+    'maxItems': 3,
+  };
+  static const _score = {'type': 'integer', 'minimum': 1, 'maximum': 3};
+  static const _questionSchema = {
+    'type': 'object',
+    'properties': {'id': _text, 'text': _text, 'choices': _choices},
+    'required': ['id', 'text', 'choices'],
+  };
+  static const _memoSchema = {
+    'type': 'object',
+    'properties': {
+      'what': _text,
+      'who': _text,
+      'why': _text,
+      'how': _text,
+      'nextStep': _text,
+      'ease': _score,
+      'spark': _score,
+    },
+    'required': ['what', 'who', 'why', 'how', 'nextStep', 'ease', 'spark'],
+  };
+  static const _namesSchema = {
+    'type': 'object',
+    'properties': {'candidates': _choices},
+    'required': ['candidates'],
+  };
 
   @override
   Future<DigQuestion> nextQuestion({
@@ -93,17 +255,20 @@ class GeminiBackend implements AiBackend {
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
   }) async {
-    final text = await _generate(Prompts.nextQuestion(
-      title: idea.title,
-      note: idea.note,
-      history: history,
-      latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
-      style: style,
-      viewpoint: viewpoint,
-      contrarian: contrarianDue,
-    ));
+    final text = await _generate(
+      Prompts.nextQuestion(
+        title: idea.title,
+        note: idea.note,
+        history: history,
+        latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
+        style: style,
+        viewpoint: viewpoint,
+        contrarian: contrarianDue,
+      ),
+      _questionSchema,
+    );
     final q = Prompts.parseQuestion(text);
-    if (q == null) throw Exception('Gemini API: unparsable question');
+    if (q == null) throw GeminiFailure.invalidResponse;
     // 逆張りとして出させた質問には印を付けて返す（取り消し時の復元用）。
     return contrarianDue ? q.copyWith(isContrarian: true) : q;
   }
@@ -115,26 +280,29 @@ class GeminiBackend implements AiBackend {
     required int version,
     DigStyle style = DigStyle.friend,
   }) async {
-    final text = await _generate(Prompts.summarize(
-      title: idea.title,
-      history: history,
-      latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
-      style: style,
-    ));
+    final text = await _generate(
+      Prompts.summarize(
+        title: idea.title,
+        history: history,
+        latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
+        style: style,
+      ),
+      _memoSchema,
+    );
     final memo = Prompts.parseMemo(text, version: version);
-    if (memo == null) throw Exception('Gemini API: unparsable memo');
+    if (memo == null) throw GeminiFailure.invalidResponse;
     return memo;
   }
 
   @override
   Future<List<String>> nameCandidates({required Idea idea}) async {
-    if (idea.memos.isEmpty) throw Exception('Gemini API: no memo');
-    final text = await _generate(Prompts.nameCandidates(
-      title: idea.title,
-      memo: idea.memos.last,
-    ));
+    if (idea.memos.isEmpty) throw GeminiFailure.invalidResponse;
+    final text = await _generate(
+      Prompts.nameCandidates(title: idea.title, memo: idea.memos.last),
+      _namesSchema,
+    );
     final names = Prompts.parseNameCandidates(text);
-    if (names.length < 3) throw Exception('Gemini API: unparsable names');
+    if (names.length < 3) throw GeminiFailure.invalidResponse;
     return names;
   }
 }
@@ -153,18 +321,52 @@ class LocalBackend implements AiBackend {
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
   }) async {
-    // 逆張り（項目3）: 指定があり、まだ出していなければ固定文を出す（1回だけ）。
-    if (contrarianDue && !history.any((a) => a.contrarian)) {
-      return FallbackQuestions.contrarianQuestion;
+    final priorRound = hasCompletedPriorRound(idea);
+    final allAskedIds = <String>{
+      for (final s in idea.sessions)
+        for (final a in s.answers) a.questionId,
+      for (final a in history) a.questionId,
+    };
+
+    // R-01: 定型モード1周目は基本5スロット完走を優先し、逆張りは2周目以降に発火する。
+    if (priorRound && contrarianDue && !history.any((a) => a.contrarian)) {
+      return FallbackQuestions.styled(
+        FallbackQuestions.contrarianQuestion,
+        style,
+      );
     }
-    // 既出の定型質問は飛ばし、次の未出題を出す。
+
+    // R-03: 視点が明示選択されている場合、その視点の未出題質問を出題する。
+    if (viewpoint != DigViewpoint.none) {
+      final pool = FallbackQuestions.viewpointQuestions[viewpoint] ?? const [];
+      for (final q in pool) {
+        if (!allAskedIds.contains(q.id)) {
+          return FallbackQuestions.styled(q, style);
+        }
+      }
+    }
+
+    // 基本5問のうち未出題のものを順に出す（2周目以降は過去セッションも既出とみなす）。
+    final basicAskedIds = priorRound
+        ? allAskedIds
+        : history.map((a) => a.questionId).toSet();
     for (final q in FallbackQuestions.questions) {
-      if (!history.any((a) => a.questionId == q.id)) {
+      if (!basicAskedIds.contains(q.id)) {
         return FallbackQuestions.styled(q, style);
       }
     }
+
+    // 2周目以降で基本5問をすべて回答済みなら、2周目用の深掘り質問を出す（ループ防止）。
+    if (priorRound) {
+      for (final q in FallbackQuestions.deepeningQuestions) {
+        if (!allAskedIds.contains(q.id)) {
+          return FallbackQuestions.styled(q, style);
+        }
+      }
+    }
+
     // 定型を使い切ったら汎用の広げ質問を出す。
-    final n = history.length + 1;
+    final n = (priorRound ? allAskedIds.length : history.length) + 1;
     return FallbackQuestions.styled(
       DigQuestion(
         id: 'extra$n',
@@ -204,7 +406,10 @@ class LocalBackend implements AiBackend {
 /// [lastSource] / [lastRemoteFailed] として公開する。画面側はセッション中
 /// 同じインスタンスを保持し、呼び出しのたびにこの値でモード表示を更新する。
 class ResilientBackend implements AiBackend {
-  final AiBackend? remote;
+  final AiBackend? _fixedRemote;
+  final AiBackend? Function()? remoteFactory;
+  AiBackend? get remote =>
+      remoteFactory == null ? _fixedRemote : remoteFactory!();
 
   /// v0.3.0 PoC: オンデバイスAI。最優先で試し、失敗したら次へ倒す。
   final AiBackend? onDevice;
@@ -212,7 +417,16 @@ class ResilientBackend implements AiBackend {
   /// v0.4.0: ChatGPT（サインイン済みのときだけ非 null）。オンデバイスの次。
   final AiBackend? chatGpt;
   final LocalBackend local = LocalBackend();
-  ResilientBackend(this.remote, {this.onDevice, this.chatGpt});
+  ResilientBackend(
+    this._fixedRemote, {
+    this.onDevice,
+    this.chatGpt,
+    this.remoteFactory,
+  });
+
+  void Function(AiPhase)? onPhase;
+  Completer<void>? _active;
+  GeminiBackend? _activeRemote;
 
   /// 直近の呼び出し（質問・まとめ共通）の応答元。未呼び出しなら null。
   AnswerSource? lastSource;
@@ -220,6 +434,7 @@ class ResilientBackend implements AiBackend {
   /// 直近の呼び出しでリモートが失敗しローカルへ倒れたか。
   /// キー未設定で最初からローカルの場合は false。
   bool lastRemoteFailed = false;
+  GeminiFailure? lastRemoteError;
 
   /// 直近の呼び出しでオンデバイスが失敗し次へ倒れたか（v0.3.0 PoC）。
   bool lastOnDeviceFailed = false;
@@ -232,6 +447,38 @@ class ResilientBackend implements AiBackend {
 
   /// 直近の ChatGPT 失敗の理由（診断表示用、v0.4.0）。
   String? lastChatGptError;
+
+  /// 直近の呼び出しがユーザー手動の「定型で続ける」だったか（R-04）。
+  bool lastManualTemplate = false;
+
+  /// 直近のオンデバイス状態（R-04）。
+  OnDeviceStatus? get lastOnDeviceStatus =>
+      onDevice is OnDeviceBackend ? (onDevice as OnDeviceBackend).lastStatus : null;
+
+  /// 定型モードに落ちた理由（R-04）。AI応答時は null。
+  FallbackReason? fallbackReason({
+    required bool hasRemoteKey,
+    required bool remoteConsent,
+  }) => fallbackReasonFor(
+    isLocalSource: lastSource == AnswerSource.local,
+    hasRemoteKey: hasRemoteKey,
+    remoteConsent: remoteConsent,
+    // v0.4.0: ChatGPT の失敗も「クラウドAIに接続できなかった」に含める。
+    lastRemoteFailed: lastRemoteFailed || lastChatGptFailed,
+    onDeviceNeedsDownload: lastOnDeviceStatus == OnDeviceStatus.needsDownload,
+    manualTemplate: lastManualTemplate,
+  );
+
+  void cancelPending() {
+    final active = _active;
+    if (active == null || active.isCompleted) return;
+    active.complete();
+    _activeRemote?.cancelPending();
+    final candidate = onDevice;
+    if (candidate is OnDeviceBackend) {
+      candidate.cancelPending();
+    }
+  }
 
   /// 現在のモード表示（DigScreen のバッジ用）。
   DigModeKind get currentModeKind {
@@ -251,51 +498,101 @@ class ResilientBackend implements AiBackend {
     return DigModeKind.templateNoKey;
   }
 
-  /// 候補を優先順（オンデバイス→リモート→ローカル）で試す共通処理。
-  Future<T> _run<T>(
+  /// 候補を優先順（オンデバイス→ChatGPT→Gemini→ローカル）で試す共通処理。
+  Future<(T, AnswerSource)> _run<T>(
+    Future<T> Function(AiBackend backend) op,
+    Future<T> Function() localOp, {
+    bool templateOnly = false,
+  }) async {
+    cancelPending();
+    final active = Completer<void>();
+    _active = active;
+    try {
+      return await Future.any([
+        _resolve(op, localOp, active, templateOnly),
+        active.future.then<(T, AnswerSource)>((_) => throw const AiCancelled()),
+      ]);
+    } finally {
+      if (identical(_active, active)) _active = null;
+    }
+  }
+
+  Future<(T, AnswerSource)> _resolve<T>(
     Future<T> Function(AiBackend backend) op,
     Future<T> Function() localOp,
+    Completer<void> active,
+    bool templateOnly,
   ) async {
+    void checkCancelled() {
+      if (active.isCompleted) throw const AiCancelled();
+    }
+
     lastOnDeviceFailed = false;
     lastChatGptFailed = false;
     lastRemoteFailed = false;
-    if (onDevice != null) {
+    lastRemoteError = null;
+    lastOnDeviceError = null;
+    lastManualTemplate = templateOnly;
+    if (!templateOnly && onDevice != null) {
+      onPhase?.call(AiPhase.onDevice);
       try {
+        checkCancelled();
         final r = await op(onDevice!);
+        checkCancelled();
         lastSource = AnswerSource.onDevice;
-        lastOnDeviceError = null;
-        return r;
+        return (r, AnswerSource.onDevice);
       } catch (e) {
+        checkCancelled();
         lastOnDeviceFailed = true;
         final od = onDevice;
-        lastOnDeviceError =
-            od is OnDeviceBackend ? (od.lastError ?? e.toString()) : e.toString();
+        lastOnDeviceError = od is OnDeviceBackend
+            ? (od.lastError ?? e.toString())
+            : e.toString();
       }
     }
-    if (chatGpt != null) {
+    // v0.4.0: 第2候補は ChatGPT（サインイン済みのときだけ非 null）。
+    // Gemini と同じクラウド扱いで、フェーズ通知・キャンセル規約に合わせる。
+    if (!templateOnly && chatGpt != null) {
+      onPhase?.call(AiPhase.cloud);
       try {
+        checkCancelled();
         final r = await op(chatGpt!);
+        checkCancelled();
         lastSource = AnswerSource.chatGpt;
         lastChatGptError = null;
-        return r;
+        return (r, AnswerSource.chatGpt);
       } catch (e) {
+        checkCancelled();
         lastChatGptFailed = true;
         final cg = chatGpt;
-        lastChatGptError =
-            cg is ChatGptBackend ? (cg.lastError ?? e.toString()) : e.toString();
+        lastChatGptError = cg is ChatGptBackend
+            ? (cg.lastError ?? e.toString())
+            : e.toString();
       }
     }
-    if (remote != null) {
+    checkCancelled();
+    final cloud = templateOnly ? null : remote;
+    if (cloud != null) {
+      onPhase?.call(AiPhase.cloud);
       try {
-        final r = await op(remote!);
+        checkCancelled();
+        if (cloud is GeminiBackend) _activeRemote = cloud;
+        final r = await op(cloud);
+        checkCancelled();
         lastSource = AnswerSource.remote;
-        return r;
-      } catch (_) {
-        lastRemoteFailed = true;
+        return (r, AnswerSource.remote);
+      } catch (error) {
+        checkCancelled();
+        lastRemoteFailed = error != GeminiFailure.revoked;
+        if (error is GeminiFailure && lastRemoteFailed) lastRemoteError = error;
+      } finally {
+        if (identical(_activeRemote, cloud)) _activeRemote = null;
       }
     }
+    final result = await localOp();
+    checkCancelled();
     lastSource = AnswerSource.local;
-    return localOp();
+    return (result, AnswerSource.local);
   }
 
   @override
@@ -308,8 +605,10 @@ class ResilientBackend implements AiBackend {
     DigStyle style = DigStyle.friend,
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
-  }) {
-    return _run(
+    bool templateOnly = false,
+    List<QaEntry>? templateHistory,
+  }) async {
+    final (question, source) = await _run(
       (b) => b.nextQuestion(
         idea: idea,
         history: history,
@@ -319,12 +618,14 @@ class ResilientBackend implements AiBackend {
       ),
       () => local.nextQuestion(
         idea: idea,
-        history: history,
+        history: templateHistory ?? history,
         style: style,
         viewpoint: viewpoint,
         contrarianDue: contrarianDue,
       ),
+      templateOnly: templateOnly,
     );
+    return question.copyWith(source: source);
   }
 
   @override
@@ -333,8 +634,9 @@ class ResilientBackend implements AiBackend {
     required List<QaEntry> history,
     required int version,
     DigStyle style = DigStyle.friend,
-  }) {
-    return _run(
+    bool templateOnly = false,
+  }) async {
+    final (memo, source) = await _run(
       (b) => b.summarize(
         idea: idea,
         history: history,
@@ -347,14 +649,21 @@ class ResilientBackend implements AiBackend {
         version: version,
         style: style,
       ),
+      templateOnly: templateOnly,
     );
+    return memo.withSource(source);
   }
 
   @override
-  Future<List<String>> nameCandidates({required Idea idea}) {
-    return _run(
+  Future<List<String>> nameCandidates({
+    required Idea idea,
+    bool templateOnly = false,
+  }) async {
+    final (names, _) = await _run(
       (b) => b.nameCandidates(idea: idea),
       () => local.nameCandidates(idea: idea),
+      templateOnly: templateOnly,
     );
+    return names;
   }
 }

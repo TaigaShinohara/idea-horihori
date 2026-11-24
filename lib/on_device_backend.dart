@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter_device_ai/flutter_device_ai.dart';
 
@@ -7,185 +8,343 @@ import 'dig_mode.dart';
 import 'models.dart';
 import 'prompts.dart';
 
-/// オンデバイスAI（Android: Gemini Nano / ML Kit GenAI Prompt API）の
-/// 状態。プラグインの型をアプリ側の言葉に寄せたもの（テスト差し替え用）。
-enum OnDeviceStatus { available, needsDownload, unavailable }
+enum OnDeviceStatus { available, needsDownload, unavailable, checkFailed }
 
-/// 状態確認の結果（プラグインが返す理由メッセージつき）。
+enum OnDeviceLifecycle {
+  idle,
+  checking,
+  ready,
+  downloadable,
+  downloading,
+  unavailable,
+  timedOut,
+  cancelled,
+}
+
 class OnDeviceCheck {
   final OnDeviceStatus status;
   final String message;
   const OnDeviceCheck(this.status, [this.message = '']);
 }
 
-/// オンデバイスAIクライアントの抽象化（実機: [FlutterOnDeviceClient]、
-/// テスト: Fake）。profileMaker PoC と同じ分離パターン。
 abstract class OnDeviceTextClient {
   Future<OnDeviceCheck> checkStatus();
-
-  /// モデルのダウンロード完了まで待つ。失敗・タイムアウトは例外。
   Future<void> downloadModel();
-
   Future<String> generate(String prompt);
 }
 
-/// flutter_device_ai の実クライアント。
 class FlutterOnDeviceClient implements OnDeviceTextClient {
   final FlutterDeviceAi _ai;
-  FlutterOnDeviceClient({FlutterDeviceAi? ai}) : _ai = ai ?? FlutterDeviceAi();
+  final void Function(double?)? onDownloadProgress;
+  StreamIterator<ModelDownloadStatus>? _download;
+  OnDeviceAiSession? _session;
+  int _revision = 0;
+
+  FlutterOnDeviceClient({FlutterDeviceAi? ai, this.onDownloadProgress})
+    : _ai = ai ?? FlutterDeviceAi.withFallback();
+
+  void _checkCurrent(int revision) {
+    if (revision != _revision) throw const AiCancelled();
+  }
 
   @override
   Future<OnDeviceCheck> checkStatus() async {
-    final a = await _ai.availability();
-    final status = switch (a.status) {
+    final availability = await _ai.availability();
+    final status = switch (availability.status) {
       ModelFeatureStatus.available => OnDeviceStatus.available,
       ModelFeatureStatus.downloadable ||
-      ModelFeatureStatus.downloading =>
-        OnDeviceStatus.needsDownload,
+      ModelFeatureStatus.downloading => OnDeviceStatus.needsDownload,
+      ModelFeatureStatus.unavailable
+          when availability.reason == AvailabilityReason.unknown =>
+        OnDeviceStatus.checkFailed,
       ModelFeatureStatus.unavailable => OnDeviceStatus.unavailable,
     };
-    return OnDeviceCheck(status, a.message);
+    return OnDeviceCheck(status, availability.message);
   }
 
   @override
   Future<void> downloadModel() async {
-    await for (final event in _ai.downloadModel()) {
-      if (event.status == ModelFeatureStatus.available) return;
-      if (event.status == ModelFeatureStatus.unavailable) {
-        throw Exception(
-            'on-device model download failed: ${event.errorMessage ?? ''}');
+    final revision = _revision;
+    final iterator = StreamIterator(_ai.downloadModel());
+    _download = iterator;
+    try {
+      while (await iterator.moveNext()) {
+        _checkCurrent(revision);
+        final event = iterator.current;
+        if (event.status == ModelFeatureStatus.available) return;
+        if (event.status == ModelFeatureStatus.unavailable) {
+          throw OnDeviceException(event.errorMessage ?? 'モデルを取得できませんでした。');
+        }
+        onDownloadProgress?.call(event.progress?.clamp(0.0, 1.0));
       }
+      _checkCurrent(revision);
+      if ((await checkStatus()).status != OnDeviceStatus.available) {
+        throw const OnDeviceException('モデルの取得が完了しませんでした。');
+      }
+      _checkCurrent(revision);
+    } finally {
+      if (identical(_download, iterator)) _download = null;
+      await iterator.cancel();
+      if (revision == _revision) onDownloadProgress?.call(null);
     }
-    throw Exception('on-device model download ended unexpectedly');
   }
 
   @override
   Future<String> generate(String prompt) async {
-    final res = await _ai.generateText(
-      prompt: prompt,
-      instructions: 'あなたはアプリのアイデアを深掘りするインタビュアーです。'
-          '指示された形式（JSONのみ）で、日本語で短く答えてください。',
-      config: const GenerationConfig(maxTokens: 512, temperature: 0.7),
+    final revision = _revision;
+    // 専用のシステム指示はNano V3以降で使える。指示はテキストに含める。
+    final session = await _ai.createSession(
+      config: const GenerationConfig(maxTokens: 512, temperature: 0.3),
     );
-    return res.text;
+    try {
+      _checkCurrent(revision);
+      _session = session;
+      final tokens = await _countTokens(session, prompt);
+      _checkCurrent(revision);
+      if (tokens > 3400) throw const _OnDeviceInputTooLong();
+      final response = await session.ask(prompt);
+      _checkCurrent(revision);
+      return response.text;
+    } finally {
+      if (identical(_session, session)) _session = null;
+      await _release(session.close());
+    }
+  }
+
+  Future<int> _countTokens(OnDeviceAiSession session, String prompt) async {
+    try {
+      return await session.countTokens(text: prompt)
+          .timeout(const Duration(seconds: 2));
+    } on OnDeviceAiException {
+      return utf8.encode(prompt).length;
+    } on TimeoutException {
+      return utf8.encode(prompt).length;
+    }
+  }
+
+  void cancelPending() {
+    _revision++;
+    final download = _download;
+    final session = _session;
+    _download = null;
+    _session = null;
+    if (download != null) unawaited(_release(download.cancel()));
+    if (session != null) unawaited(_release(session.close()));
+  }
+
+  Future<void> _release(Future<void> operation) async {
+    try {
+      await operation;
+    } catch (_) {
+      // ネイティブ側の切断後も処理の取り消しは維持する。
+    }
   }
 }
 
-/// オンデバイスAIが使えない／応答しない場合の例外。
-/// 呼び出し側（ResilientBackend）が次の候補へ倒すために使う。
 class OnDeviceException implements Exception {
   final String message;
-  OnDeviceException(this.message);
+  const OnDeviceException(this.message);
+
   @override
-  String toString() => 'OnDeviceException: $message';
+  String toString() => message;
 }
 
-/// オンデバイスAIバックエンド（v0.3.0 PoC）。
-///
-/// profileMaker PoC の教訓を最初から入れる:
-/// - 全呼び出しにタイムアウト（実機で応答が返らず固まる事象への対策）。
-///   固まったら例外にして、ResilientBackend が次の候補へ倒す。
-/// - パース失敗時のみ1回再試行する。
-/// - モデルのダウンロードが必要な端末では、初回だけ待ってから推論する。
+class _OnDeviceInputTooLong implements Exception {
+  const _OnDeviceInputTooLong();
+}
+
 class OnDeviceBackend implements AiBackend {
   final OnDeviceTextClient _client;
   final Duration statusTimeout;
   final Duration downloadTimeout;
   final Duration generateTimeout;
+  final OnDeviceCheck? Function()? readCachedStatus;
+  final void Function(OnDeviceCheck)? writeCachedStatus;
+  int _revision = 0;
 
-  Future<void>? _readyFuture;
-
-  /// 直近の失敗理由（診断表示用）。成功したら消える。
   String? lastError;
+  OnDeviceStatus? lastStatus;
+  OnDeviceLifecycle lifecycle = OnDeviceLifecycle.idle;
 
   OnDeviceBackend({
     OnDeviceTextClient? client,
-    this.statusTimeout = const Duration(seconds: 15),
+    void Function(double?)? onDownloadProgress,
+    this.readCachedStatus,
+    this.writeCachedStatus,
+    this.statusTimeout = const Duration(seconds: 6),
     this.downloadTimeout = const Duration(seconds: 120),
-    this.generateTimeout = const Duration(seconds: 60),
-  }) : _client = client ?? FlutterOnDeviceClient();
+    this.generateTimeout = const Duration(seconds: 18),
+  }) : _client =
+           client ??
+           FlutterOnDeviceClient(onDownloadProgress: onDownloadProgress);
 
   @override
   bool get isRemote => false;
 
-  /// 利用可能になるまで（必要ならダウンロード含む）進める。結果は保持し、
-  /// セッション中は再確認しない。失敗したら例外。
-  Future<void> _ensureReady() {
-    return _readyFuture ??= _prepare();
+  void _checkCurrent(int revision) {
+    if (revision != _revision) throw const AiCancelled();
   }
 
-  Future<void> _prepare() async {
-    try {
-      final check = await _client.checkStatus().timeout(
-            statusTimeout,
-            onTimeout: () =>
-                throw OnDeviceException('status check timed out'),
-          );
-      lastError = null;
-      switch (check.status) {
-        case OnDeviceStatus.available:
-          return;
-        case OnDeviceStatus.needsDownload:
-          await _client.downloadModel().timeout(
-                downloadTimeout,
-                onTimeout: () =>
-                    throw OnDeviceException('model download timed out'),
-              );
-          return;
-        case OnDeviceStatus.unavailable:
-          throw OnDeviceException(check.message.isEmpty
-              ? 'on-device AI unavailable on this device'
-              : 'on-device AI unavailable: ${check.message}');
-      }
-    } catch (e) {
-      // 失敗を保持すると再試行できなくなるので、次回呼び出しでやり直せる
-      // ようにキャッシュを捨てる。
-      _readyFuture = null;
-      lastError = e.toString();
-      if (e is OnDeviceException) rethrow;
-      throw OnDeviceException('on-device AI preparation failed: $e');
+  void _cancelClient() {
+    final client = _client;
+    if (client is FlutterOnDeviceClient) client.cancelPending();
+  }
+
+  Future<void> _prepare(int revision, {required bool allowDownload}) async {
+    lifecycle = OnDeviceLifecycle.checking;
+    final OnDeviceCheck check;
+    final cached = allowDownload ? null : readCachedStatus?.call();
+    if (cached != null &&
+        (cached.status == OnDeviceStatus.unavailable ||
+            cached.status == OnDeviceStatus.needsDownload)) {
+      check = cached;
+    } else {
+      check = await _client.checkStatus().timeout(statusTimeout);
+      _checkCurrent(revision);
+      writeCachedStatus?.call(check);
     }
+    lastStatus = check.status;
+    switch (check.status) {
+      case OnDeviceStatus.available:
+        break;
+      case OnDeviceStatus.needsDownload:
+        lifecycle = OnDeviceLifecycle.downloadable;
+        if (!allowDownload) {
+          throw const OnDeviceException('設定で端末AIのモデルを準備してください。');
+        }
+        lifecycle = OnDeviceLifecycle.downloading;
+        await _client.downloadModel().timeout(downloadTimeout);
+        _checkCurrent(revision);
+        lastStatus = OnDeviceStatus.available;
+        writeCachedStatus?.call(const OnDeviceCheck(OnDeviceStatus.available));
+      case OnDeviceStatus.unavailable || OnDeviceStatus.checkFailed:
+        lifecycle = OnDeviceLifecycle.unavailable;
+        throw OnDeviceException(
+          check.message.isEmpty ? '端末AIは現在利用できません。' : check.message,
+        );
+    }
+    lifecycle = OnDeviceLifecycle.ready;
   }
 
-  /// 設定画面の診断用：状態と理由をそのまま返す（例外にしない）。
   Future<OnDeviceCheck> diagnose() async {
     try {
-      return await _client.checkStatus().timeout(statusTimeout);
-    } catch (e) {
-      return OnDeviceCheck(OnDeviceStatus.unavailable, '確認に失敗: $e');
+      final result = await _client.checkStatus().timeout(statusTimeout);
+      lastStatus = result.status;
+      writeCachedStatus?.call(result);
+      return result;
+    } on TimeoutException {
+      lastStatus = OnDeviceStatus.checkFailed;
+      return const OnDeviceCheck(
+        OnDeviceStatus.checkFailed,
+        'AICoreから時間内に応答がありませんでした。',
+      );
+    } catch (error) {
+      lastStatus = OnDeviceStatus.checkFailed;
+      return OnDeviceCheck(OnDeviceStatus.checkFailed, error.toString());
     }
   }
 
-  Future<String> _generate(String prompt) async {
-    await _ensureReady();
+  /// 生成テストを伴わない単独のモデル準備（R-04）。
+  Future<OnDeviceCheck> prepareModel() async {
+    final revision = ++_revision;
+    lastError = null;
     try {
-      final text = await _client.generate(prompt).timeout(
-            generateTimeout,
-            onTimeout: () => throw OnDeviceException('generation timed out'),
-          );
-      if (text.trim().isEmpty) throw OnDeviceException('empty response');
-      return text;
-    } on OnDeviceException catch (e) {
-      lastError = e.toString();
+      await _prepare(revision, allowDownload: true);
+      return const OnDeviceCheck(OnDeviceStatus.available);
+    } on TimeoutException {
+      _checkCurrent(revision);
+      final phase = lifecycle;
+      cancelPending();
+      lifecycle = OnDeviceLifecycle.timedOut;
+      lastError = switch (phase) {
+        OnDeviceLifecycle.checking => 'AICoreから時間内に応答がありませんでした。',
+        OnDeviceLifecycle.downloading => '時間内にモデルを取得できませんでした。',
+        _ => '端末AIから時間内に応答がありませんでした。',
+      };
+      throw OnDeviceException(lastError!);
+    } on AiCancelled {
       rethrow;
-    } catch (e) {
-      lastError = 'generation failed: $e';
-      throw OnDeviceException('generation failed: $e');
+    } catch (error) {
+      _checkCurrent(revision);
+      final failure = error is OnDeviceException
+          ? error
+          : OnDeviceException(
+              '端末AIの準備に失敗しました。${error is OnDeviceAiException ? ' ${error.message}' : ''}',
+            );
+      lastError = failure.message;
+      throw failure;
     }
   }
 
-  /// パース失敗時のみ1回だけ生成し直す（profileMaker PoC と同じ型）。
+  Future<DigQuestion> verifyGeneration() => _nextQuestion(
+    idea: Idea(
+      id: 'nano-check',
+      title: '近所の散歩コースを記録するアプリ',
+      createdAt: DateTime.now(),
+    ),
+    history: const [],
+    allowDownload: true,
+  );
+
+  void cancelPending() {
+    _revision++;
+    lifecycle = OnDeviceLifecycle.cancelled;
+    _cancelClient();
+  }
+
   Future<T> _generateParsed<T>(
-    String prompt,
-    T? Function(String text) parse,
-    String what,
-  ) async {
-    for (var attempt = 1; attempt <= 2; attempt++) {
-      final text = await _generate(prompt);
-      final parsed = parse(text);
-      if (parsed != null) return parsed;
+    String Function(int budget) prompt,
+    T? Function(String text) parse, {
+    bool allowDownload = false,
+  }) async {
+    final revision = ++_revision;
+    lastError = null;
+    try {
+      await _prepare(revision, allowDownload: allowDownload);
+      return await _tryOutput(revision, prompt, parse).timeout(generateTimeout);
+    } on TimeoutException {
+      _checkCurrent(revision);
+      final phase = lifecycle;
+      cancelPending();
+      lifecycle = OnDeviceLifecycle.timedOut;
+      lastError = switch (phase) {
+        OnDeviceLifecycle.checking => 'AICoreから時間内に応答がありませんでした。',
+        OnDeviceLifecycle.downloading => '時間内にモデルを取得できませんでした。',
+        _ => 'Gemini Nanoから時間内に応答がありませんでした。',
+      };
+      throw OnDeviceException(lastError!);
+    } on AiCancelled {
+      rethrow;
+    } catch (error) {
+      _checkCurrent(revision);
+      final failure = error is OnDeviceException
+          ? error
+          : OnDeviceException(
+              'Gemini Nanoの処理に失敗しました。${error is OnDeviceAiException ? ' ${error.message}' : ''}',
+            );
+      lastError = failure.message;
+      throw failure;
     }
-    throw OnDeviceException('unparsable $what (after retry)');
+  }
+
+  Future<T> _tryOutput<T>(
+    int revision,
+    String Function(int budget) prompt,
+    T? Function(String text) parse,
+  ) async {
+    var budget = Prompts.nanoBudget;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      _checkCurrent(revision);
+      try {
+        final text = await _client.generate(prompt(budget));
+        _checkCurrent(revision);
+        final value = parse(text);
+        if (value != null) return value;
+      } on _OnDeviceInputTooLong {
+        budget = Prompts.compactNanoBudget;
+      }
+    }
+    throw const OnDeviceException('Gemini Nanoから使える形式の応答が返りませんでした。');
   }
 
   @override
@@ -195,9 +354,24 @@ class OnDeviceBackend implements AiBackend {
     DigStyle style = DigStyle.friend,
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
+  }) => _nextQuestion(
+    idea: idea,
+    history: history,
+    style: style,
+    viewpoint: viewpoint,
+    contrarianDue: contrarianDue,
+  );
+
+  Future<DigQuestion> _nextQuestion({
+    required Idea idea,
+    required List<QaEntry> history,
+    DigStyle style = DigStyle.friend,
+    DigViewpoint viewpoint = DigViewpoint.none,
+    bool contrarianDue = false,
+    bool allowDownload = false,
   }) async {
-    final q = await _generateParsed(
-      Prompts.nextQuestion(
+    final question = await _generateParsed(
+      (budget) => Prompts.nextQuestion(
         title: idea.title,
         note: idea.note,
         history: history,
@@ -205,11 +379,12 @@ class OnDeviceBackend implements AiBackend {
         style: style,
         viewpoint: viewpoint,
         contrarian: contrarianDue,
+        budget: budget,
       ),
       Prompts.parseQuestion,
-      'question',
+      allowDownload: allowDownload,
     );
-    return contrarianDue ? q.copyWith(isContrarian: true) : q;
+    return contrarianDue ? question.copyWith(isContrarian: true) : question;
   }
 
   @override
@@ -218,30 +393,30 @@ class OnDeviceBackend implements AiBackend {
     required List<QaEntry> history,
     required int version,
     DigStyle style = DigStyle.friend,
-  }) async {
-    return _generateParsed(
-      Prompts.summarize(
-        title: idea.title,
-        history: history,
-        latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
-        style: style,
-      ),
-      (text) => Prompts.parseMemo(text, version: version),
-      'memo',
-    );
-  }
+  }) => _generateParsed(
+    (budget) => Prompts.summarize(
+      title: idea.title,
+      history: history,
+      latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
+      style: style,
+      budget: budget,
+    ),
+    (text) => Prompts.parseMemo(text, version: version),
+  );
 
   @override
-  Future<List<String>> nameCandidates({required Idea idea}) async {
-    if (idea.memos.isEmpty) throw OnDeviceException('no memo');
-    final names = await _generateParsed(
-      Prompts.nameCandidates(title: idea.title, memo: idea.memos.last),
+  Future<List<String>> nameCandidates({required Idea idea}) {
+    if (idea.memos.isEmpty) throw const OnDeviceException('企画メモがありません。');
+    return _generateParsed(
+      (budget) => Prompts.nameCandidates(
+        title: idea.title,
+        memo: idea.memos.last,
+        budget: budget,
+      ),
       (text) {
-        final list = Prompts.parseNameCandidates(text);
-        return list.length >= 3 ? list : null;
+        final names = Prompts.parseNameCandidates(text);
+        return names.length == 3 ? names : null;
       },
-      'name candidates',
     );
-    return names;
   }
 }

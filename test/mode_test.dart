@@ -10,6 +10,21 @@ import 'package:horihori/store.dart';
 import 'package:horihori/widgets/glass.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+class FakeSecretStore implements SecretStore {
+  final Map<String, String> values = {};
+
+  @override
+  Future<void> delete(String key) async => values.remove(key);
+
+  @override
+  Future<String?> read(String key) async => values[key];
+
+  @override
+  Future<void> write(String key, String value) async {
+    values[key] = value;
+  }
+}
+
 Idea _idea() => Idea(
       id: '1',
       title: '天気で服を決めるアプリ',
@@ -71,6 +86,8 @@ double _contrastRatio(Color a, Color b) {
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   group('K1 モード判定（digModeKind）', () {
     test('キーなしは定型（キー未設定）', () {
       expect(
@@ -176,14 +193,14 @@ void main() {
 
     test('初期は false、markKeyGuideShown で true になり再読込でも保たれる',
         () async {
-      final store = IdeaStore();
+      final store = IdeaStore(secrets: FakeSecretStore());
       await store.load();
       expect(store.keyGuideShown, isFalse);
 
       await store.markKeyGuideShown();
       expect(store.keyGuideShown, isTrue);
 
-      final reloaded = IdeaStore();
+      final reloaded = IdeaStore(secrets: FakeSecretStore());
       await reloaded.load();
       expect(reloaded.keyGuideShown, isTrue);
 
@@ -217,6 +234,73 @@ void main() {
     });
     test('旧アクセント色は 4.5:1 未満（変更理由の確認）', () {
       expect(_contrastRatio(Colors.white, kAccent), lessThan(4.5));
+    });
+  });
+
+  group('R-02 / R-04 生成元ラベルと定型落ち理由', () {
+    test('AnswerSource ラベルが 端末AI / クラウドAI / 定型 に統一されている', () {
+      expect(AnswerSource.onDevice.label, '端末AI');
+      expect(AnswerSource.remote.label, 'クラウドAI');
+      expect(AnswerSource.local.label, '定型');
+    });
+
+    test('fallbackReasonFor が状態に応じて適切な理由を返す', () {
+      expect(
+        fallbackReasonFor(
+          isLocalSource: false,
+          hasRemoteKey: false,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+        ),
+        isNull,
+      );
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: false,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+          manualTemplate: true,
+        ),
+        FallbackReason.manualTemplate,
+      );
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: true,
+          remoteConsent: true,
+          lastRemoteFailed: true,
+        ),
+        FallbackReason.remoteFailed,
+      );
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: true,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+        ),
+        FallbackReason.remoteConsentOff,
+      );
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: false,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+          onDeviceNeedsDownload: true,
+        ),
+        FallbackReason.onDeviceNeedsDownload,
+      );
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: false,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+        ),
+        FallbackReason.noRemoteKey,
+      );
     });
   });
 }
