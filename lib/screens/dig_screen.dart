@@ -38,6 +38,8 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
   bool _summarizing = false;
   bool _saving = false;
   bool _leaving = false;
+  bool _openingSettings = false;
+  bool _optionsOpen = false;
   bool _backgrounded = false;
   bool _retrySummary = false;
   bool _returnedFromSettings = false;
@@ -98,6 +100,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     if (_backgrounded && !_leaving && (_loading || _summarizing)) {
       _retrySummary = _summarizing;
       _stopGeneration();
+      if (!mounted) return;
       setState(() {
         _loading = false;
         _summarizing = false;
@@ -125,18 +128,29 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _openSettings() async {
-    if (_busy || _leaving) return;
-    await Navigator.push<void>(
-      context,
-      MaterialPageRoute(builder: (_) => SettingsScreen(store: widget.store)),
-    );
-    if (!mounted || _leaving) return;
-    _backend.cancelPending();
-    _initBackend();
-    setState(() {
-      _returnedFromSettings = _question?.source == AnswerSource.local;
-      _retryNotice = null;
-    });
+    if (_busy ||
+        _leaving ||
+        _openingSettings ||
+        _optionsOpen ||
+        ModalRoute.of(context)?.isCurrent != true) {
+      return;
+    }
+    _openingSettings = true;
+    try {
+      await Navigator.push<void>(
+        context,
+        MaterialPageRoute(builder: (_) => SettingsScreen(store: widget.store)),
+      );
+      if (!mounted || _leaving) return;
+      _backend.cancelPending();
+      _initBackend();
+      setState(() {
+        _returnedFromSettings = _question?.source == AnswerSource.local;
+        _retryNotice = null;
+      });
+    } finally {
+      _openingSettings = false;
+    }
   }
 
   FallbackReason? _currentFallbackReason() {
@@ -494,20 +508,23 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     ).showSnackBar(const SnackBar(content: Text('変更を保存できませんでした。もう一度お試しください。')));
   }
 
-  Future<void> _setStyle(DigStyle style) async {
-    if (_busy || widget.store.digStyle == style) return;
+  Future<bool> _setStyle(DigStyle style) async {
+    if (widget.store.digStyle == style) return true;
+    if (_busy) return false;
     setState(() => _saving = true);
     try {
       await widget.store.saveDigStyle(style);
+      return true;
     } catch (_) {
-      if (mounted && !_leaving) _showSaveError();
+      return false;
     } finally {
       if (mounted && !_leaving) setState(() => _saving = false);
     }
   }
 
-  Future<void> _setViewpoint(DigViewpoint viewpoint) async {
-    if (_busy || _session.viewpoint == viewpoint) return;
+  Future<bool> _setViewpoint(DigViewpoint viewpoint) async {
+    if (_session.viewpoint == viewpoint) return true;
+    if (_busy) return false;
     final previous = _session.viewpoint;
     setState(() {
       _session.viewpoint = viewpoint;
@@ -515,29 +532,41 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     });
     try {
       await _persist();
+      return true;
     } catch (_) {
       _session.viewpoint = previous;
-      if (mounted && !_leaving) _showSaveError();
+      return false;
     } finally {
       if (mounted && !_leaving) setState(() => _saving = false);
     }
   }
 
   Future<void> _openOptionsSheet() async {
-    if (_busy || _leaving) return;
-    FocusScope.of(context).unfocus();
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => _DigOptionsSheet(
-        initialStyle: widget.store.digStyle,
-        initialViewpoint: _session.viewpoint,
-        onStyleChanged: (s) async => _setStyle(s),
-        onViewpointChanged: (v) async => _setViewpoint(v),
-      ),
-    );
-    if (mounted) setState(() {});
+    if (_busy ||
+        _leaving ||
+        _openingSettings ||
+        _optionsOpen ||
+        ModalRoute.of(context)?.isCurrent != true) {
+      return;
+    }
+    _optionsOpen = true;
+    try {
+      FocusScope.of(context).unfocus();
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: Colors.transparent,
+        builder: (_) => _DigOptionsSheet(
+          initialStyle: widget.store.digStyle,
+          initialViewpoint: _session.viewpoint,
+          onStyleChanged: _setStyle,
+          onViewpointChanged: _setViewpoint,
+        ),
+      );
+      if (mounted) setState(() {});
+    } finally {
+      _optionsOpen = false;
+    }
   }
 
   String _shortStyleLabel(DigStyle style) => switch (style) {
@@ -590,9 +619,11 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
           body: GestureDetector(
             behavior: HitTestBehavior.translucent,
             onTap: () => FocusScope.of(context).unfocus(),
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
-              child: Column(
+            child: SafeArea(
+              top: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+                child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   // R-03: 1行固定最小高さヘッダ（モード／現在値チップ／進捗）。
@@ -737,21 +768,25 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
-                      TextButton(
-                        onPressed:
-                            !_busy &&
-                                _failure == null &&
-                                canUndoLastAnswer(_session)
-                            ? _undo
-                            : null,
-                        child: const Text('1問もどる'),
+                      Flexible(
+                        child: TextButton(
+                          onPressed:
+                              !_busy &&
+                                  _failure == null &&
+                                  canUndoLastAnswer(_session)
+                              ? _undo
+                              : null,
+                          child: const Text('1問もどる'),
+                        ),
                       ),
-                      TextButton(
-                        onPressed:
-                            !_busy && _failure == null && canSummarize
-                            ? () => _summarize()
-                            : null,
-                        child: const Text('いったんまとめる'),
+                      Flexible(
+                        child: TextButton(
+                          onPressed:
+                              !_busy && _failure == null && canSummarize
+                              ? () => _summarize()
+                              : null,
+                          child: const Text('いったんまとめる'),
+                        ),
                       ),
                     ],
                   ),
@@ -761,7 +796,8 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
           ),
         ),
       ),
-    );
+    ),
+  );
   }
 
   Widget _questionCard(DigQuestion q) {
@@ -881,8 +917,8 @@ class _StyleViewpointChip extends StatelessWidget {
 class _DigOptionsSheet extends StatefulWidget {
   final DigStyle initialStyle;
   final DigViewpoint initialViewpoint;
-  final Future<void> Function(DigStyle) onStyleChanged;
-  final Future<void> Function(DigViewpoint) onViewpointChanged;
+  final Future<bool> Function(DigStyle) onStyleChanged;
+  final Future<bool> Function(DigViewpoint) onViewpointChanged;
   const _DigOptionsSheet({
     required this.initialStyle,
     required this.initialViewpoint,
@@ -898,32 +934,63 @@ class _DigOptionsSheetState extends State<_DigOptionsSheet> {
   late DigStyle _style = widget.initialStyle;
   late DigViewpoint _viewpoint = widget.initialViewpoint;
   bool _saving = false;
+  String? _error;
 
   Future<void> _selectStyle(DigStyle style) async {
     if (_saving || _style == style) return;
+    final previous = _style;
     setState(() {
       _style = style;
       _saving = true;
+      _error = null;
     });
-    await widget.onStyleChanged(style);
-    if (mounted) setState(() => _saving = false);
+    var ok = false;
+    try {
+      ok = await widget.onStyleChanged(style);
+    } catch (_) {
+      ok = false;
+    }
+    if (!mounted) return;
+    setState(() {
+      _saving = false;
+      if (!ok) {
+        _style = previous;
+        _error = '変更を保存できませんでした。もう一度お試しください。';
+      }
+    });
   }
 
   Future<void> _selectViewpoint(DigViewpoint viewpoint) async {
     if (_saving || _viewpoint == viewpoint) return;
+    final previous = _viewpoint;
     setState(() {
       _viewpoint = viewpoint;
       _saving = true;
+      _error = null;
     });
-    await widget.onViewpointChanged(viewpoint);
-    if (mounted) setState(() => _saving = false);
+    var ok = false;
+    try {
+      ok = await widget.onViewpointChanged(viewpoint);
+    } catch (_) {
+      ok = false;
+    }
+    if (!mounted) return;
+    setState(() {
+      _saving = false;
+      if (!ok) {
+        _viewpoint = previous;
+        _error = '変更を保存できませんでした。もう一度お試しください。';
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     final muted = Theme.of(context).colorScheme.onSurfaceVariant;
-    return GlassSheetSurface(
-      child: Column(
+    return PopScope(
+      canPop: !_saving,
+      child: GlassSheetSurface(
+        child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -968,12 +1035,23 @@ class _DigOptionsSheetState extends State<_DigOptionsSheet> {
                 ),
             ],
           ),
-          const SizedBox(height: 12),
-          Text(
-            '変更は次の質問から反映されます。',
-            style: TextStyle(fontSize: 13, color: muted),
-          ),
-        ],
+            const SizedBox(height: 12),
+            Text(
+              '変更は次の質問から反映されます。',
+              style: TextStyle(fontSize: 13, color: muted),
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                _error!,
+                style: TextStyle(
+                  fontSize: 13,
+                  color: Theme.of(context).colorScheme.error,
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

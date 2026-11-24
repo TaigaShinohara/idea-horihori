@@ -22,8 +22,10 @@ class Prompts {
   }
 
   static String _clip(String text, int limit) {
+    if (limit <= 0) return '';
     final runes = text.trim().runes.take(limit + 1).toList();
     if (runes.length <= limit) return String.fromCharCodes(runes);
+    if (limit == 1) return '…';
     return '${String.fromCharCodes(runes.take(limit - 1))}…';
   }
 
@@ -152,15 +154,45 @@ ${_memoText(memo, budget)}
       t = t.replaceFirst(RegExp(r'^```[a-zA-Z]*\s*'), '');
       if (t.endsWith('```')) t = t.substring(0, t.length - 3).trim();
     }
-    final start = t.indexOf('{');
-    final end = t.lastIndexOf('}');
-    if (start < 0 || end <= start) return null;
     try {
-      final decoded = jsonDecode(t.substring(start, end + 1));
-      return decoded is Map<String, dynamic> ? decoded : null;
-    } catch (_) {
-      return null;
+      final direct = jsonDecode(t);
+      if (direct is Map<String, dynamic>) return direct;
+    } catch (_) {}
+
+    for (var i = 0; i < t.length; i++) {
+      if (t.codeUnitAt(i) != 0x7B) continue;
+      var depth = 0;
+      var inString = false;
+      var escaped = false;
+      for (var j = i; j < t.length; j++) {
+        final code = t.codeUnitAt(j);
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+          } else if (code == 0x5C) {
+            escaped = true;
+          } else if (code == 0x22) {
+            inString = false;
+          }
+          continue;
+        }
+        if (code == 0x22) {
+          inString = true;
+        } else if (code == 0x7B) {
+          depth++;
+        } else if (code == 0x7D) {
+          depth--;
+          if (depth == 0) {
+            try {
+              final decoded = jsonDecode(t.substring(i, j + 1));
+              if (decoded is Map<String, dynamic>) return decoded;
+            } catch (_) {}
+            break;
+          }
+        }
+      }
     }
+    return null;
   }
 
   static DigQuestion? parseQuestion(String text) {

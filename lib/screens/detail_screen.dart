@@ -68,7 +68,14 @@ class _DetailScreenState extends State<DetailScreen> {
   }
 
   Future<void> _showNameCandidates(BuildContext context) async {
-    if (_namesOpen) return;
+    if (_namesOpen ||
+        _archiving ||
+        _editing ||
+        _openingDig ||
+        _openingBrief ||
+        ModalRoute.of(context)?.isCurrent != true) {
+      return;
+    }
     _namesOpen = true;
     try {
       await showModalBottomSheet<void>(
@@ -83,7 +90,14 @@ class _DetailScreenState extends State<DetailScreen> {
   }
 
   Future<void> _openBrief() async {
-    if (_openingBrief || _archiving || _editing) return;
+    if (_openingBrief ||
+        _archiving ||
+        _editing ||
+        _namesOpen ||
+        _openingDig ||
+        ModalRoute.of(context)?.isCurrent != true) {
+      return;
+    }
     _openingBrief = true;
     try {
       await Navigator.push<void>(
@@ -96,7 +110,14 @@ class _DetailScreenState extends State<DetailScreen> {
   }
 
   Future<void> _openDig() async {
-    if (_openingDig || _archiving || _editing) return;
+    if (_openingDig ||
+        _archiving ||
+        _editing ||
+        _namesOpen ||
+        _openingBrief ||
+        ModalRoute.of(context)?.isCurrent != true) {
+      return;
+    }
     _openingDig = true;
     try {
       final completed = await Navigator.push<bool>(
@@ -172,8 +193,10 @@ class _DetailScreenState extends State<DetailScreen> {
   @override
   Widget build(BuildContext context) {
     final accentText = accentTextColor(context);
-    return GlassBackground(
-      child: Scaffold(
+    return PopScope(
+      canPop: !(_editing || _archiving),
+      child: GlassBackground(
+        child: Scaffold(
         backgroundColor: Colors.transparent,
         appBar: AppBar(
           title: const Text('企画メモ'),
@@ -203,7 +226,12 @@ class _DetailScreenState extends State<DetailScreen> {
             final hasAnswers = idea.sessions.any((s) => s.answers.isNotEmpty);
             final hasResumable = idea.resumableSession != null;
             return ListView(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+              padding: EdgeInsets.fromLTRB(
+                16,
+                8,
+                16,
+                24 + MediaQuery.paddingOf(context).bottom,
+              ),
               children: [
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -348,7 +376,8 @@ class _DetailScreenState extends State<DetailScreen> {
           },
         ),
       ),
-    );
+    ),
+  );
   }
 }
 
@@ -443,6 +472,7 @@ class _MemoView extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
                 'メモ v${memo.version}',
@@ -452,11 +482,15 @@ class _MemoView extends StatelessWidget {
                   color: accentText,
                 ),
               ),
-              const Spacer(),
+              const SizedBox(width: 8),
               if (memo.source case final source?)
-                Text(
-                  source.label,
-                  style: TextStyle(fontSize: 13, color: muted),
+                Flexible(
+                  child: Text(
+                    source.label,
+                    textAlign: TextAlign.end,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 13, color: muted),
+                  ),
                 ),
             ],
           ),
@@ -752,6 +786,7 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
   }
 
   void _generate({bool templateOnly = false}) {
+    _backend.cancelPending();
     final names = _backend.nameCandidates(
       idea: widget.idea,
       templateOnly: templateOnly,
@@ -796,18 +831,19 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
       if (ok != true || !mounted) return;
       final previous = widget.idea.title;
       widget.idea.title = name;
+      final messenger = ScaffoldMessenger.of(context);
       try {
         await widget.store.updateIdea(widget.idea);
         if (mounted) {
           Navigator.pop(context);
-          ScaffoldMessenger.of(context).showSnackBar(
+          messenger.showSnackBar(
             SnackBar(content: Text('タイトルを「$name」に変更しました')),
           );
         }
       } catch (_) {
         widget.idea.title = previous;
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
+          messenger.showSnackBar(
             const SnackBar(content: Text('タイトルを変更できませんでした。')),
           );
         }
@@ -920,6 +956,7 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
                                       : () => _confirmApplyTitle(name),
                                   child: Text(
                                     'タイトルにする',
+                                    overflow: TextOverflow.ellipsis,
                                     style: TextStyle(
                                       fontSize: 13,
                                       color: accentText,
