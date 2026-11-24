@@ -196,7 +196,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } on OnDeviceException catch (error) {
       if (mounted && attempt == _nanoAttempt) {
         setState(
-          () => _nanoMessage = 'Gemini Nanoで生成できませんでした。${error.message}',
+          () => _nanoMessage = '$onDeviceModelNameで生成できませんでした。${error.message}',
         );
       }
     } on AiCancelled {
@@ -222,7 +222,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     OnDeviceStatus.available => '利用できます（オフラインで動作します）',
     OnDeviceStatus.needsDownload => 'モデルの準備が必要です。',
     OnDeviceStatus.unavailable => 'この端末では利用できません。',
-    OnDeviceStatus.checkFailed => 'AICoreの状態を確認できませんでした。少し待って再確認してください。',
+    OnDeviceStatus.checkFailed => '$onDeviceServiceNameの状態を確認できませんでした。少し待って再確認してください。',
     null => _checking ? '対応状況を確認しています…' : '未確認',
   };
 
@@ -475,7 +475,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ] else
                         OutlinedButton(
                           onPressed: nanoBusy ? null : _verifyNano,
-                          child: const Text('Nanoで質問を試す'),
+                          child: Text(onDeviceModelName == 'Gemini Nano'
+                              ? 'Nanoで質問を試す'
+                              : '$onDeviceModelNameで質問を試す'),
                         ),
                       if (_diagnosis case final diagnosis?) ...[
                         const SizedBox(height: 8),
@@ -493,9 +495,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ],
                       if (_sampleQuestion case final question?) ...[
                         const SizedBox(height: 10),
-                        const Text(
-                          'Gemini Nanoで生成できました',
-                          style: TextStyle(fontWeight: FontWeight.bold),
+                        Text(
+                          '$onDeviceModelNameで生成できました',
+                          style: const TextStyle(fontWeight: FontWeight.bold),
                         ),
                         const SizedBox(height: 4),
                         Text(question.text),
