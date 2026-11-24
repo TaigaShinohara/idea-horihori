@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show SocketException;
 
 import 'package:flutter/foundation.dart' show Listenable;
 import 'package:http/http.dart' as http;
@@ -65,6 +66,7 @@ class GeminiBackend implements AiBackend {
   final String apiKey;
   final String model;
   final http.Client? _client;
+  http.Client? _ownedClient;
   final Listenable? consentChanges;
   final bool Function()? maySend;
   final Duration timeout;
@@ -87,11 +89,18 @@ class GeminiBackend implements AiBackend {
     if (request != null && !request.isCompleted) request.complete();
   }
 
+  void dispose() {
+    cancelPending();
+    _ownedClient?.close();
+    _ownedClient = null;
+  }
+
   Future<Map<String, dynamic>> _request({Map<String, Object>? body}) async {
     if (apiKey.trim().isEmpty) throw GeminiFailure.invalidKey;
     if (!AppConfig.validGeminiModel(model)) throw GeminiFailure.invalidModel;
     if (maySend?.call() == false) throw GeminiFailure.revoked;
 
+    cancelPending();
     final abort = Completer<void>();
     void stop() {
       if (!abort.isCompleted) abort.complete();
@@ -113,7 +122,7 @@ class GeminiBackend implements AiBackend {
       request.headers['Content-Type'] = 'application/json; charset=utf-8';
       request.body = jsonEncode(body);
     }
-    final client = _client ?? http.Client();
+    final client = _client ?? (_ownedClient ??= http.Client());
     consentChanges?.addListener(stop);
     try {
       final res = await client
@@ -131,14 +140,18 @@ class GeminiBackend implements AiBackend {
         case 401 || 403:
           throw GeminiFailure.invalidKey;
         case 400:
-          final error = jsonDecode(utf8.decode(res.bodyBytes));
-          final details = error is Map ? error['error'] : null;
-          final items = details is Map ? details['details'] : null;
-          if (items is List &&
-              items.whereType<Map>().any(
-                (e) => e['reason'] == 'API_KEY_INVALID',
-              )) {
-            throw GeminiFailure.invalidKey;
+          try {
+            final error = jsonDecode(utf8.decode(res.bodyBytes));
+            final details = error is Map ? error['error'] : null;
+            final items = details is Map ? details['details'] : null;
+            if (items is List &&
+                items.whereType<Map>().any(
+                  (e) => e['reason'] == 'API_KEY_INVALID',
+                )) {
+              throw GeminiFailure.invalidKey;
+            }
+          } on FormatException {
+            // 非JSONの400応答はモデル/リクエスト不正として扱う。
           }
           throw GeminiFailure.invalidModel;
         case 404:
@@ -156,13 +169,14 @@ class GeminiBackend implements AiBackend {
       throw GeminiFailure.revoked;
     } on http.ClientException {
       throw GeminiFailure.network;
+    } on SocketException {
+      throw GeminiFailure.network;
     } on FormatException {
       throw GeminiFailure.invalidResponse;
     } finally {
       consentChanges?.removeListener(stop);
       stop();
       if (identical(_activeRequest, abort)) _activeRequest = null;
-      if (_client == null) client.close();
     }
   }
 
@@ -366,7 +380,10 @@ class LocalBackend implements AiBackend {
     }
 
     // 定型を使い切ったら汎用の広げ質問を出す。
-    final n = (priorRound ? allAskedIds.length : history.length) + 1;
+    var n = (priorRound ? allAskedIds.length : history.length) + 1;
+    while (allAskedIds.contains('extra$n')) {
+      n++;
+    }
     return FallbackQuestions.styled(
       DigQuestion(
         id: 'extra$n',
@@ -480,6 +497,12 @@ class ResilientBackend implements AiBackend {
     }
   }
 
+  void dispose() {
+    cancelPending();
+    final fixed = _fixedRemote;
+    if (fixed is GeminiBackend) fixed.dispose();
+  }
+
   /// 現在のモード表示（DigScreen のバッジ用）。
   DigModeKind get currentModeKind {
     final s = lastSource;
@@ -524,9 +547,29 @@ class ResilientBackend implements AiBackend {
     bool templateOnly,
   ) async {
     void checkCancelled() {
-      if (active.isCompleted) throw const AiCancelled();
+      if (!identical(_active, active) || active.isCompleted) {
+        throw const AiCancelled();
+      }
     }
 
+    var onDeviceFailed = false;
+    String? onDeviceError;
+    var remoteFailed = false;
+    GeminiFailure? remoteError;
+
+    (T, AnswerSource) commit(T result, AnswerSource source) {
+      checkCancelled();
+      lastOnDeviceFailed = onDeviceFailed;
+      lastOnDeviceError = onDeviceError;
+      lastRemoteFailed = remoteFailed;
+      lastRemoteError = remoteError;
+      lastManualTemplate = templateOnly;
+      lastSource = source;
+      return (result, source);
+    }
+
+    // 呼び出し開始時に前回の失敗状態をリセットする（ChatGPT 分岐は commit() を
+    // 通らず直接フィールドを書くため、ここでの初期化が要る）。
     lastOnDeviceFailed = false;
     lastChatGptFailed = false;
     lastRemoteFailed = false;
@@ -534,18 +577,17 @@ class ResilientBackend implements AiBackend {
     lastOnDeviceError = null;
     lastManualTemplate = templateOnly;
     if (!templateOnly && onDevice != null) {
+      checkCancelled();
       onPhase?.call(AiPhase.onDevice);
       try {
         checkCancelled();
         final r = await op(onDevice!);
-        checkCancelled();
-        lastSource = AnswerSource.onDevice;
-        return (r, AnswerSource.onDevice);
+        return commit(r, AnswerSource.onDevice);
       } catch (e) {
         checkCancelled();
-        lastOnDeviceFailed = true;
+        onDeviceFailed = true;
         final od = onDevice;
-        lastOnDeviceError = od is OnDeviceBackend
+        onDeviceError = od is OnDeviceBackend
             ? (od.lastError ?? e.toString())
             : e.toString();
       }
@@ -558,7 +600,15 @@ class ResilientBackend implements AiBackend {
         checkCancelled();
         final r = await op(chatGpt!);
         checkCancelled();
+        // commit() を通らないため、先行するオンデバイス失敗も含めて
+        // commit() と同じフィールド記録をここで行う。
+        lastOnDeviceFailed = onDeviceFailed;
+        lastOnDeviceError = onDeviceError;
+        lastRemoteFailed = false;
+        lastRemoteError = null;
+        lastManualTemplate = templateOnly;
         lastSource = AnswerSource.chatGpt;
+        lastChatGptFailed = false;
         lastChatGptError = null;
         return (r, AnswerSource.chatGpt);
       } catch (e) {
@@ -573,26 +623,26 @@ class ResilientBackend implements AiBackend {
     checkCancelled();
     final cloud = templateOnly ? null : remote;
     if (cloud != null) {
+      checkCancelled();
       onPhase?.call(AiPhase.cloud);
       try {
         checkCancelled();
         if (cloud is GeminiBackend) _activeRemote = cloud;
         final r = await op(cloud);
-        checkCancelled();
-        lastSource = AnswerSource.remote;
-        return (r, AnswerSource.remote);
+        return commit(r, AnswerSource.remote);
       } catch (error) {
         checkCancelled();
-        lastRemoteFailed = error != GeminiFailure.revoked;
-        if (error is GeminiFailure && lastRemoteFailed) lastRemoteError = error;
+        remoteFailed = error != GeminiFailure.revoked;
+        if (error is GeminiFailure && remoteFailed) remoteError = error;
       } finally {
         if (identical(_activeRemote, cloud)) _activeRemote = null;
+        if (remoteFactory != null && cloud is GeminiBackend) {
+          cloud.dispose();
+        }
       }
     }
     final result = await localOp();
-    checkCancelled();
-    lastSource = AnswerSource.local;
-    return (result, AnswerSource.local);
+    return commit(result, AnswerSource.local);
   }
 
   @override

@@ -8,15 +8,14 @@ class LocalNameCandidates {
     // タイトルの語を土台にする（記号・空白を除き、長すぎれば先頭を取る）。
     var base = title.replaceAll(RegExp(r'[\s　・/／]'), '');
     if (base.isEmpty) base = 'アプリ';
-    final short = base.length > 6 ? base.substring(0, 6) : base;
+    final short = String.fromCharCodes(base.runes.take(6));
 
     // What の最初の語（読点・空白まで）も候補の材料にする。
     var whatWord = '';
     if (memo != null) {
       final w = memo.what.replaceAll('「', '').replaceAll('」', '');
       final m = RegExp(r'^[^、。\s　]+').firstMatch(w);
-      if (m != null) whatWord = m.group(0)!;
-      if (whatWord.length > 6) whatWord = whatWord.substring(0, 6);
+      if (m != null) whatWord = String.fromCharCodes(m.group(0)!.runes.take(6));
     }
 
     final raw = <String>[

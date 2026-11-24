@@ -1,12 +1,20 @@
 import 'dart:async';
-import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_device_ai/flutter_device_ai.dart';
 
 import 'ai_backend.dart';
 import 'dig_mode.dart';
 import 'models.dart';
 import 'prompts.dart';
+
+String get onDeviceModelName => defaultTargetPlatform == TargetPlatform.iOS
+    ? 'Apple Intelligence'
+    : 'Gemini Nano';
+
+String get onDeviceServiceName => defaultTargetPlatform == TargetPlatform.iOS
+    ? 'Apple Intelligence'
+    : 'AICore';
 
 enum OnDeviceStatus { available, needsDownload, unavailable, checkFailed }
 
@@ -52,8 +60,10 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
     final availability = await _ai.availability();
     final status = switch (availability.status) {
       ModelFeatureStatus.available => OnDeviceStatus.available,
-      ModelFeatureStatus.downloadable ||
-      ModelFeatureStatus.downloading => OnDeviceStatus.needsDownload,
+      ModelFeatureStatus.downloadable || ModelFeatureStatus.downloading =>
+        defaultTargetPlatform == TargetPlatform.iOS
+            ? OnDeviceStatus.unavailable
+            : OnDeviceStatus.needsDownload,
       ModelFeatureStatus.unavailable
           when availability.reason == AvailabilityReason.unknown =>
         OnDeviceStatus.checkFailed,
@@ -111,14 +121,18 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
     }
   }
 
+  static int _estimateTokens(String prompt) =>
+      (prompt.runes.length * 1.2).ceil();
+
   Future<int> _countTokens(OnDeviceAiSession session, String prompt) async {
     try {
-      return await session.countTokens(text: prompt)
+      return await session
+          .countTokens(text: prompt)
           .timeout(const Duration(seconds: 2));
     } on OnDeviceAiException {
-      return utf8.encode(prompt).length;
+      return _estimateTokens(prompt);
     } on TimeoutException {
-      return utf8.encode(prompt).length;
+      return _estimateTokens(prompt);
     }
   }
 
@@ -234,9 +248,9 @@ class OnDeviceBackend implements AiBackend {
       return result;
     } on TimeoutException {
       lastStatus = OnDeviceStatus.checkFailed;
-      return const OnDeviceCheck(
+      return OnDeviceCheck(
         OnDeviceStatus.checkFailed,
-        'AICoreから時間内に応答がありませんでした。',
+        '$onDeviceServiceNameから時間内に応答がありませんでした。',
       );
     } catch (error) {
       lastStatus = OnDeviceStatus.checkFailed;
@@ -247,6 +261,7 @@ class OnDeviceBackend implements AiBackend {
   /// 生成テストを伴わない単独のモデル準備（R-04）。
   Future<OnDeviceCheck> prepareModel() async {
     final revision = ++_revision;
+    _cancelClient();
     lastError = null;
     try {
       await _prepare(revision, allowDownload: true);
@@ -257,7 +272,7 @@ class OnDeviceBackend implements AiBackend {
       cancelPending();
       lifecycle = OnDeviceLifecycle.timedOut;
       lastError = switch (phase) {
-        OnDeviceLifecycle.checking => 'AICoreから時間内に応答がありませんでした。',
+        OnDeviceLifecycle.checking => '$onDeviceServiceNameから時間内に応答がありませんでした。',
         OnDeviceLifecycle.downloading => '時間内にモデルを取得できませんでした。',
         _ => '端末AIから時間内に応答がありませんでした。',
       };
@@ -298,6 +313,7 @@ class OnDeviceBackend implements AiBackend {
     bool allowDownload = false,
   }) async {
     final revision = ++_revision;
+    _cancelClient();
     lastError = null;
     try {
       await _prepare(revision, allowDownload: allowDownload);
@@ -308,9 +324,9 @@ class OnDeviceBackend implements AiBackend {
       cancelPending();
       lifecycle = OnDeviceLifecycle.timedOut;
       lastError = switch (phase) {
-        OnDeviceLifecycle.checking => 'AICoreから時間内に応答がありませんでした。',
+        OnDeviceLifecycle.checking => '$onDeviceServiceNameから時間内に応答がありませんでした。',
         OnDeviceLifecycle.downloading => '時間内にモデルを取得できませんでした。',
-        _ => 'Gemini Nanoから時間内に応答がありませんでした。',
+        _ => '$onDeviceModelNameから時間内に応答がありませんでした。',
       };
       throw OnDeviceException(lastError!);
     } on AiCancelled {
@@ -320,7 +336,7 @@ class OnDeviceBackend implements AiBackend {
       final failure = error is OnDeviceException
           ? error
           : OnDeviceException(
-              'Gemini Nanoの処理に失敗しました。${error is OnDeviceAiException ? ' ${error.message}' : ''}',
+              '$onDeviceModelNameの処理に失敗しました。${error is OnDeviceAiException ? ' ${error.message}' : ''}',
             );
       lastError = failure.message;
       throw failure;
@@ -333,18 +349,24 @@ class OnDeviceBackend implements AiBackend {
     T? Function(String text) parse,
   ) async {
     var budget = Prompts.nanoBudget;
+    var inputTooLong = false;
     for (var attempt = 0; attempt < 2; attempt++) {
       _checkCurrent(revision);
+      inputTooLong = false;
       try {
         final text = await _client.generate(prompt(budget));
         _checkCurrent(revision);
         final value = parse(text);
         if (value != null) return value;
       } on _OnDeviceInputTooLong {
+        inputTooLong = true;
         budget = Prompts.compactNanoBudget;
       }
     }
-    throw const OnDeviceException('Gemini Nanoから使える形式の応答が返りませんでした。');
+    if (inputTooLong) {
+      throw OnDeviceException('入力が長すぎるため$onDeviceModelNameで処理できませんでした。');
+    }
+    throw OnDeviceException('$onDeviceModelNameから使える形式の応答が返りませんでした。');
   }
 
   @override

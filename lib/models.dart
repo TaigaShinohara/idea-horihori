@@ -183,7 +183,7 @@ class PlanMemo {
     nextStep: j['nextStep'] as String? ?? '',
     createdAt:
         DateTime.tryParse(j['createdAt'] as String? ?? '') ?? DateTime.now(),
-    version: j['version'] as int? ?? 1,
+    version: (j['version'] as num?)?.toInt() ?? 1,
     ease: fitnessValueOrNull(j['ease']),
     spark: fitnessValueOrNull(j['spark']),
     source: AnswerSource.fromJson(j['source']),

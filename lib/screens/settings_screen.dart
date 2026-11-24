@@ -152,6 +152,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }, () => 'APIキーを削除しました。');
 
   Future<void> _verifyConnection() async {
+    if (_connection != null || _editing) return;
     final connection = GeminiBackend(apiKey: _key.text, model: _model.text);
     setState(() {
       _connection = connection;
@@ -167,6 +168,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (_) {
       if (mounted) setState(() => _apiMessage = '接続を確認できませんでした。');
     } finally {
+      connection.dispose();
       if (mounted) setState(() => _connection = null);
     }
   }
@@ -180,12 +182,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _nanoMessage = null;
       }
     });
-    final result = await _nano.diagnose();
-    if (!mounted || attempt != _nanoAttempt) return;
-    setState(() {
-      _checking = false;
-      _diagnosis = result;
-    });
+    try {
+      final result = await _nano.diagnose();
+      if (!mounted || attempt != _nanoAttempt) return;
+      setState(() => _diagnosis = result);
+    } catch (_) {
+      if (mounted && attempt == _nanoAttempt) {
+        setState(() {
+          _diagnosis = const OnDeviceCheck(OnDeviceStatus.checkFailed);
+        });
+      }
+    } finally {
+      if (mounted && attempt == _nanoAttempt) {
+        setState(() => _checking = false);
+      }
+    }
   }
 
   void _downloadProgress(double? value) {
@@ -241,7 +252,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } on OnDeviceException catch (error) {
       if (mounted && attempt == _nanoAttempt) {
         setState(
-          () => _nanoMessage = 'Gemini Nanoで生成できませんでした。${error.message}',
+          () => _nanoMessage = '$onDeviceModelNameで生成できませんでした。${error.message}',
         );
       }
     } on AiCancelled {
@@ -267,13 +278,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     OnDeviceStatus.available => '利用できます（オフラインで動作します）',
     OnDeviceStatus.needsDownload => 'モデルの準備が必要です。',
     OnDeviceStatus.unavailable => 'この端末では利用できません。',
-    OnDeviceStatus.checkFailed => 'AICoreの状態を確認できませんでした。少し待って再確認してください。',
+    OnDeviceStatus.checkFailed => '$onDeviceServiceNameの状態を確認できませんでした。少し待って再確認してください。',
     null => _checking ? '対応状況を確認しています…' : '未確認',
   };
 
   @override
   void dispose() {
-    _connection?.cancelPending();
+    _connection?.dispose();
     _nano.cancelPending();
     _key.dispose();
     _model.dispose();
@@ -290,18 +301,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final canToggleConsent =
         widget.store.hasRemoteKey || widget.store.remoteConsent;
 
-    return GlassBackground(
-      child: Scaffold(
-        backgroundColor: Colors.transparent,
-        appBar: AppBar(
-          title: const Text('設定'),
+    return PopScope(
+      canPop: !_editing,
+      child: GlassBackground(
+        child: Scaffold(
           backgroundColor: Colors.transparent,
-          elevation: 0,
-          scrolledUnderElevation: 0,
-        ),
-        body: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-          children: [
+          appBar: AppBar(
+            title: const Text('設定'),
+            backgroundColor: Colors.transparent,
+            elevation: 0,
+            scrolledUnderElevation: 0,
+          ),
+          body: ListView(
+            padding: EdgeInsets.fromLTRB(
+              16,
+              8,
+              16,
+              24 + MediaQuery.paddingOf(context).bottom,
+            ),
+            children: [
             // 1. 端末AI（通常面は状態1行＋未取得時のみ「モデルを準備する」）
             GlassCard(
               child: Column(
@@ -585,7 +603,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ] else
                         OutlinedButton(
                           onPressed: nanoBusy ? null : _verifyNano,
-                          child: const Text('Nanoで質問を試す'),
+                          child: Text(onDeviceModelName == 'Gemini Nano'
+                              ? 'Nanoで質問を試す'
+                              : '$onDeviceModelNameで質問を試す'),
                         ),
                       if (_diagnosis case final diagnosis?) ...[
                         const SizedBox(height: 8),
@@ -603,9 +623,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ],
                       if (_sampleQuestion case final question?) ...[
                         const SizedBox(height: 10),
-                        const Text(
-                          'Gemini Nanoで生成できました',
-                          style: TextStyle(fontWeight: FontWeight.bold),
+                        Text(
+                          '$onDeviceModelNameで生成できました',
+                          style: const TextStyle(fontWeight: FontWeight.bold),
                         ),
                         const SizedBox(height: 4),
                         Text(question.text),
@@ -616,7 +636,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
             ),
-          ],
+            ],
+          ),
         ),
       ),
     );

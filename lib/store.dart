@@ -60,14 +60,18 @@ class _SecretStoreTokenStore implements TokenStore {
 }
 
 class IdeaStore extends ChangeNotifier {
+  static const Duration onDeviceCacheTtl = Duration(minutes: 2);
+
   final SecretStore _secrets;
+  final DateTime Function() _now;
 
   /// ChatGPT サインイン状態の確認方法の差し替え（テスト用）。
   /// 既定では [_secrets] 経由で確認する（下記 [_checkChatGptSignedIn]）。
   final Future<bool> Function()? _chatGptChecker;
 
-  IdeaStore({SecretStore? secrets, this._chatGptChecker})
-    : _secrets = secrets ?? PlatformSecretStore();
+  IdeaStore({SecretStore? secrets, DateTime Function()? now, this._chatGptChecker})
+    : _secrets = secrets ?? PlatformSecretStore(),
+      _now = now ?? DateTime.now;
 
   /// ChatGPT サインイン状態を確認する。
   /// 既定の経路は APIキーと同じ [SecretStore] 経由にする: 本番では
@@ -90,6 +94,7 @@ class IdeaStore extends ChangeNotifier {
   String get model => _model;
   bool loaded = false;
   bool _loading = false;
+  Future<void>? _loadFuture;
   String? loadError;
   bool _remoteConsent = false;
   bool get remoteConsent => _remoteConsent;
@@ -98,10 +103,22 @@ class IdeaStore extends ChangeNotifier {
   bool _ideasWritable = true;
   bool get ideasWritable => _ideasWritable;
   OnDeviceCheck? _cachedOnDeviceStatus;
-  OnDeviceCheck? get cachedOnDeviceStatus => _cachedOnDeviceStatus;
+  DateTime? _cachedOnDeviceStatusAt;
+  OnDeviceCheck? get cachedOnDeviceStatus {
+    final cached = _cachedOnDeviceStatus;
+    final at = _cachedOnDeviceStatusAt;
+    if (cached == null || at == null) return null;
+    if (cached.status != OnDeviceStatus.available &&
+        _now().difference(at) >= onDeviceCacheTtl) {
+      return null;
+    }
+    return cached;
+  }
+
   final _cloudChanges = ChangeNotifier();
   int _cloudRevision = 0;
   int _consentRevision = 0;
+  int _idSeq = 0;
   Future<void> _settingsQueue = Future.value();
   Future<void> _ideasQueue = Future.value();
 
@@ -128,30 +145,35 @@ class IdeaStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> load() async {
-    if (_loading) return;
+  Future<SharedPreferences> _prefs() =>
+      SharedPreferences.getInstance().timeout(const Duration(seconds: 6));
+
+  Future<void> load() {
+    if (_loading) return _loadFuture ?? Future.value();
     _loading = true;
     loadError = null;
     notifyListeners();
-    try {
-      await _readPreferences(
-        await SharedPreferences.getInstance().timeout(
-          const Duration(seconds: 6),
-        ),
-      );
-      loaded = true;
-    } catch (_) {
-      loadError = '端末のデータを読み込めませんでした。';
-    } finally {
-      _loading = false;
-      notifyListeners();
-    }
+    final future = _saveSettings(
+      () => _changeIdeas(() async {
+        try {
+          await _readPreferences(await _prefs());
+          loaded = true;
+        } catch (_) {
+          loadError = '端末のデータを読み込めませんでした。';
+        } finally {
+          _loading = false;
+          _loadFuture = null;
+          notifyListeners();
+        }
+      }),
+    );
+    _loadFuture = future;
+    return future;
   }
 
   Future<void> _readPreferences(SharedPreferences prefs) async {
     keyStorageError = null;
-    _remoteConsent = false;
-    _invalidateCloud();
+    _revokeCloud();
     try {
       await _loadApiKey(prefs);
       _remoteConsent =
@@ -236,9 +258,12 @@ class IdeaStore extends ChangeNotifier {
   }
 
   Future<void> _saveIdeas() async {
+    if (!loaded || loadError != null) {
+      throw const StoreFailure('データの読み込みが完了していません。');
+    }
     if (!_ideasWritable) throw StoreFailure(ideasRecoveryNotice!);
     final snapshot = jsonEncode(ideas.map((e) => e.toJson()).toList());
-    final prefs = await SharedPreferences.getInstance();
+    final prefs = await _prefs();
     _checkWrite(await prefs.setString(AppConfig.prefsIdeasKey, snapshot));
   }
 
@@ -267,9 +292,9 @@ class IdeaStore extends ChangeNotifier {
   bool get hasRemoteKey => apiKey.isNotEmpty;
 
   Future<Idea> addIdea(String title, String note) => _changeIdeas(() async {
-    final now = DateTime.now();
+    final now = _now();
     final idea = Idea(
-      id: now.microsecondsSinceEpoch.toString(),
+      id: '${now.microsecondsSinceEpoch}_${_idSeq++}',
       title: title.trim(),
       note: note.trim(),
       createdAt: now,
@@ -286,8 +311,16 @@ class IdeaStore extends ChangeNotifier {
   });
 
   Future<void> updateIdea(Idea idea) => _changeIdeas(() async {
-    if (!ideas.contains(idea)) throw const StoreFailure('アイデアを確認できませんでした。');
-    await _saveIdeas();
+    final index = ideas.indexWhere((e) => e.id == idea.id);
+    if (index < 0) throw const StoreFailure('アイデアを確認できませんでした。');
+    final previous = ideas[index];
+    ideas[index] = idea;
+    try {
+      await _saveIdeas();
+    } catch (_) {
+      ideas[index] = previous;
+      rethrow;
+    }
     notifyListeners();
   });
 
@@ -297,11 +330,16 @@ class IdeaStore extends ChangeNotifier {
   Future<void> unarchiveIdea(Idea idea) => _setArchived(idea, false);
 
   Future<void> _setArchived(Idea idea, bool archived) => _changeIdeas(() async {
-    if (!ideas.contains(idea) || idea.archived == archived) return;
+    final index = ideas.indexWhere((e) => e.id == idea.id);
+    if (index < 0) return;
+    final target = ideas[index];
+    if (target.archived == archived) return;
+    target.archived = archived;
     idea.archived = archived;
     try {
       await _saveIdeas();
     } catch (_) {
+      target.archived = !archived;
       idea.archived = !archived;
       rethrow;
     }
@@ -310,13 +348,13 @@ class IdeaStore extends ChangeNotifier {
 
   /// 完全に削除する（復元不可。呼び出し側で確認を取ること）。
   Future<void> deleteIdea(Idea idea) => _changeIdeas(() async {
-    final index = ideas.indexOf(idea);
+    final index = ideas.indexWhere((e) => e.id == idea.id);
     if (index < 0) return;
-    ideas.removeAt(index);
+    final removed = ideas.removeAt(index);
     try {
       await _saveIdeas();
     } catch (_) {
-      ideas.insert(index, idea);
+      ideas.insert(index, removed);
       rethrow;
     }
     notifyListeners();
@@ -332,24 +370,27 @@ class IdeaStore extends ChangeNotifier {
 
   /// R-04: 端末AI診断結果のメモリ内キャッシュを更新する。
   void updateOnDeviceStatusCache(OnDeviceCheck status) {
-    if (_cachedOnDeviceStatus?.status == status.status &&
-        _cachedOnDeviceStatus?.message == status.message) {
-      return;
-    }
+    final changed =
+        _cachedOnDeviceStatus?.status != status.status ||
+        _cachedOnDeviceStatus?.message != status.message;
     _cachedOnDeviceStatus = status;
-    notifyListeners();
+    _cachedOnDeviceStatusAt = _now();
+    if (changed) notifyListeners();
   }
 
   /// R-04: 端末AI診断結果のキャッシュをクリアする。
   void clearOnDeviceStatusCache() {
-    if (_cachedOnDeviceStatus == null) return;
+    if (_cachedOnDeviceStatus == null && _cachedOnDeviceStatusAt == null) {
+      return;
+    }
     _cachedOnDeviceStatus = null;
+    _cachedOnDeviceStatusAt = null;
     notifyListeners();
   }
 
   /// K3: 初回案内を表示済みにし、以後は再表示しない。
   Future<void> markKeyGuideShown() => _saveSettings(() async {
-    final prefs = await SharedPreferences.getInstance();
+    final prefs = await _prefs();
     _checkWrite(await prefs.setBool(AppConfig.prefsKeyGuideShownKey, true));
     keyGuideShown = true;
     notifyListeners();
@@ -357,7 +398,7 @@ class IdeaStore extends ChangeNotifier {
 
   /// 掘り方スタイルを保存する（v0.2 項目1）。
   Future<void> saveDigStyle(DigStyle style) => _saveSettings(() async {
-    final prefs = await SharedPreferences.getInstance();
+    final prefs = await _prefs();
     _checkWrite(
       await prefs.setString(AppConfig.prefsDigStyleKey, style.storageValue),
     );
@@ -405,14 +446,18 @@ class IdeaStore extends ChangeNotifier {
     _revokeCloud();
     return _saveSettings(() async {
       try {
-        final prefs = await SharedPreferences.getInstance();
+        final prefs = await _prefs();
         _checkWrite(
           await prefs.setBool(AppConfig.prefsRemoteConsentKey, false),
         );
         await _writeKey(value);
-        _checkWrite(await prefs.remove(AppConfig.prefsApiKeyKey));
         _apiKey = value;
         keyStorageError = null;
+        try {
+          await prefs.remove(AppConfig.prefsApiKeyKey);
+        } catch (_) {
+          // 旧保存先の削除失敗は非致命的（SecureStorage 側の保存は完了済み）。
+        }
       } catch (_) {
         keyStorageError = 'APIキーの保存を確認できませんでした。';
         throw StoreFailure(keyStorageError!);
@@ -426,7 +471,7 @@ class IdeaStore extends ChangeNotifier {
     _revokeCloud();
     return _saveSettings(() async {
       try {
-        final prefs = await SharedPreferences.getInstance();
+        final prefs = await _prefs();
         _checkWrite(
           await prefs.setBool(AppConfig.prefsRemoteConsentKey, false),
         );
@@ -455,7 +500,7 @@ class IdeaStore extends ChangeNotifier {
       if (consent && (!hasRemoteKey || keyStorageError != null)) {
         throw const StoreFailure('先にAPIキーを保存してください。');
       }
-      final prefs = await SharedPreferences.getInstance();
+      final prefs = await _prefs();
       _checkWrite(
         await prefs.setBool(AppConfig.prefsRemoteConsentKey, consent),
       );
@@ -472,7 +517,7 @@ class IdeaStore extends ChangeNotifier {
       return Future.error(const StoreFailure('モデル名の形式を確認してください。'));
     }
     return _saveSettings(() async {
-      final prefs = await SharedPreferences.getInstance();
+      final prefs = await _prefs();
       _checkWrite(await prefs.setString(AppConfig.prefsModelKey, next));
       if (_model != next) _invalidateCloud();
       _model = next;
@@ -499,7 +544,7 @@ class IdeaStore extends ChangeNotifier {
   OnDeviceBackend onDeviceBackend({void Function(double?)? onDownloadProgress}) =>
       OnDeviceBackend(
         onDownloadProgress: onDownloadProgress,
-        readCachedStatus: () => _cachedOnDeviceStatus,
+        readCachedStatus: () => cachedOnDeviceStatus,
         writeCachedStatus: updateOnDeviceStatusCache,
       );
 

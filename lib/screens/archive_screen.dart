@@ -54,11 +54,20 @@ class ArchiveScreen extends StatelessWidget {
               );
             }
             return ListView.builder(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+              padding: EdgeInsets.fromLTRB(
+                16,
+                8,
+                16,
+                24 + MediaQuery.paddingOf(context).bottom,
+              ),
               itemCount: archived.length,
               itemBuilder: (context, i) => Padding(
                 padding: const EdgeInsets.only(bottom: 12),
-                child: _ArchivedCard(store: store, idea: archived[i]),
+                child: _ArchivedCard(
+                  key: ValueKey(archived[i].id),
+                  store: store,
+                  idea: archived[i],
+                ),
               ),
             );
           },
@@ -71,7 +80,7 @@ class ArchiveScreen extends StatelessWidget {
 class _ArchivedCard extends StatefulWidget {
   final IdeaStore store;
   final Idea idea;
-  const _ArchivedCard({required this.store, required this.idea});
+  const _ArchivedCard({super.key, required this.store, required this.idea});
 
   @override
   State<_ArchivedCard> createState() => _ArchivedCardState();
@@ -113,26 +122,32 @@ class _ArchivedCardState extends State<_ArchivedCard> {
             ),
           ),
           const SizedBox(height: 10),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              TextButton(
-                onPressed: _busy ? null : () => _confirmDelete(context),
-                child: Text(
-                  '完全に削除',
-                  style: TextStyle(color: errorColor),
+          SizedBox(
+            width: double.infinity,
+            child: Wrap(
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                TextButton(
+                  onPressed: _busy ? null : () => _confirmDelete(context),
+                  child: Text(
+                    '完全に削除',
+                    style: TextStyle(color: errorColor),
+                  ),
                 ),
-              ),
-              FilledButton.tonalIcon(
-                style: FilledButton.styleFrom(
-                  backgroundColor: accentTonalFill(context),
-                  foregroundColor: accentTextColor(context),
+                FilledButton.tonalIcon(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: accentTonalFill(context),
+                    foregroundColor: accentTextColor(context),
+                  ),
+                  onPressed: _busy ? null : _restore,
+                  icon: const Icon(Icons.unarchive_outlined, size: 18),
+                  label: const Text('戻す'),
                 ),
-                onPressed: _busy ? null : _restore,
-                icon: const Icon(Icons.unarchive_outlined, size: 18),
-                label: const Text('戻す'),
-              ),
-            ],
+              ],
+            ),
           ),
         ],
       ),
