@@ -5,6 +5,7 @@ import 'dig_mode.dart';
 enum AnswerSource {
   onDevice('端末AI'),
   remote('クラウドAI'),
+  chatGpt('ChatGPT'),
   local('定型');
 
   const AnswerSource(this.label);

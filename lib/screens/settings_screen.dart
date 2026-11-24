@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../ai_backend.dart';
 import '../app_config.dart';
+import '../chatgpt_auth_service.dart';
 import '../models.dart';
 import '../on_device_backend.dart';
 import '../store.dart';
@@ -33,6 +34,61 @@ class _SettingsScreenState extends State<SettingsScreen> {
   GeminiBackend? _connection;
   String? _apiMessage;
   String? _nanoMessage;
+
+  // v0.4.0: ChatGPT サインイン。
+  final ChatGptAuthService _chatGptAuth = ChatGptAuthService();
+  final TextEditingController _codeCtrl = TextEditingController();
+  bool _cgBusy = false;
+  String? _cgMessage;
+
+  Future<void> _chatGptSignIn() async {
+    setState(() {
+      _cgBusy = true;
+      _cgMessage = null;
+    });
+    try {
+      await _chatGptAuth.signIn();
+      await widget.store.refreshChatGptStatus();
+      if (!mounted) return;
+      setState(() => _cgMessage = 'サインインしました');
+    } on ChatGptAuthException catch (e) {
+      if (!mounted) return;
+      setState(() => _cgMessage = e.message);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _cgMessage = 'サインインに失敗しました: $e');
+    } finally {
+      if (mounted) setState(() => _cgBusy = false);
+    }
+  }
+
+  Future<void> _chatGptSignInWithCode() async {
+    setState(() {
+      _cgBusy = true;
+      _cgMessage = null;
+    });
+    try {
+      await _chatGptAuth.signInWithCode(_codeCtrl.text);
+      await widget.store.refreshChatGptStatus();
+      if (!mounted) return;
+      setState(() => _cgMessage = 'サインインしました');
+    } on ChatGptAuthException catch (e) {
+      if (!mounted) return;
+      setState(() => _cgMessage = e.message);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _cgMessage = 'サインインに失敗しました: $e');
+    } finally {
+      if (mounted) setState(() => _cgBusy = false);
+    }
+  }
+
+  Future<void> _chatGptSignOut() async {
+    await _chatGptAuth.signOut();
+    await widget.store.refreshChatGptStatus();
+    if (!mounted) return;
+    setState(() => _cgMessage = 'サインアウトしました');
+  }
 
   @override
   void initState() {
@@ -232,6 +288,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _nano.cancelPending();
     _key.dispose();
     _model.dispose();
+    _codeCtrl.dispose();
     super.dispose();
   }
 
@@ -416,7 +473,78 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
             const SizedBox(height: 16),
-            // 3. 詳細・動作確認（開発者向け診断・テスト・モデル名を折りたたみへ隔離）
+            // 3. ChatGPT（v0.4.0: サインインで本人の ChatGPT を使う）
+            GlassCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text('ChatGPT',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 6),
+                  Text(
+                    widget.store.chatGptSignedIn
+                        ? 'サインイン済み。オンデバイスが使えない時は、あなたの ChatGPT で深掘りします。'
+                        : 'サインインすると、あなたの ChatGPT（サブスクリプション）で深掘りできます。トークンは端末の中だけに保存されます。',
+                    style: const TextStyle(fontSize: 13, height: 1.6),
+                  ),
+                  const SizedBox(height: 12),
+                  if (widget.store.chatGptSignedIn)
+                    OutlinedButton(
+                      onPressed: _cgBusy ? null : _chatGptSignOut,
+                      child: const Text('サインアウト'),
+                    )
+                  else
+                    FilledButton(
+                      onPressed: _cgBusy ? null : _chatGptSignIn,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: kButtonFill,
+                        foregroundColor: Colors.white,
+                      ),
+                      child: Text(_cgBusy ? 'サインイン中…' : 'ChatGPTでサインイン'),
+                    ),
+                  if (_cgMessage != null) ...[
+                    const SizedBox(height: 10),
+                    Text(_cgMessage!,
+                        style: const TextStyle(fontSize: 13, height: 1.6)),
+                  ],
+                  if (!widget.store.chatGptSignedIn) ...[
+                    const SizedBox(height: 6),
+                    Material(
+                      type: MaterialType.transparency,
+                      child: ExpansionTile(
+                        title: const Text('ブラウザから戻れない時は',
+                            style: TextStyle(fontSize: 13)),
+                        childrenPadding:
+                            const EdgeInsets.only(bottom: 8),
+                        children: [
+                          const Text(
+                            'サインインを開始したあと、ブラウザに表示された認可コードを貼り付けてください。',
+                            style: TextStyle(fontSize: 12, height: 1.6),
+                          ),
+                          const SizedBox(height: 8),
+                          TextField(
+                            controller: _codeCtrl,
+                            decoration: const InputDecoration(
+                              labelText: '認可コード',
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          OutlinedButton(
+                            onPressed:
+                                _cgBusy ? null : _chatGptSignInWithCode,
+                            child: const Text('コードでサインイン'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            // 4. 詳細・動作確認（開発者向け診断・テスト・モデル名を折りたたみへ隔離）
             GlassCard(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
               child: Theme(

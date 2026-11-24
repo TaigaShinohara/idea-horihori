@@ -8,6 +8,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'ai_backend.dart';
 import 'app_config.dart';
+import 'chatgpt_auth_service.dart';
+import 'chatgpt_backend.dart';
 import 'on_device_backend.dart';
 import 'dig_mode.dart';
 import 'models.dart';
@@ -41,14 +43,49 @@ class StoreFailure implements Exception {
   final String message;
 }
 
+/// store の [SecretStore] を ChatGPT 認証の [TokenStore] として使うアダプタ。
+/// インターフェース形状が同一のため、そのまま委譲する。
+class _SecretStoreTokenStore implements TokenStore {
+  final SecretStore _secrets;
+  _SecretStoreTokenStore(this._secrets);
+
+  @override
+  Future<String?> read(String key) => _secrets.read(key);
+
+  @override
+  Future<void> write(String key, String value) => _secrets.write(key, value);
+
+  @override
+  Future<void> delete(String key) => _secrets.delete(key);
+}
+
 class IdeaStore extends ChangeNotifier {
   static const Duration onDeviceCacheTtl = Duration(minutes: 2);
 
   final SecretStore _secrets;
   final DateTime Function() _now;
-  IdeaStore({SecretStore? secrets, DateTime Function()? now})
+
+  /// ChatGPT サインイン状態の確認方法の差し替え（テスト用）。
+  /// 既定では [_secrets] 経由で確認する（下記 [_checkChatGptSignedIn]）。
+  final Future<bool> Function()? _chatGptChecker;
+
+  IdeaStore({SecretStore? secrets, DateTime Function()? now, this._chatGptChecker})
     : _secrets = secrets ?? PlatformSecretStore(),
       _now = now ?? DateTime.now;
+
+  /// ChatGPT サインイン状態を確認する。
+  /// 既定の経路は APIキーと同じ [SecretStore] 経由にする: 本番では
+  /// flutter_secure_storage（ChatGPT トークンの保存先と同一）を見て、
+  /// テストでは注入された FakeSecretStore が即答する。プラットフォーム
+  /// チャネルを直接叩くと widget テストのフェイク非同期で応答が返らず
+  /// load() がハングするため、この経路に統一している。
+  Future<bool> _checkChatGptSignedIn() {
+    final checker = _chatGptChecker;
+    if (checker != null) return checker();
+    return ChatGptAuthService(
+      store: _SecretStoreTokenStore(_secrets),
+    ).isSignedIn;
+  }
 
   List<Idea> ideas = [];
   String _apiKey = '';
@@ -90,6 +127,23 @@ class IdeaStore extends ChangeNotifier {
 
   /// 掘り方スタイル（v0.2 項目1）。既定は友達モード。再起動後も保持する。
   DigStyle digStyle = DigStyle.friend;
+
+  /// ChatGPT にサインイン済みか（v0.4.0）。実体はセキュア保存のトークンで、
+  /// ここは backend() 組み立て用のキャッシュ。load() と設定画面で更新する。
+  bool chatGptSignedIn = false;
+
+  /// ChatGPT サインイン状態を再確認してキャッシュを更新する。
+  Future<void> refreshChatGptStatus() async {
+    try {
+      chatGptSignedIn = await _checkChatGptSignedIn().timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => false,
+      );
+    } catch (_) {
+      chatGptSignedIn = false;
+    }
+    notifyListeners();
+  }
 
   Future<SharedPreferences> _prefs() =>
       SharedPreferences.getInstance().timeout(const Duration(seconds: 6));
@@ -136,6 +190,15 @@ class IdeaStore extends ChangeNotifier {
       } catch (_) {
         // 次回も読み込み時に旧モデルを移行する。
       }
+    }
+    // v0.4.0: ChatGPT サインイン状態をキャッシュする（失敗時は未サインイン扱い）。
+    try {
+      chatGptSignedIn = await _checkChatGptSignedIn().timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => false,
+      );
+    } catch (_) {
+      chatGptSignedIn = false;
     }
     keyGuideShown = prefs.get(AppConfig.prefsKeyGuideShownKey) == true;
     final style = prefs.get(AppConfig.prefsDigStyleKey);
@@ -485,9 +548,12 @@ class IdeaStore extends ChangeNotifier {
         writeCachedStatus: updateOnDeviceStatusCache,
       );
 
+  /// 現在の設定でバックエンドを組む。
+  /// 優先順は オンデバイス → ChatGPT（サインイン時）→ Gemini（キー＋同意がある場合）→ 定型。
   ResilientBackend backend() => ResilientBackend(
     null,
     onDevice: onDeviceBackend(),
+    chatGpt: chatGptSignedIn ? ChatGptBackend() : null,
     remoteFactory: _remote,
   );
 

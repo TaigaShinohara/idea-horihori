@@ -91,6 +91,10 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     super.dispose();
   }
 
+  // v0.4.0 統合メモ: 旧 _syncMode（スナックバーでの切替通知）は main 側の
+  // UX 全面改修で廃止され、モード表示は _ModeBadge（AnswerSource.label、
+  // ChatGPT 時は「ChatGPT」）＋ _FallbackBanner（fallbackReason）に統一された。
+  // そのため ChatGPT への切替も同じ経路で表示される。
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _backgrounded =

@@ -47,7 +47,11 @@ void main() {
 
   Future<IdeaStore> loadedStore({int ideaCount = 0}) async {
     SharedPreferences.setMockInitialValues({});
-    final store = IdeaStore(secrets: FakeSecretStore());
+    // セキュア保存チャネルは widget テストでハングするため、両方とも差し替える。
+    final store = IdeaStore(
+      secrets: FakeSecretStore(),
+      chatGptChecker: () async => false,
+    );
     await store.load();
     for (var i = 0; i < ideaCount; i++) {
       await store.addIdea('アイデア${i + 1}：散歩メモアプリ', '思いつきメモ');
@@ -124,7 +128,19 @@ void main() {
       await tester.pump();
       expect(find.text('端末AI'), findsOneWidget);
       expect(find.text('モデルを準備する'), findsOneWidget);
+      // v0.4.0 で ChatGPT カードが入り、詳細カードはスクロール先になった。
+      // 存在確認のためスクロールしてから先頭に戻して撮影する。
+      await tester.scrollUntilVisible(
+        find.text('詳細・動作確認'),
+        120,
+        scrollable: find.byType(Scrollable).first,
+      );
       expect(find.text('詳細・動作確認'), findsOneWidget);
+      tester
+          .state<ScrollableState>(find.byType(Scrollable).first)
+          .position
+          .jumpTo(0);
+      await tester.pump();
       await expectLater(find.byType(MaterialApp),
           matchesGoldenFile('goldens/settings.png'));
     });
@@ -211,7 +227,13 @@ void main() {
         home: SettingsScreen(store: store),
       ));
       await tester.pump();
+      await tester.scrollUntilVisible(
+        find.text('詳細・動作確認'),
+        120,
+        scrollable: find.byType(Scrollable).first,
+      );
       await tester.ensureVisible(find.text('詳細・動作確認'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('詳細・動作確認'));
       await tester.pumpAndSettle();
       await tester.ensureVisible(find.text('状態を確認する'));
@@ -250,7 +272,13 @@ void main() {
         home: SettingsScreen(store: store),
       ));
       await tester.pump();
+      await tester.scrollUntilVisible(
+        find.text('詳細・動作確認'),
+        120,
+        scrollable: find.byType(Scrollable).first,
+      );
       await tester.ensureVisible(find.text('詳細・動作確認'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('詳細・動作確認'));
       await tester.pumpAndSettle();
       await tester.ensureVisible(find.text('Nanoで質問を試す'));

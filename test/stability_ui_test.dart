@@ -129,11 +129,22 @@ void main() {
         find.text('AICoreの状態を確認できませんでした。少し待って再確認してください。'),
         findsOneWidget,
       );
-      await tester.ensureVisible(find.text('詳細・動作確認'));
+      // v0.4.0 で ChatGPT カードが増え「詳細・動作確認」が ListView の
+      // 構築範囲外に出たため、ListView を明示してスクロールで出現させる
+      // （Scrollable が複数あるため scrollUntilVisible の既定探索は使えない）。
+      await tester.dragUntilVisible(
+        find.text('詳細・動作確認'),
+        find.byType(ListView),
+        const Offset(0, -100),
+      );
       await tester.tap(find.text('詳細・動作確認'));
       await tester.pumpAndSettle();
 
-      await tester.ensureVisible(find.text('状態を確認する'));
+      await tester.dragUntilVisible(
+        find.text('状態を確認する'),
+        find.byType(ListView),
+        const Offset(0, -100),
+      );
       final button = tester.widget<OutlinedButton>(
         find.widgetWithText(OutlinedButton, '状態を確認する'),
       );

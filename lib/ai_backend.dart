@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 
 import 'app_config.dart';
 import 'dig_mode.dart';
+import 'chatgpt_backend.dart';
 import 'on_device_backend.dart';
 import 'fallback.dart';
 import 'models.dart';
@@ -14,6 +15,8 @@ import 'name_candidates.dart';
 import 'prompts.dart';
 import 'session_logic.dart';
 
+/// 応答がどこから来たか（K1: モード開示のために画面へ伝える）。
+/// 本体は models.dart（v0.4.0 で chatGpt を追加）。
 export 'models.dart' show AnswerSource;
 
 class AiCancelled implements Exception {
@@ -427,8 +430,16 @@ class ResilientBackend implements AiBackend {
 
   /// v0.3.0 PoC: オンデバイスAI。最優先で試し、失敗したら次へ倒す。
   final AiBackend? onDevice;
+
+  /// v0.4.0: ChatGPT（サインイン済みのときだけ非 null）。オンデバイスの次。
+  final AiBackend? chatGpt;
   final LocalBackend local = LocalBackend();
-  ResilientBackend(this._fixedRemote, {this.onDevice, this.remoteFactory});
+  ResilientBackend(
+    this._fixedRemote, {
+    this.onDevice,
+    this.chatGpt,
+    this.remoteFactory,
+  });
 
   void Function(AiPhase)? onPhase;
   Completer<void>? _active;
@@ -448,6 +459,12 @@ class ResilientBackend implements AiBackend {
   /// 直近のオンデバイス失敗の理由（診断表示用、v0.3.1）。
   String? lastOnDeviceError;
 
+  /// 直近の呼び出しで ChatGPT が失敗し次へ倒れたか（v0.4.0）。
+  bool lastChatGptFailed = false;
+
+  /// 直近の ChatGPT 失敗の理由（診断表示用、v0.4.0）。
+  String? lastChatGptError;
+
   /// 直近の呼び出しがユーザー手動の「定型で続ける」だったか（R-04）。
   bool lastManualTemplate = false;
 
@@ -463,7 +480,8 @@ class ResilientBackend implements AiBackend {
     isLocalSource: lastSource == AnswerSource.local,
     hasRemoteKey: hasRemoteKey,
     remoteConsent: remoteConsent,
-    lastRemoteFailed: lastRemoteFailed,
+    // v0.4.0: ChatGPT の失敗も「クラウドAIに接続できなかった」に含める。
+    lastRemoteFailed: lastRemoteFailed || lastChatGptFailed,
     onDeviceNeedsDownload: lastOnDeviceStatus == OnDeviceStatus.needsDownload,
     manualTemplate: lastManualTemplate,
   );
@@ -489,18 +507,21 @@ class ResilientBackend implements AiBackend {
   DigModeKind get currentModeKind {
     final s = lastSource;
     if (s == AnswerSource.onDevice) return DigModeKind.onDevice;
+    if (s == AnswerSource.chatGpt) return DigModeKind.chatGpt;
     if (s == AnswerSource.remote) return DigModeKind.ai;
-    if (s == AnswerSource.local && (lastOnDeviceFailed || lastRemoteFailed)) {
+    if (s == AnswerSource.local &&
+        (lastOnDeviceFailed || lastChatGptFailed || lastRemoteFailed)) {
       return DigModeKind.templateFailed;
     }
     if (s == AnswerSource.local) return DigModeKind.templateNoKey;
     // 未呼び出し: 最優先の候補を表示する。
     if (onDevice != null) return DigModeKind.onDevice;
+    if (chatGpt != null) return DigModeKind.chatGpt;
     if (remote != null) return DigModeKind.ai;
     return DigModeKind.templateNoKey;
   }
 
-  /// 候補を優先順（オンデバイス→リモート→ローカル）で試す共通処理。
+  /// 候補を優先順（オンデバイス→ChatGPT→Gemini→ローカル）で試す共通処理。
   Future<(T, AnswerSource)> _run<T>(
     Future<T> Function(AiBackend backend) op,
     Future<T> Function() localOp, {
@@ -547,6 +568,14 @@ class ResilientBackend implements AiBackend {
       return (result, source);
     }
 
+    // 呼び出し開始時に前回の失敗状態をリセットする（ChatGPT 分岐は commit() を
+    // 通らず直接フィールドを書くため、ここでの初期化が要る）。
+    lastOnDeviceFailed = false;
+    lastChatGptFailed = false;
+    lastRemoteFailed = false;
+    lastRemoteError = null;
+    lastOnDeviceError = null;
+    lastManualTemplate = templateOnly;
     if (!templateOnly && onDevice != null) {
       checkCancelled();
       onPhase?.call(AiPhase.onDevice);
@@ -560,6 +589,34 @@ class ResilientBackend implements AiBackend {
         final od = onDevice;
         onDeviceError = od is OnDeviceBackend
             ? (od.lastError ?? e.toString())
+            : e.toString();
+      }
+    }
+    // v0.4.0: 第2候補は ChatGPT（サインイン済みのときだけ非 null）。
+    // Gemini と同じクラウド扱いで、フェーズ通知・キャンセル規約に合わせる。
+    if (!templateOnly && chatGpt != null) {
+      onPhase?.call(AiPhase.cloud);
+      try {
+        checkCancelled();
+        final r = await op(chatGpt!);
+        checkCancelled();
+        // commit() を通らないため、先行するオンデバイス失敗も含めて
+        // commit() と同じフィールド記録をここで行う。
+        lastOnDeviceFailed = onDeviceFailed;
+        lastOnDeviceError = onDeviceError;
+        lastRemoteFailed = false;
+        lastRemoteError = null;
+        lastManualTemplate = templateOnly;
+        lastSource = AnswerSource.chatGpt;
+        lastChatGptFailed = false;
+        lastChatGptError = null;
+        return (r, AnswerSource.chatGpt);
+      } catch (e) {
+        checkCancelled();
+        lastChatGptFailed = true;
+        final cg = chatGpt;
+        lastChatGptError = cg is ChatGptBackend
+            ? (cg.lastError ?? e.toString())
             : e.toString();
       }
     }
@@ -589,7 +646,7 @@ class ResilientBackend implements AiBackend {
   }
 
   @override
-  bool get isRemote => remote != null;
+  bool get isRemote => remote != null || chatGpt != null;
 
   @override
   Future<DigQuestion> nextQuestion({
