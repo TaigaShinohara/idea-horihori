@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../ai_backend.dart';
+import '../google_workspace.dart';
 import '../models.dart';
 import '../store.dart';
 import '../widgets/glass.dart';
@@ -22,11 +24,15 @@ class DetailScreen extends StatefulWidget {
 
   /// 深掘り完了直後の遷移かどうか（K2 の山場表示に使う）。
   final bool highlightLatestMemo;
+
+  /// v0.5.0: Google Workspace 連携（テストではフェイクを差し替える）。
+  final GoogleWorkspaceService? googleService;
   const DetailScreen({
     super.key,
     required this.store,
     required this.idea,
     this.highlightLatestMemo = false,
+    this.googleService,
   });
 
   @override
@@ -40,6 +46,10 @@ class _DetailScreenState extends State<DetailScreen> {
   bool _namesOpen = false;
   bool _openingDig = false;
   bool _openingBrief = false;
+  bool _sendingToDrive = false;
+
+  late final GoogleWorkspaceService _google =
+      widget.googleService ?? GoogleWorkspaceService();
 
   IdeaStore get store => widget.store;
   Idea get idea => widget.idea;
@@ -132,6 +142,62 @@ class _DetailScreenState extends State<DetailScreen> {
       }
     } finally {
       _openingDig = false;
+    }
+  }
+
+  /// v0.5.0: 完成した企画メモを Google ドキュメントとしてドライブへ送る。
+  /// 未サインインなら、その場でサインイン→認可まで進める（サービスの責務）。
+  Future<void> _sendToDrive(PlanMemo memo) async {
+    if (_sendingToDrive || _editing || _archiving) return;
+    final messenger = ScaffoldMessenger.of(context);
+    if (!_google.isConfigured) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text('Google連携は未設定（セットアップ待ち）です。'),
+        ),
+      );
+      return;
+    }
+    setState(() => _sendingToDrive = true);
+    try {
+      final doc = await _google.sendPlanToDrive(idea, memo: memo);
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (dialogCtx) => AlertDialog(
+          title: const Text('Googleドキュメントを作成しました'),
+          content: Text('「${doc.name}」をドライブに保存しました。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogCtx),
+              child: const Text('閉じる'),
+            ),
+            if (doc.webViewLink != null)
+              TextButton(
+                onPressed: () async {
+                  Navigator.pop(dialogCtx);
+                  final uri = Uri.tryParse(doc.webViewLink!);
+                  if (uri != null) {
+                    await launchUrl(uri, mode: LaunchMode.externalApplication);
+                  }
+                },
+                child: const Text('開く'),
+              ),
+          ],
+        ),
+      );
+    } on GoogleWorkspaceException catch (e) {
+      if (mounted) {
+        messenger.showSnackBar(SnackBar(content: Text(e.message)));
+      }
+    } catch (_) {
+      if (mounted) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('ドライブへ送れませんでした。通信状態を確認して、もう一度お試しください。')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _sendingToDrive = false);
     }
   }
 
@@ -343,6 +409,15 @@ class _DetailScreenState extends State<DetailScreen> {
                         ),
                       ),
                     ],
+                  ),
+                  const SizedBox(height: 10),
+                  // v0.5.0: 完成した企画書を Google ドキュメント化する。
+                  OutlinedButton.icon(
+                    onPressed: _sendingToDrive
+                        ? null
+                        : () => _sendToDrive(latest),
+                    icon: const Icon(Icons.cloud_upload_outlined, size: 18),
+                    label: Text(_sendingToDrive ? '送信中…' : 'Googleドキュメントで開く'),
                   ),
                   if (hasAnswers) ...[
                     const SizedBox(height: 20),
