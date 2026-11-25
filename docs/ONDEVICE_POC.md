@@ -60,3 +60,32 @@
 - Gemini Nanoには、入力を短くしてからトークン数を確認して渡す。入力が上限に近い場合は、直近の質問・回答をさらに絞ってやり直す。端末内に保存済みの履歴はそのまま参照できる。
 - 質問・企画メモ・名前候補には生成元を表示する。以前の保存データに生成元の記録がなければ表示を省略する。
 - Gemini APIの既定は `gemini-3.5-flash-lite`。保存済みの廃止済みGemini 2.0モデルは読み込み時に移行する。設定の接続確認はモデルのメタデータを取得する。クラウドの生成には別途同意が必要で、同意撤回・画面退出時は処理を取り消す。
+
+## 診断結果と原因の結論（2026-11-25、Pixel 10 Pro・v0.4.1）
+
+本人が設定→詳細・動作確認の診断結果をスクショで報告:
+
+- 端末AIカード: 「AICoreの状態を確認できませんでした。少し待って再確認してください。」
+- 生の理由: 「Could not query AICore: null」
+
+### コードとプラグイン実装から言えること（根拠つき）
+
+- 「Could not query AICore: null」は flutter_device_ai 0.3.0 の Android 実装（FlutterDeviceAiPlugin.kt の availability()）が出す文面。AICore パッケージの存在確認は通過したうえで、ML Kit GenAI の `Generation.getClient().checkStatus()` が例外を投げ、その例外の `message` が null だった、という意味である。つまり「端末が非対応」という判定ではなく「状態クエリ自体の失敗」。
+- 同プラグインの生成経路（createSession → generateContent）は checkStatus を経由しない。セッション生成も Android ではローカルオブジェクトの作成のみで、AICore 呼び出しは generateContent / countTokens の時点でのみ起きる。
+- 実際、同じ Pixel 10 Pro で別パッケージの検証版では Gemini Nano の生成が成功した記録がある（本ドキュメント「Pixel 10 Proでの推論確認（2026-11-23）」）。「状態が取れない＝生成もできない」とは言えない。
+- 一方、アプリ側は v0.4.1 まで checkStatus が available でなければ生成を試さない作り（_prepare が checkFailed で例外）だったため、状態クエリの失敗がそのまま「オンデバイスAIを使えない」に化けていた。これが本件の直接の原因（アプリ側の判定ロジック）であり、AICore 側で checkStatus が null メッセージ例外を返す理由そのものは端末側の事情で、アプリからは確定できない。
+
+### 対処（v0.4.2）
+
+- 生成系の呼び出し（質問・まとめ・名前候補・「質問を試す」）では、checkFailed でも生成を1回試し、結果で判定するフォールバックに変更（_prepare の probeOnCheckFailed）。生成が成功したら状態を「利用可」に昇格させてキャッシュする。生成も失敗したら従来どおり次候補（ChatGPT→Gemini→定型）へ落ちる。
+- prepareModel（モデルの事前準備）は生成を伴わないため probe せず、「質問を試す」で実際に生成できるか確認するよう案内する文面に変更。
+- 診断の表示文面も「状態を確認できませんでした（使えないと確定ではありません）。『質問を試す』で実際に生成できるか確かめられます。」に改善。
+- 実機でしか確定できない残件: この Pixel 10 Pro 実機で、v0.4.2 の probe により実際に深掘りがオンデバイスで通るか（生成成功まで至るか）は未確認＝実機待ち。
+
+## APKサイズ最適化（2026-11-25、v0.4.2）
+
+- 本人指摘「アプリが重たい」を受けて内訳を実測: APK 120MB の大半は flutter_device_ai が依存として引き込む llamadart 系のネイティブライブラリだった（libggml-vulkan.so 26MB / libLiteRtLm.so 26MB / LiteRt サンプラー・アクセラレータ群 約17MB / libwebgpu_dawn.so 5.7MB / libGemmaModelConstraintProvider.so 4.8MB / libllama*.so 約8MB / ggml-cpu 各種 約11MB など、非圧縮合計 約100MB）。
+- これらは「OS のモデルが使えない端末で GGUF ローカルモデルを llama.cpp / LiteRT-LM で動かす」フォールバック用。本アプリは FlutterDeviceAi.withFallback() にアダプタを渡しておらず、この経路を使っていない。Android の Gemini Nano は AICore のシステムプロセスで実行され、ML Kit GenAI 側にこれらの .so は不要。
+- 対処: android/app/build.gradle.kts の packaging.jniLibs.excludes で該当 .so（libLiteRt* / libGemmaModelConstraintProvider / libggml* / libllama* / libmtmd / libwebgpu_dawn）を除外。サイズ実測: 除外前 125,250,388 バイト（約120MB）→ 除外後 20,276,253 バイト（約20MB）、−84%。署名・版数（0.4.2+12）も apksigner で確認済み。
+- リスクと残件: 除外した .so が実機でロードされないことの最終確認は実機待ち（ロードされるのは AICore 経路と無関係な初期化が無いことまでをコードで確認済み）。ローカルLLM経路を使う改修時は除外を外すこと（build.gradle.kts にコメント明記）。
+- 起動まわり: main() は store.load() を非同期に流しており、起動時の同期的な重い処理はコード上見当たらなかったため、今回はサイズ削減のみ。
