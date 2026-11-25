@@ -422,6 +422,7 @@ class OnDeviceBackend implements GuidedDigBackend {
           text,
           context: context,
           anchorSource: input(budget).anchorSource,
+          style: style,
         ),
         schema: (budget) => input(budget).schema,
       );
@@ -467,21 +468,30 @@ class OnDeviceBackend implements GuidedDigBackend {
     required int version,
     DigStyle style = DigStyle.friend,
     bool reviewDraft = false,
-  }) => _generateParsed(
-    (budget) => Prompts.summarize(
-      title: idea.title,
-      note: idea.note,
-      history: history,
-      latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
-      style: style,
-      budget: budget,
-      reviewDraft: reviewDraft,
-      structuredOutput: _usesNativeSchemas,
-    ),
-    (text, _) =>
-        Prompts.parseMemo(text, version: version, reviewDraft: reviewDraft),
-    schema: reviewDraft ? (_) => Prompts.reviewMemoSchema : null,
-  );
+  }) {
+    final note = idea.note;
+    return _generateParsed(
+      (budget) => Prompts.summarize(
+        title: idea.title,
+        note: note,
+        history: history,
+        latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
+        style: style,
+        budget: budget,
+        reviewDraft: reviewDraft,
+        structuredOutput: _usesNativeSchemas,
+      ),
+      (text, budget) => Prompts.parseMemo(
+        text,
+        version: version,
+        reviewDraft: reviewDraft,
+        history: history,
+        budget: budget,
+        note: note,
+      ),
+      schema: reviewDraft ? (_) => Prompts.reviewMemoSchema : null,
+    );
+  }
 
   @override
   Future<List<String>> nameCandidates({required Idea idea}) {

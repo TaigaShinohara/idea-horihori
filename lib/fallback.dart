@@ -1,6 +1,8 @@
 import 'dig_mode.dart';
 import 'first_dig.dart';
 import 'models.dart';
+import 'prompts.dart';
+import 'review_draft_grounding.dart';
 
 /// APIキー未設定／オフラインでも深掘りが成立するための
 /// 組み込み定型質問セット（5問＝1セッション分）。
@@ -34,30 +36,10 @@ class FallbackQuestions {
     ),
   ];
 
-  static const _firstScene = DigQuestion(
-    id: 'guided_local_scene',
-    axis: 'scene',
-    text: '最初にこのアプリを使うのはどんな場面？',
-    choices: ['困ったそのとき', '後で思い出すとき', '楽しみとして始めるとき'],
-  );
-  static const _firstObstacle = DigQuestion(
-    id: 'guided_local_obstacle',
-    axis: 'obstacle',
-    text: '今のやり方で、どの段階が難しい？',
-    choices: ['取りかかるまで', '作業の途中', '後で見返すとき'],
-  );
-  static const _firstTest = DigQuestion(
-    id: 'guided_local_test',
-    axis: 'test',
-    text: '最初に何を確かめたい？',
-    choices: ['今のやり方で詰まるところ', 'どのくらい頻繁に起きるか', '手作業でも助かるか'],
-  );
-  static const _firstAudience = DigQuestion(
-    id: 'guided_local_audience',
-    axis: 'audience',
-    text: '最初に試してもらうなら、どんな人が近い？',
-    choices: ['自分と同じ場面で困っている人', '今のやり方に慣れた人', '初めてその作業をする人'],
-  );
+  static final _firstScene = OpeningFocus.scene.toQuestion();
+  static final _firstObstacle = OpeningFocus.obstacle.toQuestion();
+  static final _firstTest = OpeningFocus.test.toQuestion();
+  static final _firstAudience = OpeningFocus.audience.toQuestion();
 
   static DigQuestion firstDig(
     FirstDigContext context,
@@ -225,45 +207,48 @@ class FallbackQuestions {
 class LocalMemoBuilder {
   static PlanMemo build({
     required String title,
+    String note = '',
     required List<QaEntry> answers,
     required int version,
     DateTime? now,
     bool reviewDraft = false,
   }) {
     final slots = <String, String>{};
+    final selection = <String, String>{};
     for (final question in FallbackQuestions.questions) {
-      for (final entry in answers.reversed) {
+      for (var index = answers.length - 1; index >= 0; index--) {
+        final entry = answers[index];
         if (!_matchesTemplate(entry, question) ||
             entry.undecided ||
             entry.answer.trim().isEmpty) {
           continue;
         }
-        slots[question.id] = entry.answer;
+        if (reviewDraft) {
+          if (entry.substantiveAnswer.isEmpty) continue;
+          final field = question.id == 'next' ? 'nextStep' : question.id;
+          selection[field] = 'a${index + 1}';
+        } else {
+          slots[question.id] = entry.answer;
+        }
         break;
       }
+    }
+    if (reviewDraft) {
+      return ReviewDraftGrounding.fromAnswers(
+        answers,
+        budget: Prompts.standardBudget,
+        note: note,
+      ).build(version: version, now: now, selection: selection);
     }
 
     String slot(String id) => slots[id] ?? '';
 
     final form = slot('what');
     final what = form.isEmpty
-        ? (reviewDraft ? '' : title)
+        ? title
         : (title.contains('アプリ') || form.contains('アプリ'))
         ? '「$title」— $form'
         : '「$title」— $formアプリ';
-
-    if (reviewDraft) {
-      return PlanMemo(
-        what: what,
-        who: slot('who'),
-        why: slot('why'),
-        how: slot('how'),
-        nextStep: slot('next'),
-        openQuestions: '',
-        createdAt: now ?? DateTime.now(),
-        version: version,
-      );
-    }
 
     // 体力測定（v0.2 項目4）の簡易ルール。単純で説明可能に保つ:
     // - 作りやすさ ease: 「形（what）／どうやって（how）／次の一歩（next）」の

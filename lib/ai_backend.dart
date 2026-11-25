@@ -307,6 +307,7 @@ class GeminiBackend implements GuidedDigBackend {
         text,
         context: firstDig,
         anchorSource: input.anchorSource,
+        style: style,
       );
       if (question == null) throw GeminiFailure.invalidResponse;
       return question;
@@ -337,10 +338,11 @@ class GeminiBackend implements GuidedDigBackend {
     DigStyle style = DigStyle.friend,
     bool reviewDraft = false,
   }) async {
+    final note = idea.note;
     final text = await _generate(
       Prompts.summarize(
         title: idea.title,
-        note: idea.note,
+        note: note,
         history: history,
         latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
         style: style,
@@ -353,6 +355,8 @@ class GeminiBackend implements GuidedDigBackend {
       text,
       version: version,
       reviewDraft: reviewDraft,
+      history: history,
+      note: note,
     );
     if (memo == null) throw GeminiFailure.invalidResponse;
     return memo;
@@ -458,6 +462,7 @@ class LocalBackend implements GuidedDigBackend {
   }) async {
     return LocalMemoBuilder.build(
       title: idea.title,
+      note: idea.note,
       answers: history,
       version: version,
       reviewDraft: reviewDraft,

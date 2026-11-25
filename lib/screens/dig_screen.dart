@@ -1055,13 +1055,25 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
   }
 
   Widget _questionCard(DigQuestion q) {
+    final quoteEnd = q.axis != null &&
+            FollowUpFocus.fromQuestionId(q.id) != null &&
+            q.text.startsWith('「')
+        ? q.text.indexOf('」\n')
+        : -1;
     return GlassCard(
       padding: const EdgeInsets.all(20),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (quoteEnd >= 0) ...[
+            Text(
+              q.text.substring(0, quoteEnd + 1),
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 8),
+          ],
           Text(
-            q.text,
+            quoteEnd >= 0 ? q.text.substring(quoteEnd + 2) : q.text,
             style: const TextStyle(
               fontSize: 20,
               fontWeight: FontWeight.bold,

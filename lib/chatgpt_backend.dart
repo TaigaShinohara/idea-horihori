@@ -173,7 +173,7 @@ class ChatGptBackend implements GuidedDigBackend {
         title: idea.title,
         note: idea.note,
         context: firstDig,
-        style: style,
+          style: style,
         viewpoint: viewpoint,
       );
       return _generateParsed(
@@ -182,6 +182,7 @@ class ChatGptBackend implements GuidedDigBackend {
           text,
           context: firstDig,
           anchorSource: input.anchorSource,
+        style: style,
         ),
         'question',
       );
@@ -210,17 +211,23 @@ class ChatGptBackend implements GuidedDigBackend {
     DigStyle style = DigStyle.friend,
     bool reviewDraft = false,
   }) async {
+    final note = idea.note;
     return _generateParsed(
       Prompts.summarize(
         title: idea.title,
-        note: idea.note,
+        note: note,
         history: history,
         latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
         style: style,
         reviewDraft: reviewDraft,
       ),
-      (text) =>
-          Prompts.parseMemo(text, version: version, reviewDraft: reviewDraft),
+      (text) => Prompts.parseMemo(
+        text,
+        version: version,
+        reviewDraft: reviewDraft,
+        history: history,
+        note: note,
+      ),
       'memo',
     );
   }
