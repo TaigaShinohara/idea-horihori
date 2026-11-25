@@ -131,14 +131,6 @@ class FallbackQuestions {
     ),
   ];
 
-  /// 質問IDが視点・2周目用の補足質問かどうか（nextStep非汚染の判定用）。
-  static bool isSupplementalId(String id) =>
-      id == 'contrarian' ||
-      id.startsWith('money_') ||
-      id.startsWith('tech_') ||
-      id.startsWith('user_') ||
-      id.startsWith('deep_');
-
   /// 上司モード用の前置き（v0.2 項目1）。質問の骨格と選択肢は共通で、
   /// boss のときだけ各質問の前置きを詰める調子に差し替える。
   static const Map<String, String> _bossPrefixes = {
@@ -165,89 +157,31 @@ class FallbackQuestions {
 
 /// 回答群から企画メモの型をローカルで整形する（AIなし版）。
 class LocalMemoBuilder {
-  static const List<String> _slotIds = ['who', 'why', 'what', 'how', 'next'];
-
-  /// 質問文のキーワードから振り分け先の欄を推定する（テンプレ外ID用）。
-  /// 「何」は汎用的なので最後に見る。
-  static String? _routeByKeyword(String question) {
-    if (question.contains('誰') || question.contains('ため')) return 'who';
-    if (question.contains('困') || question.contains('悩')) return 'why';
-    if (question.contains('どう') || question.contains('方法')) return 'how';
-    if (question.contains('最初') || question.contains('次')) return 'next';
-    if (question.contains('形') || question.contains('何')) return 'what';
-    return null;
-  }
-
   static PlanMemo build({
     required String title,
     required List<QaEntry> answers,
     required int version,
     DateTime? now,
   }) {
-    final slots = <String, String>{for (final id in _slotIds) id: ''};
-
-    // テンプレIDは「最後に一致した回答」を使う（再深掘りの新しい回答を
-    // 優先し、古い回答でメモが固定されるのを防ぐ）。
-    for (final a in answers) {
-      if (_slotIds.contains(a.questionId) && a.answer.trim().isNotEmpty) {
-        slots[a.questionId] = a.answer;
-      }
-    }
-
-    // テンプレ外の回答（Geminiの q1, q2... や逆張り・視点・2周目質問など）:
-    // R-01/R-03: 逆張り・視点・2周目補足質問は nextStep を絶対に汚染しない。
-    // 1) 逆張り回答は What の補足（extras）へ分離する
-    // 2) 視点・2周目質問は next 以外の空き欄へキーワード振り分け、入らなければ extras へ
-    // 3) その他（AIの自由IDなど）は従来通りキーワード→空き欄→extras の順
-    final pool = <String>[];
-    final extras = <String>[];
-    for (final a in answers) {
-      if (_slotIds.contains(a.questionId)) continue;
-      if (a.answer.trim().isEmpty) continue;
-      if (a.contrarian || a.questionId == 'contrarian') {
-        extras.add(a.answer);
-        continue;
-      }
-      if (FallbackQuestions.isSupplementalId(a.questionId)) {
-        final target = _routeByKeyword(a.question);
-        if (target != null && target != 'next' && slots[target]!.isEmpty) {
-          slots[target] = a.answer;
-        } else {
-          extras.add(a.answer);
+    final slots = <String, String>{};
+    for (final question in FallbackQuestions.questions) {
+      for (final entry in answers.reversed) {
+        if (!_matchesTemplate(entry, question) || entry.answer.trim().isEmpty) {
+          continue;
         }
-        continue;
-      }
-      final target = _routeByKeyword(a.question);
-      if (target != null && slots[target]!.isEmpty) {
-        slots[target] = a.answer;
-      } else {
-        pool.add(a.answer);
-      }
-    }
-    for (final answer in pool) {
-      String emptyId = '';
-      for (final id in _slotIds) {
-        if (slots[id]!.isEmpty) {
-          emptyId = id;
-          break;
-        }
-      }
-      if (emptyId.isEmpty) {
-        extras.add(answer);
-      } else {
-        slots[emptyId] = answer;
+        slots[question.id] = entry.answer;
+        break;
       }
     }
 
     String slot(String id) => slots[id] ?? '';
 
     final form = slot('what');
-    final whatBase = form.isEmpty
+    final what = form.isEmpty
         ? title
         : (title.contains('アプリ') || form.contains('アプリ'))
             ? '「$title」— $form'
             : '「$title」— $formアプリ';
-    final what = extras.isEmpty ? whatBase : '$whatBase。${extras.join('。')}';
 
     // 体力測定（v0.2 項目4）の簡易ルール。単純で説明可能に保つ:
     // - 作りやすさ ease: 「形（what）／どうやって（how）／次の一歩（next）」の
@@ -273,5 +207,13 @@ class LocalMemoBuilder {
       ease: ease,
       spark: spark,
     );
+  }
+
+  // 生成された質問の ID は任意。旧データでは定型の本文と一致する場合だけ使う。
+  static bool _matchesTemplate(QaEntry entry, DigQuestion question) {
+    if (entry.questionId != question.id || entry.contrarian) return false;
+    if (entry.source != null && entry.source != AnswerSource.local) return false;
+    return entry.question == question.text ||
+        entry.question == FallbackQuestions.styled(question, DigStyle.boss).text;
   }
 }

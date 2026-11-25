@@ -299,7 +299,7 @@ void main() {
       );
       expect(memo.nextStep, '続きを深掘りする');
       expect(memo.nextStep, isNot('需要がない'));
-      expect(memo.what, contains('需要がない'));
+      expect(memo.what, '天気アプリ');
       // タイトルに「アプリ」が含まれるため「アプリ」が重複しない
       expect(memo.what, isNot(contains('サッと記録するアプリ')));
     });

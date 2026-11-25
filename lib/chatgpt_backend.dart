@@ -171,6 +171,7 @@ class ChatGptBackend implements AiBackend {
     return _generateParsed(
       Prompts.summarize(
         title: idea.title,
+        note: idea.note,
         history: history,
         latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
         style: style,

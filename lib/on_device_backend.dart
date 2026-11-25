@@ -418,6 +418,7 @@ class OnDeviceBackend implements AiBackend {
   }) => _generateParsed(
     (budget) => Prompts.summarize(
       title: idea.title,
+      note: idea.note,
       history: history,
       latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
       style: style,
