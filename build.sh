@@ -40,6 +40,26 @@ VER=$(grep -E '^version:' pubspec.yaml | sed -E 's/version: *([0-9.]+)\+([0-9]+)
 VNAME=$(echo $VER | cut -d' ' -f1); VCODE=$(echo $VER | cut -d' ' -f2)
 sed -i -E "s/^flutter.versionName=.*/flutter.versionName=$VNAME/; s/^flutter.versionCode=.*/flutter.versionCode=$VCODE/" android/local.properties
 G="$GRADLE_USER_HOME/wrapper/dists/gradle-9.3.1-all/9ot9r568e8zfvvd4mn8rbu1j0/gradle-9.3.1/bin/gradle"
+# v0.5.0: dart-define を .local/dart-defines.env（KEY=VALUE 形式、.local/ は
+# gitignore 済み）から読み、Flutter Gradle プラグインの形式
+# （各定義を base64 化してカンマ連結）で -Pdart-defines として渡す。
+# Google Workspace 連携のクライアント ID はここから差し込む
+# （docs/GOOGLE_WORKSPACE_SETUP.md）。ファイルが無ければ従来どおり。
+DD_ARGS=()
+if [ -f .local/dart-defines.env ]; then
+  DD=$(python3 -c "
+import base64, sys
+defs = []
+for line in open('.local/dart-defines.env', encoding='utf-8'):
+    line = line.strip()
+    if not line or line.startswith('#') or '=' not in line:
+        continue
+    defs.append(base64.b64encode(line.encode('utf-8')).decode('ascii'))
+if defs:
+    print('-Pdart-defines=' + ','.join(defs))
+")
+  [ -n "$DD" ] && DD_ARGS=("$DD")
+fi
 # Build serialization rule (user decision 2026-11-23, revised): at most 2
 # builds VM-wide, via the shared semaphore wrapper.
-cd android && exec ~/workspace/tools/with-build-lock.sh "$G" assembleRelease --max-workers=1 "$@"
+cd android && exec ~/workspace/tools/with-build-lock.sh "$G" assembleRelease --max-workers=1 "${DD_ARGS[@]}" "$@"

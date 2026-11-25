@@ -1,7 +1,7 @@
 name: horihori
 description: "アイデアをストックして、AIの質問で企画メモに育てるアプリ（アイデアホリホリ）"
 publish_to: 'none'
-version: 0.4.2+12
+version: 0.5.0+13
 
 environment:
   sdk: ^3.13.7
@@ -17,6 +17,8 @@ dependencies:
   # Sign in with ChatGPT（OAuth+PKCE／トークンは端末内セキュア保存のみ）
   crypto: ^3.0.3
   url_launcher: ^6.3.1
+  # v0.5.0: Google Workspace 連携（サインイン＋Drive へ drive.file スコープのみ）
+  google_sign_in: ^7.2.0
 
 dev_dependencies:
   flutter_test:

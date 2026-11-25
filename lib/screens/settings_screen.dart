@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../ai_backend.dart';
 import '../app_config.dart';
 import '../chatgpt_auth_service.dart';
+import '../google_workspace.dart';
 import '../models.dart';
 import '../on_device_backend.dart';
 import '../store.dart';
@@ -10,7 +11,10 @@ import '../widgets/glass.dart';
 
 class SettingsScreen extends StatefulWidget {
   final IdeaStore store;
-  const SettingsScreen({super.key, required this.store});
+
+  /// v0.5.0: Google Workspace 連携（テストではフェイクを差し替える）。
+  final GoogleWorkspaceService? googleService;
+  const SettingsScreen({super.key, required this.store, this.googleService});
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -40,6 +44,63 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final TextEditingController _codeCtrl = TextEditingController();
   bool _cgBusy = false;
   String? _cgMessage;
+
+  // v0.5.0: Google Workspace 連携。
+  late final GoogleWorkspaceService _google =
+      widget.googleService ?? GoogleWorkspaceService();
+  bool _gBusy = false;
+  bool _gChecked = false;
+  GoogleAccountInfo? _gAccount;
+  String? _gMessage;
+
+  Future<void> _refreshGoogleAccount() async {
+    final account = await _google.currentAccount();
+    if (!mounted) return;
+    setState(() {
+      _gAccount = account;
+      _gChecked = true;
+    });
+  }
+
+  Future<void> _googleSignIn() async {
+    setState(() {
+      _gBusy = true;
+      _gMessage = null;
+    });
+    try {
+      final account = await _google.signIn();
+      if (!mounted) return;
+      setState(() {
+        _gAccount = account;
+        _gChecked = true;
+        _gMessage = 'サインインしました';
+      });
+    } on GoogleWorkspaceException catch (e) {
+      if (!mounted) return;
+      setState(() => _gMessage = e.message);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _gMessage = 'サインインに失敗しました: $e');
+    } finally {
+      if (mounted) setState(() => _gBusy = false);
+    }
+  }
+
+  Future<void> _googleSignOut() async {
+    setState(() => _gBusy = true);
+    try {
+      await _google.signOut();
+    } catch (_) {
+      // サインアウト失敗でも表示は未サインイン側へ倒す。
+    }
+    if (!mounted) return;
+    setState(() {
+      _gBusy = false;
+      _gAccount = null;
+      _gChecked = true;
+      _gMessage = 'サインアウトしました';
+    });
+  }
 
   Future<void> _chatGptSignIn() async {
     setState(() {
@@ -98,6 +159,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _diagnosis = cached;
     } else {
       _runDiagnosis(auto: true);
+    }
+    // 未設定ビルドではプラグインに触れない（currentAccount が即 null を返す）。
+    if (_google.isConfigured) {
+      _refreshGoogleAccount();
+    } else {
+      _gChecked = true;
     }
   }
 
@@ -544,7 +611,63 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
             const SizedBox(height: 16),
-            // 4. 詳細・動作確認（開発者向け診断・テスト・モデル名を折りたたみへ隔離）
+            // 4. Google Workspace（v0.5.0: 企画メモを Google ドキュメント化）
+            GlassCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text('Google Workspace',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 6),
+                  if (!_google.isConfigured)
+                    const Text(
+                      '未設定（セットアップ待ち）です。Google Cloud 側の設定が完了したビルドで有効になります。有効になると、完成した企画メモを Google ドキュメントとしてドライブへ送れます。',
+                      style: TextStyle(fontSize: 13, height: 1.6),
+                    )
+                  else if (_gAccount case final account?)
+                    Text(
+                      'サインイン済み（${account.email}）。企画メモの画面から Google ドキュメント化できます。アクセスは、このアプリが作ったファイルだけに限られます。',
+                      style: const TextStyle(fontSize: 13, height: 1.6),
+                    )
+                  else
+                    const Text(
+                      'サインインすると、完成した企画メモを Google ドキュメントとしてドライブへ送れます。アクセスは、このアプリが作ったファイルだけ（drive.file）に限られます。',
+                      style: TextStyle(fontSize: 13, height: 1.6),
+                    ),
+                  if (_google.isConfigured) ...[
+                    const SizedBox(height: 12),
+                    if (_gAccount != null)
+                      OutlinedButton(
+                        onPressed: _gBusy ? null : _googleSignOut,
+                        child: const Text('サインアウト'),
+                      )
+                    else
+                      FilledButton(
+                        onPressed: _gBusy || !_gChecked
+                            ? null
+                            : _googleSignIn,
+                        style: FilledButton.styleFrom(
+                          backgroundColor: kButtonFill,
+                          foregroundColor: Colors.white,
+                        ),
+                        child: Text(_gBusy
+                            ? 'サインイン中…'
+                            : !_gChecked
+                                ? '確認中…'
+                                : 'Googleでサインイン'),
+                      ),
+                  ],
+                  if (_gMessage != null) ...[
+                    const SizedBox(height: 10),
+                    Text(_gMessage!,
+                        style: const TextStyle(fontSize: 13, height: 1.6)),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            // 5. 詳細・動作確認（開発者向け診断・テスト・モデル名を折りたたみへ隔離）
             GlassCard(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
               child: Theme(
