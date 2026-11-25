@@ -417,6 +417,27 @@ class _MemoBody extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final labelColor = Theme.of(context).colorScheme.onSurfaceVariant;
+    final openQuestions = memo.openQuestions;
+    if (openQuestions != null) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _row(
+            '決めたこと',
+            [
+              if (memo.what.isNotEmpty) '何を作る　${memo.what}',
+              if (memo.who.isNotEmpty) '誰に　${memo.who}',
+              if (memo.why.isNotEmpty) 'なぜ　${memo.why}',
+              if (memo.how.isNotEmpty) 'どうやって　${memo.how}',
+            ]
+                .join('\n'),
+            labelColor,
+          ),
+          _row('未確認のこと', openQuestions, labelColor),
+          _row('次に試すこと', memo.nextStep, labelColor, last: true),
+        ],
+      );
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -690,6 +711,13 @@ class _OldMemoTileState extends State<_OldMemoTile> {
                     const SizedBox(height: 6),
                   ],
                   _MemoBody(memo: widget.memo),
+                  if (widget.memo.hasFitness) ...[
+                    const SizedBox(height: 12),
+                    if (widget.memo.ease case final ease?)
+                      Text('作りやすさ ${fitnessDots(ease)}'),
+                    if (widget.memo.spark case final spark?)
+                      Text('ワクワク度 ${fitnessDots(spark)}'),
+                  ],
                   if (widget.memo.input case final input?) ...[
                     MemoInputView(input: input, idea: widget.idea),
                     TextButton(

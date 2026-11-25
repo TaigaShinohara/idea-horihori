@@ -34,6 +34,7 @@ QaEntry? undoLastAnswer(DigSession session) {
     choices: last.choices!,
     isContrarian: last.contrarian,
     source: last.source,
+    axis: last.axis,
   );
   session.contrarianAsked = session.answers.any((answer) => answer.contrarian);
   return last;

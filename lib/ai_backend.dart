@@ -10,6 +10,7 @@ import 'dig_mode.dart';
 import 'chatgpt_backend.dart';
 import 'on_device_backend.dart';
 import 'fallback.dart';
+import 'first_dig.dart';
 import 'models.dart';
 import 'name_candidates.dart';
 import 'prompts.dart';
@@ -61,8 +62,30 @@ abstract class AiBackend {
   bool get isRemote;
 }
 
+/// 初回の質問と確認用の下書きに対応する生成経路。
+abstract interface class GuidedDigBackend implements AiBackend {
+  @override
+  Future<DigQuestion> nextQuestion({
+    required Idea idea,
+    required List<QaEntry> history,
+    DigStyle style = DigStyle.friend,
+    DigViewpoint viewpoint = DigViewpoint.none,
+    bool contrarianDue = false,
+    FirstDigContext? firstDig,
+  });
+
+  @override
+  Future<PlanMemo> summarize({
+    required Idea idea,
+    required List<QaEntry> history,
+    required int version,
+    DigStyle style = DigStyle.friend,
+    bool reviewDraft = false,
+  });
+}
+
 /// Gemini REST (generateContent) 実装。キーはログに出さない。
-class GeminiBackend implements AiBackend {
+class GeminiBackend implements GuidedDigBackend {
   final String apiKey;
   final String model;
   final http.Client? _client;
@@ -268,7 +291,26 @@ class GeminiBackend implements AiBackend {
     DigStyle style = DigStyle.friend,
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
+    FirstDigContext? firstDig,
   }) async {
+    if (firstDig != null) {
+      final input = Prompts.firstDigQuestion(
+        title: idea.title,
+        note: idea.note,
+        context: firstDig,
+        style: style,
+        viewpoint: viewpoint,
+        structuredOutput: true,
+      );
+      final text = await _generate(input.prompt, input.schema);
+      final question = Prompts.parseFirstDigQuestion(
+        text,
+        context: firstDig,
+        anchorSource: input.anchorSource,
+      );
+      if (question == null) throw GeminiFailure.invalidResponse;
+      return question;
+    }
     final text = await _generate(
       Prompts.nextQuestion(
         title: idea.title,
@@ -293,6 +335,7 @@ class GeminiBackend implements AiBackend {
     required List<QaEntry> history,
     required int version,
     DigStyle style = DigStyle.friend,
+    bool reviewDraft = false,
   }) async {
     final text = await _generate(
       Prompts.summarize(
@@ -301,10 +344,16 @@ class GeminiBackend implements AiBackend {
         history: history,
         latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
         style: style,
+        reviewDraft: reviewDraft,
+        structuredOutput: true,
       ),
-      _memoSchema,
+      reviewDraft ? Prompts.reviewMemoSchema : _memoSchema,
     );
-    final memo = Prompts.parseMemo(text, version: version);
+    final memo = Prompts.parseMemo(
+      text,
+      version: version,
+      reviewDraft: reviewDraft,
+    );
     if (memo == null) throw GeminiFailure.invalidResponse;
     return memo;
   }
@@ -324,7 +373,7 @@ class GeminiBackend implements AiBackend {
 
 /// ローカルフォールバック実装（キー未設定／オフライン／API失敗時）。
 /// 定型質問＋ローカル整形で、ネットなしでも深掘りが完結する。
-class LocalBackend implements AiBackend {
+class LocalBackend implements GuidedDigBackend {
   @override
   bool get isRemote => false;
 
@@ -335,7 +384,11 @@ class LocalBackend implements AiBackend {
     DigStyle style = DigStyle.friend,
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
+    FirstDigContext? firstDig,
   }) async {
+    if (firstDig != null) {
+      return FallbackQuestions.firstDig(firstDig, style, viewpoint);
+    }
     final priorRound = hasCompletedPriorRound(idea);
     final allAskedIds = <String>{
       for (final s in idea.sessions)
@@ -401,11 +454,13 @@ class LocalBackend implements AiBackend {
     required List<QaEntry> history,
     required int version,
     DigStyle style = DigStyle.friend,
+    bool reviewDraft = false,
   }) async {
     return LocalMemoBuilder.build(
       title: idea.title,
       answers: history,
       version: version,
+      reviewDraft: reviewDraft,
     );
   }
 
@@ -423,7 +478,7 @@ class LocalBackend implements AiBackend {
 /// K1（v0.1.2）: 失敗を無言で吸収せず、直近の応答元と失敗有無を
 /// [lastSource] / [lastRemoteFailed] として公開する。画面側はセッション中
 /// 同じインスタンスを保持し、呼び出しのたびにこの値でモード表示を更新する。
-class ResilientBackend implements AiBackend {
+class ResilientBackend implements GuidedDigBackend {
   final AiBackend? _fixedRemote;
   final AiBackend? Function()? remoteFactory;
   AiBackend? get remote =>
@@ -445,6 +500,7 @@ class ResilientBackend implements AiBackend {
   void Function(AiPhase)? onPhase;
   Completer<void>? _active;
   GeminiBackend? _activeRemote;
+  ChatGptBackend? _activeChatGpt;
 
   /// 直近の呼び出し（質問・まとめ共通）の応答元。未呼び出しなら null。
   AnswerSource? lastSource;
@@ -470,8 +526,9 @@ class ResilientBackend implements AiBackend {
   bool lastManualTemplate = false;
 
   /// 直近のオンデバイス状態（R-04）。
-  OnDeviceStatus? get lastOnDeviceStatus =>
-      onDevice is OnDeviceBackend ? (onDevice as OnDeviceBackend).lastStatus : null;
+  OnDeviceStatus? get lastOnDeviceStatus => onDevice is OnDeviceBackend
+      ? (onDevice as OnDeviceBackend).lastStatus
+      : null;
 
   /// 定型モードに落ちた理由（R-04）。AI応答時は null。
   FallbackReason? fallbackReason({
@@ -492,6 +549,8 @@ class ResilientBackend implements AiBackend {
     if (active == null || active.isCompleted) return;
     active.complete();
     _activeRemote?.cancelPending();
+    _activeChatGpt?.cancelPending();
+    _activeChatGpt = null;
     final candidate = onDevice;
     if (candidate is OnDeviceBackend) {
       candidate.cancelPending();
@@ -595,30 +654,24 @@ class ResilientBackend implements AiBackend {
     }
     // v0.4.0: 第2候補は ChatGPT（サインイン済みのときだけ非 null）。
     // Gemini と同じクラウド扱いで、フェーズ通知・キャンセル規約に合わせる。
-    if (!templateOnly && chatGpt != null) {
+    final cg = chatGpt;
+    if (!templateOnly && cg != null) {
       onPhase?.call(AiPhase.cloud);
       try {
         checkCancelled();
-        final r = await op(chatGpt!);
-        checkCancelled();
-        // commit() を通らないため、先行するオンデバイス失敗も含めて
-        // commit() と同じフィールド記録をここで行う。
-        lastOnDeviceFailed = onDeviceFailed;
-        lastOnDeviceError = onDeviceError;
-        lastRemoteFailed = false;
-        lastRemoteError = null;
-        lastManualTemplate = templateOnly;
-        lastSource = AnswerSource.chatGpt;
-        lastChatGptFailed = false;
+        if (cg is ChatGptBackend) _activeChatGpt = cg;
+        final r = await op(cg);
+        final result = commit(r, AnswerSource.chatGpt);
         lastChatGptError = null;
-        return (r, AnswerSource.chatGpt);
+        return result;
       } catch (e) {
         checkCancelled();
         lastChatGptFailed = true;
-        final cg = chatGpt;
         lastChatGptError = cg is ChatGptBackend
             ? (cg.lastError ?? e.toString())
             : e.toString();
+      } finally {
+        if (identical(_active, active)) _activeChatGpt = null;
       }
     }
     checkCancelled();
@@ -658,21 +711,35 @@ class ResilientBackend implements AiBackend {
     bool contrarianDue = false,
     bool templateOnly = false,
     List<QaEntry>? templateHistory,
+    FirstDigContext? firstDig,
   }) async {
     final (question, source) = await _run(
-      (b) => b.nextQuestion(
-        idea: idea,
-        history: history,
-        style: style,
-        viewpoint: viewpoint,
-        contrarianDue: contrarianDue,
-      ),
+      (b) {
+        if (b is GuidedDigBackend) {
+          return b.nextQuestion(
+            idea: idea,
+            history: history,
+            style: style,
+            viewpoint: viewpoint,
+            contrarianDue: contrarianDue,
+            firstDig: firstDig,
+          );
+        }
+        return b.nextQuestion(
+          idea: idea,
+          history: history,
+          style: style,
+          viewpoint: viewpoint,
+          contrarianDue: contrarianDue,
+        );
+      },
       () => local.nextQuestion(
         idea: idea,
         history: templateHistory ?? history,
         style: style,
         viewpoint: viewpoint,
         contrarianDue: contrarianDue,
+        firstDig: firstDig,
       ),
       templateOnly: templateOnly,
     );
@@ -686,19 +753,32 @@ class ResilientBackend implements AiBackend {
     required int version,
     DigStyle style = DigStyle.friend,
     bool templateOnly = false,
+    bool reviewDraft = false,
   }) async {
     final (memo, source) = await _run(
-      (b) => b.summarize(
-        idea: idea,
-        history: history,
-        version: version,
-        style: style,
-      ),
+      (b) {
+        if (b is GuidedDigBackend) {
+          return b.summarize(
+            idea: idea,
+            history: history,
+            version: version,
+            style: style,
+            reviewDraft: reviewDraft,
+          );
+        }
+        return b.summarize(
+          idea: idea,
+          history: history,
+          version: version,
+          style: style,
+        );
+      },
       () => local.summarize(
         idea: idea,
         history: history,
         version: version,
         style: style,
+        reviewDraft: reviewDraft,
       ),
       templateOnly: templateOnly,
     );

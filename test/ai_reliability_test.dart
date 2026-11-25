@@ -327,7 +327,7 @@ void main() {
     ]);
   });
 
-  testWidgets('5問回答済みの再開は6問目を出さず、企画メモを保存する', (tester) async {
+  testWidgets('5問回答済みの再開は6問目を出さず、本人の確認後に保存する', (tester) async {
     final ai = ResilientBackend(null);
     final store = _ScreenStore(ai);
     await store.load();
@@ -349,10 +349,18 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    expect(find.text('企画メモを確認'), findsOneWidget);
+    expect(idea.memos, isEmpty);
+    expect(idea.sessions.single.finished, isFalse);
+    final confirm = find.text('企画メモを保存');
+    await tester.ensureVisible(confirm);
+    await tester.tap(confirm);
+    await tester.pumpAndSettle();
     expect(find.byType(DetailScreen), findsOneWidget);
     expect(idea.sessions.single.answers, hasLength(5));
     expect(idea.sessions.single.finished, isTrue);
     expect(idea.memos.single.source, AnswerSource.local);
+    expect(idea.memos.single.hasFitness, isFalse);
     expect(
       PlanMemo.fromJson(idea.memos.single.toJson()).source,
       AnswerSource.local,

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -15,6 +16,20 @@ class _FakeAuth extends ChatGptAuthService {
   @override
   Future<String?> getAccountId() async => 'acc-1';
 }
+
+class _WaitingAuth extends _FakeAuth {
+  final requested = Completer<void>();
+  final token = Completer<String?>();
+
+  @override
+  Future<String?> getValidAccessToken() {
+    requested.complete();
+    return token.future;
+  }
+}
+
+Idea _fixtureIdea() =>
+    Idea(id: 'fixture', title: '試作を記録するアプリ', createdAt: DateTime(2026));
 
 String _codexResponse(String text) => jsonEncode({
   'output': [
@@ -64,15 +79,12 @@ void main() {
           '${seg({'alg': 'none'})}.${seg({
             'https://api.openai.com/auth': {'chatgpt_account_id': 'acc-9'},
           })}.sig';
-      final tokens = ChatGptAuthService.parseTokenResponse(
-        {
-          'access_token': 'at',
-          'refresh_token': 'rt',
-          'id_token': idToken,
-          'expires_in': 3600,
-        },
-        now: DateTime(2026, 1, 1),
-      );
+      final tokens = ChatGptAuthService.parseTokenResponse({
+        'access_token': 'at',
+        'refresh_token': 'rt',
+        'id_token': idToken,
+        'expires_in': 3600,
+      }, now: DateTime(2026, 1, 1));
       expect(tokens.accessToken, 'at');
       expect(tokens.refreshToken, 'rt');
       expect(tokens.accountId, 'acc-9');
@@ -81,13 +93,80 @@ void main() {
   });
 
   group('ChatGPT バックエンド', () {
+    test('認証待ちの取消後は生成を送信しない', () async {
+      final auth = _WaitingAuth();
+      var sends = 0;
+      final backend = ResilientBackend(
+        null,
+        chatGpt: ChatGptBackend(
+          authService: auth,
+          client: MockClient((_) async {
+            sends++;
+            return _jsonResponse(_codexResponse('Invalid JSON'));
+          }),
+        ),
+      );
+      final pending = backend.nextQuestion(idea: _fixtureIdea(), history: []);
+      final cancelled = expectLater(pending, throwsA(isA<AiCancelled>()));
+      await auth.requested.future;
+      backend.cancelPending();
+      await cancelled;
+      auth.token.complete('fake-token');
+      await Future<void>.delayed(Duration.zero);
+      expect(sends, 0);
+    });
+
+    test('送信済みの応答が取消後に戻っても再試行しない', () async {
+      final dispatched = Completer<void>();
+      final response = Completer<http.Response>();
+      var sends = 0;
+      final backend = ResilientBackend(
+        null,
+        chatGpt: ChatGptBackend(
+          authService: _FakeAuth(),
+          client: MockClient((_) {
+            sends++;
+            if (!dispatched.isCompleted) dispatched.complete();
+            return response.future;
+          }),
+        ),
+      );
+      final pending = backend.nextQuestion(idea: _fixtureIdea(), history: []);
+      final cancelled = expectLater(pending, throwsA(isA<AiCancelled>()));
+      await dispatched.future;
+      backend.cancelPending();
+      await cancelled;
+      response.complete(_jsonResponse(_codexResponse('Invalid JSON')));
+      await Future<void>.delayed(Duration.zero);
+      expect(sends, 1);
+      expect(backend.lastSource, isNull);
+    });
+
+    test('認証後にサインアウトすると生成を送信しない', () async {
+      final auth = _WaitingAuth();
+      var maySend = true;
+      var sends = 0;
+      final backend = ChatGptBackend(
+        authService: auth,
+        maySend: () => maySend,
+        client: MockClient((_) async {
+          sends++;
+          return _jsonResponse(_codexResponse('Invalid JSON'));
+        }),
+      );
+      final pending = backend.nextQuestion(idea: _fixtureIdea(), history: []);
+      final revoked = expectLater(pending, throwsA(isA<ChatGptException>()));
+      await auth.requested.future;
+      maySend = false;
+      auth.token.complete('fake-token');
+      await revoked;
+      expect(sends, 0);
+    });
+
     test('Responses API の output からテキストを取り出す', () {
       final text = ChatGptBackend.extractOutputText({
         'output': [
-          {
-            'type': 'reasoning',
-            'content': [],
-          },
+          {'type': 'reasoning', 'content': []},
           {
             'type': 'message',
             'content': [
@@ -108,11 +187,18 @@ void main() {
           expect(req.headers['Authorization'], 'Bearer fake-token');
           expect(req.headers['chatgpt-account-id'], 'acc-1');
           return _jsonResponse(
-            _codexResponse('{"id": "q1", "text": "誰に届けたい？", "choices": ["個人", "チーム", "企業"]}'),
+            _codexResponse(
+              '{"id": "q1", "text": "誰に届けたい？", "choices": ["個人", "チーム", "企業"]}',
+            ),
           );
         }),
       );
-      final idea = Idea(id: '1', title: 'アイデア', note: '', createdAt: DateTime(2026));
+      final idea = Idea(
+        id: '1',
+        title: 'アイデア',
+        note: '',
+        createdAt: DateTime(2026),
+      );
       final q = await backend.nextQuestion(idea: idea, history: const []);
       expect(q.text, '誰に届けたい？');
       expect(q.choices, hasLength(3));
@@ -120,12 +206,15 @@ void main() {
 
     test('未サインイン（トークンなし）では失敗して理由が残る', () async {
       final backend = ChatGptBackend(
-        authService: ChatGptAuthService(
-          store: _MemoryTokenStore(),
-        ),
+        authService: ChatGptAuthService(store: _MemoryTokenStore()),
         client: MockClient((_) async => _jsonResponse('{}')),
       );
-      final idea = Idea(id: '1', title: 'x', note: '', createdAt: DateTime(2026));
+      final idea = Idea(
+        id: '1',
+        title: 'x',
+        note: '',
+        createdAt: DateTime(2026),
+      );
       await expectLater(
         backend.nextQuestion(idea: idea, history: const []),
         throwsA(isA<ChatGptException>()),
@@ -141,12 +230,21 @@ void main() {
         onDevice: _ThrowingBackend(),
         chatGpt: ChatGptBackend(
           authService: _FakeAuth(),
-          client: MockClient((_) async => _jsonResponse(
-                _codexResponse('{"id": "q1", "text": "質問？", "choices": ["a", "b", "c"]}'),
-              )),
+          client: MockClient(
+            (_) async => _jsonResponse(
+              _codexResponse(
+                '{"id": "q1", "text": "質問？", "choices": ["a", "b", "c"]}',
+              ),
+            ),
+          ),
         ),
       );
-      final idea = Idea(id: '1', title: 'x', note: '', createdAt: DateTime(2026));
+      final idea = Idea(
+        id: '1',
+        title: 'x',
+        note: '',
+        createdAt: DateTime(2026),
+      );
       final q = await backend.nextQuestion(idea: idea, history: const []);
       expect(q.text, '質問？');
       expect(backend.lastSource, AnswerSource.chatGpt);
@@ -168,16 +266,14 @@ class _ThrowingBackend implements AiBackend {
     DigStyle style = DigStyle.friend,
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
-  }) async =>
-      throw Exception('on-device unavailable');
+  }) async => throw Exception('on-device unavailable');
   @override
   Future<PlanMemo> summarize({
     required Idea idea,
     required List<QaEntry> history,
     required int version,
     DigStyle style = DigStyle.friend,
-  }) async =>
-      throw Exception('on-device unavailable');
+  }) async => throw Exception('on-device unavailable');
   @override
   Future<List<String>> nameCandidates({required Idea idea}) async =>
       throw Exception('on-device unavailable');

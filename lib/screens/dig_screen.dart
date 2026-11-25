@@ -1,13 +1,17 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../ai_backend.dart';
 import '../app_config.dart';
 import '../dig_mode.dart';
+import '../first_dig.dart';
 import '../models.dart';
 import '../on_device_backend.dart';
 import '../session_logic.dart';
 import '../store.dart';
 import '../widgets/glass.dart';
+import '../widgets/memo_review_pane.dart';
 import 'detail_screen.dart';
 import 'settings_screen.dart';
 
@@ -34,6 +38,8 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
   late final DigSession _session;
   late ResilientBackend _backend;
   DigQuestion? _question;
+  PlanMemo? _reviewEdit;
+  MemoDraft? _unsavedDraft;
   bool _loading = false;
   bool _summarizing = false;
   bool _saving = false;
@@ -44,6 +50,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
   bool _retrySummary = false;
   bool _returnedFromSettings = false;
   bool _guidePrompted = false;
+  bool _changingQuestion = false;
   int _request = 0;
   AiPhase? _phase;
   String? _failure;
@@ -57,6 +64,24 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       _selectedChoice != null || _freeCtrl.text.trim().isNotEmpty;
   bool get _sessionComplete =>
       _session.answers.length >= AppConfig.questionsPerSession;
+  bool get _reviewing => _session.reviewOpen && _session.reviewDraft != null;
+  bool get _openingTurn => _session.guidedOpening && _session.answers.length < 2;
+  bool get _atOpeningCheckpoint =>
+      _session.guidedOpening &&
+      _session.answers.isNotEmpty &&
+      _session.answers.length <= 2 &&
+      _session.pendingQuestion == null;
+  bool get _canReplaceQuestion =>
+      _openingTurn &&
+      !_session.replacedPositions.contains(_session.answers.length);
+
+  FirstDigContext? _firstDig({DigQuestion? excludedQuestion}) =>
+      _openingTurn
+      ? FirstDigContext(
+          firstAnswer: _session.answers.firstOrNull,
+          excludedQuestion: excludedQuestion,
+        )
+      : null;
 
   @override
   void initState() {
@@ -68,10 +93,13 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
         DigSession(
           id: DateTime.now().microsecondsSinceEpoch.toString(),
           startedAt: DateTime.now(),
+          guidedOpening: !hasCompletedPriorRound(idea),
         );
-    if (_sessionComplete) {
+    if (_reviewing) {
+      _reviewEdit = _session.reviewDraft!.memo;
+    } else if (_sessionComplete) {
       _summarize();
-    } else {
+    } else if (!_atOpeningCheckpoint) {
       _loadQuestion();
     }
   }
@@ -101,6 +129,9 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached;
+    if (_backgrounded && _reviewing) {
+      unawaited(_flushReviewOnBlur());
+    }
     if (_backgrounded && !_leaving && (_loading || _summarizing)) {
       _retrySummary = _summarizing;
       _stopGeneration();
@@ -108,7 +139,12 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       setState(() {
         _loading = false;
         _summarizing = false;
-        _failure = '生成を中止しました。続きから再開できます。';
+        _changingQuestion = false;
+        if (_question != null && !_retrySummary) {
+          _retryNotice = '生成を中止しました。元の質問から続けられます。';
+        } else {
+          _failure = '生成を中止しました。続きから再開できます。';
+        }
       });
     }
   }
@@ -223,6 +259,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
         viewpoint: _session.viewpoint,
         contrarianDue: contrarianDue(_session),
         templateOnly: templateOnly,
+        firstDig: _firstDig(),
       );
       if (!_current(request)) return;
       if (generated.isContrarian) _session.contrarianAsked = true;
@@ -259,16 +296,28 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
 
   /// R-04: 未回答の定型フォールバック質問を、ユーザー操作でAIへ聞き直す。
   /// 成功時のみ pendingQuestion を上書き保存し、失敗・キャンセル時は元へロールバックする。
-  Future<void> _retryQuestionWithAi() async {
+  Future<void> _retryQuestionWithAi() => _changeQuestion();
+
+  Future<void> _changeQuestion({
+    bool different = false,
+    bool templateOnly = false,
+  }) async {
     final previousQuestion = _question;
-    if (_busy || _leaving || previousQuestion?.source != AnswerSource.local) {
+    if (_busy ||
+        _leaving ||
+        previousQuestion == null ||
+        (different
+            ? !_canReplaceQuestion
+            : previousQuestion.source != AnswerSource.local)) {
       return;
     }
     final previousPending = _session.pendingQuestion;
     final previousContrarian = _session.contrarianAsked;
     final request = ++_request;
+    final position = _session.answers.length;
     setState(() {
       _loading = true;
+      _changingQuestion = different;
       _summarizing = false;
       _phase = null;
       _failure = null;
@@ -283,10 +332,11 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
         style: widget.store.digStyle,
         viewpoint: _session.viewpoint,
         contrarianDue: contrarianDue(_session),
-        templateOnly: false,
+        templateOnly: templateOnly,
+        firstDig: _firstDig(excludedQuestion: different ? previousQuestion : null),
       );
       if (!_current(request)) return;
-      if (generated.source == AnswerSource.local) {
+      if (!different && generated.source == AnswerSource.local) {
         final reason = _backend.fallbackReason(
           hasRemoteKey: widget.store.hasRemoteKey,
           remoteConsent: widget.store.remoteConsent,
@@ -300,9 +350,14 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
         });
         return;
       }
+      if (different && _sameQuestion(generated.text, previousQuestion.text)) {
+        setState(() => _retryNotice = '別の質問を用意できませんでした。');
+        return;
+      }
       _session.pendingQuestion = generated;
       _session.contrarianAsked =
           previousContrarian || generated.isContrarian;
+      if (different) _session.replacedPositions.add(position);
       setState(() {
         _saving = true;
         _loading = false;
@@ -317,16 +372,19 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
         _retryNotice = null;
       });
     } on AiCancelled {
-      _session.pendingQuestion = previousPending;
-      _session.contrarianAsked = previousContrarian;
       return;
     } catch (_) {
-      _session.pendingQuestion = previousPending;
-      _session.contrarianAsked = previousContrarian;
+      if (generated != null && identical(_session.pendingQuestion, generated)) {
+        _session.pendingQuestion = previousPending;
+        _session.contrarianAsked = previousContrarian;
+        if (different) _session.replacedPositions.remove(position);
+      }
       if (_current(request)) {
         setState(() {
           _question = previousQuestion;
-          _retryNotice = 'AIでの聞き直しに失敗しました。元の質問のまま続けられます。';
+          _retryNotice = different
+              ? '別の質問を用意できませんでした。元の質問から続けられます。'
+              : 'AIでの聞き直しに失敗しました。元の質問のまま続けられます。';
         });
       }
     } finally {
@@ -334,20 +392,31 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
         setState(() {
           _loading = false;
           _saving = false;
+          _changingQuestion = false;
         });
       }
     }
   }
 
-  Future<void> _answer() async {
+  bool _sameQuestion(String a, String b) {
+    return FirstDigContext.normalize(a) == FirstDigContext.normalize(b);
+  }
+
+  Future<void> _answer({bool undecided = false}) async {
     final question = _question;
-    if (_busy || _leaving || question == null || !_canAnswer) return;
+    if (_busy || _leaving || question == null || (!undecided && !_canAnswer)) {
+      return;
+    }
     final free = _freeCtrl.text.trim();
-    final answer = free.isNotEmpty ? free : _selectedChoice;
+    final answer = undecided
+        ? 'まだ分からない'
+        : (free.isNotEmpty ? free : _selectedChoice);
     if (answer == null || answer.isEmpty) return;
     FocusScope.of(context).unfocus();
     setState(() => _saving = true);
     final previousContrarian = _session.contrarianAsked;
+    final previousDraft = _session.reviewDraft;
+    final wasOpen = _session.reviewOpen;
     final entry = QaEntry(
       questionId: question.id,
       question: question.text,
@@ -355,8 +424,12 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       choices: question.choices,
       contrarian: question.isContrarian,
       source: question.source,
+      axis: question.axis,
+      undecided: undecided,
     );
     _session.answers.add(entry);
+    _session.reviewDraft = null;
+    _session.reviewOpen = false;
     if (entry.contrarian) _session.contrarianAsked = true;
     _session.pendingQuestion = null;
     try {
@@ -365,6 +438,8 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       _session.answers.remove(entry);
       _session.pendingQuestion = question;
       _session.contrarianAsked = previousContrarian;
+      _session.reviewDraft = previousDraft;
+      _session.reviewOpen = wasOpen;
       if (mounted && !_leaving) {
         setState(() => _saving = false);
         _showSaveError();
@@ -372,6 +447,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       return;
     }
     if (!mounted || _leaving) return;
+    _unsavedDraft = null;
     _freeCtrl.clear();
     setState(() {
       _question = null;
@@ -380,27 +456,24 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       _retryNotice = null;
     });
     if (_backgrounded) {
+      if (_atOpeningCheckpoint) return;
       setState(() => _failure = '回答を保存しました。続きから再開できます。');
       return;
     }
     if (_sessionComplete) {
       await _summarize();
-    } else {
+    } else if (!_atOpeningCheckpoint) {
       await _loadQuestion();
     }
   }
 
   Future<void> _summarize({bool templateOnly = false}) async {
+    if (!canSummarizeSession(_session) || _saving || _leaving || _reviewing) {
+      return;
+    }
     final request = ++_request;
-    setState(() {
-      _summarizing = true;
-      _loading = false;
-      _phase = null;
-      _failure = null;
-      _retryNotice = null;
-    });
-    PlanMemo? memo;
-    final previousPending = _session.pendingQuestion;
+    final earlierDraft = _session.reviewDraft;
+    final cachedDraft = earlierDraft ?? _unsavedDraft;
     final answers = List<QaEntry>.of(_session.answers);
     final input = MemoInput(
       title: idea.title,
@@ -408,43 +481,66 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       sessionId: _session.id,
       answerCount: answers.length,
     );
+    setState(() {
+      _summarizing = cachedDraft == null;
+      _saving = cachedDraft != null;
+      _loading = false;
+      _phase = null;
+      _failure = null;
+      _retryNotice = null;
+      _retrySummary = false;
+    });
     try {
-      memo = (await _backend.summarize(
-        idea: Idea(
-          id: idea.id,
-          title: input.title,
-          note: input.note,
-          createdAt: idea.createdAt,
-          memos: List.of(idea.memos),
-        ),
-        history: answers,
-        version: idea.memos.length + 1,
-        style: widget.store.digStyle,
-        templateOnly: templateOnly,
-      )).copyWith(input: input);
+      final generated = cachedDraft?.memo ?? await _backend.summarize(
+          idea: Idea(
+            id: idea.id,
+            title: input.title,
+            note: input.note,
+            createdAt: idea.createdAt,
+            memos: List.of(idea.memos),
+          ),
+          history: answers,
+          version: idea.memos.length + 1,
+          style: widget.store.digStyle,
+          templateOnly: templateOnly,
+          reviewDraft: true,
+        );
       if (!_current(request)) return;
-      idea.memos.add(memo);
-      _session.finished = true;
-      _session.pendingQuestion = null;
+      final draft = cachedDraft ?? MemoDraft(
+        revision: DateTime.now().microsecondsSinceEpoch.toString(),
+        memo: generated.copyWith(
+          input: input,
+          openQuestions: generated.openQuestions ?? '',
+        ),
+      );
+      _unsavedDraft = draft;
       setState(() {
         _summarizing = false;
         _saving = true;
       });
-      await _persist();
+      await widget.store.saveMemoDraft(
+        ideaId: idea.id,
+        sessionId: _session.id,
+        expectedRevision: earlierDraft?.revision,
+        draft: draft,
+        reviewOpen: true,
+      );
+      if (!mounted || !_current(request)) return;
+      _unsavedDraft = null;
+      _reviewEdit = draft.memo;
+      if (_backend.lastRemoteError case final failure?) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(failure.message)));
+      }
     } on AiCancelled {
       return;
     } catch (_) {
-      if (memo != null && idea.memos.remove(memo)) {
-        _session.finished = false;
-        _session.pendingQuestion = previousPending;
-      }
       if (_current(request)) {
         setState(() {
-          _failure = '企画メモを保存できませんでした。もう一度お試しください。';
+          _failure = '企画メモの下書きを保存できませんでした。もう一度お試しください。';
           _retrySummary = true;
         });
       }
-      return;
     } finally {
       if (_current(request)) {
         setState(() {
@@ -453,12 +549,81 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
         });
       }
     }
-    if (!mounted || !_current(request)) return;
-    final failure = _backend.lastRemoteError;
-    if (failure != null) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(failure.message)));
+  }
+
+  Future<void> _saveReviewEdits({
+    bool reviewOpen = true,
+    bool force = false,
+  }) async {
+    final draft = _session.reviewDraft;
+    final edited = _reviewEdit;
+    if (draft == null || edited == null ||
+        (!force && identical(edited, draft.memo) && _session.reviewOpen == reviewOpen)) {
+      return;
     }
+    await widget.store.saveMemoDraft(
+      ideaId: idea.id,
+      sessionId: _session.id,
+      expectedRevision: draft.revision,
+      draft: MemoDraft(revision: draft.revision, memo: edited),
+      reviewOpen: reviewOpen,
+    );
+  }
+
+  Future<void> _flushReviewOnBlur() async {
+    if (_saving || _leaving || !_reviewing) return;
+    try {
+      await _saveReviewEdits();
+    } catch (_) {
+      if (mounted && _reviewing && !_leaving) _showSaveError();
+    }
+  }
+
+  Future<void> _returnToQuestions({bool leave = false}) async {
+    if (_saving || _leaving) return;
+    FocusScope.of(context).unfocus();
+    setState(() => _saving = true);
+    try {
+      await _saveReviewEdits(reviewOpen: leave, force: true);
+      if (!mounted) return;
+      if (leave) {
+        _leaving = true;
+        Navigator.pop(context);
+      } else {
+        setState(() => _question = _session.pendingQuestion);
+      }
+    } catch (_) {
+      if (mounted) _showSaveError();
+    } finally {
+      if (mounted && !_leaving) setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _confirmReview() async {
+    final draft = _session.reviewDraft;
+    final edited = _reviewEdit;
+    if (_saving || _leaving || draft == null || edited == null ||
+        !edited.canConfirm(idea)) {
+      return;
+    }
+    FocusScope.of(context).unfocus();
+    setState(() => _saving = true);
+    try {
+      await widget.store.confirmMemoDraft(
+        ideaId: idea.id,
+        sessionId: _session.id,
+        revision: draft.revision,
+        edited: edited,
+      );
+    } catch (_) {
+      if (mounted) {
+        setState(() => _saving = false);
+        _showSaveError();
+      }
+      return;
+    }
+    if (!mounted) return;
+    _leaving = true;
     if (widget.fromDetail) {
       Navigator.pop(context, true);
     } else {
@@ -477,9 +642,16 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
 
   void _useTemplate() {
     final summary = _summarizing;
+    final changingQuestion = _changingQuestion && _loading;
     _stopGeneration();
     if (summary) {
       _summarize(templateOnly: true);
+    } else if (changingQuestion) {
+      setState(() {
+        _loading = false;
+        _changingQuestion = false;
+      });
+      _changeQuestion(different: true, templateOnly: true);
     } else {
       _loadQuestion(templateOnly: true);
     }
@@ -497,8 +669,12 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     if (_busy || _leaving) return;
     final previousPending = _session.pendingQuestion;
     final previousContrarian = _session.contrarianAsked;
+    final previousDraft = _session.reviewDraft;
+    final wasOpen = _session.reviewOpen;
     final removed = undoLastAnswer(_session);
     if (removed == null) return;
+    _session.reviewDraft = null;
+    _session.reviewOpen = false;
     setState(() => _saving = true);
     try {
       await _persist();
@@ -507,12 +683,16 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       setState(() {
         _selectedChoice = null;
         _question = _session.pendingQuestion;
+        _reviewEdit = null;
+        _unsavedDraft = null;
         _retryNotice = null;
       });
     } catch (_) {
       _session.answers.add(removed);
       _session.pendingQuestion = previousPending;
       _session.contrarianAsked = previousContrarian;
+      _session.reviewDraft = previousDraft;
+      _session.reviewOpen = wasOpen;
       if (mounted && !_leaving) _showSaveError();
     } finally {
       if (mounted && !_leaving) setState(() => _saving = false);
@@ -591,8 +771,53 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     DigStyle.boss => '上司',
   };
 
+  Widget _buildReview() {
+    final draft = _session.reviewDraft!;
+    final edited = _reviewEdit ?? draft.memo;
+    return PopScope<bool>(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) unawaited(_returnToQuestions(leave: true));
+      },
+      child: GlassBackground(
+        child: Scaffold(
+          backgroundColor: Colors.transparent,
+          appBar: AppBar(
+            leading: BackButton(
+              onPressed: _saving
+                  ? null
+                  : () => _returnToQuestions(leave: true),
+            ),
+            title: const Text('企画メモを確認'),
+            backgroundColor: Colors.transparent,
+            elevation: 0,
+            scrolledUnderElevation: 0,
+          ),
+          body: SafeArea(
+            top: false,
+            child: MemoReviewPane(
+              key: ValueKey(draft.revision),
+              idea: idea,
+              memo: edited,
+              busy: _saving,
+              canSave: edited.canConfirm(idea),
+              onChanged: (memo) => setState(() => _reviewEdit = memo),
+              onBlur: () => unawaited(_flushReviewOnBlur()),
+              onSave: _confirmReview,
+              onReturnToQuestions: _sessionComplete ? null : _returnToQuestions,
+              onEditLastAnswer: _sessionComplete && canUndoLastAnswer(_session)
+                  ? _undo
+                  : null,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (_reviewing) return _buildReview();
     final done = _session.answers.length;
     final canSummarize = canSummarizeSession(_session);
     final displaySource = _question?.source ?? _backend.lastSource;
@@ -609,6 +834,15 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     final canRetryAi = _canRetryWithAi();
     final reduceMotion = MediaQuery.disableAnimationsOf(context);
     final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+    final canInteract = !_busy && _failure == null;
+    final VoidCallback? primaryAction;
+    if (!canInteract) {
+      primaryAction = null;
+    } else if (_atOpeningCheckpoint) {
+      primaryAction = _loadQuestion;
+    } else {
+      primaryAction = _question != null && _canAnswer ? _answer : null;
+    }
 
     return PopScope<bool>(
       canPop: !_saving,
@@ -762,6 +996,8 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                               ],
                             ),
                           )
+                        : _atOpeningCheckpoint
+                        ? const Center(child: Text('ここまでの回答を保存しました。'))
                         : const SizedBox.shrink(),
                   ),
                   const SizedBox(height: 12),
@@ -772,14 +1008,11 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                       foregroundColor: Colors.white,
                       padding: const EdgeInsets.symmetric(vertical: 14),
                     ),
-                    onPressed:
-                        !_busy &&
-                            _failure == null &&
-                            _question != null &&
-                            _canAnswer
-                        ? _answer
-                        : null,
-                    child: const Text('答える', style: TextStyle(fontSize: 16)),
+                    onPressed: primaryAction,
+                    child: Text(
+                      _atOpeningCheckpoint ? 'もう1問' : '答える',
+                      style: const TextStyle(fontSize: 16),
+                    ),
                   ),
                   const SizedBox(height: 6),
                   Row(
@@ -802,7 +1035,11 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                               !_busy && _failure == null && canSummarize
                               ? () => _summarize()
                               : null,
-                          child: const Text('いったんまとめる'),
+                          child: Text(
+                            _atOpeningCheckpoint
+                                ? 'ここまでをまとめる'
+                                : 'いったんまとめる',
+                          ),
                         ),
                       ),
                     ],
@@ -862,6 +1099,21 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
               if (_freeCtrl.text.trim().isNotEmpty) _selectedChoice = null;
             }),
           ),
+          if (_openingTurn)
+            Wrap(
+              spacing: 8,
+              children: [
+                TextButton(
+                  onPressed: () => _answer(undecided: true),
+                  child: const Text('まだ分からない'),
+                ),
+                if (_canReplaceQuestion)
+                  TextButton(
+                    onPressed: () => _changeQuestion(different: true),
+                    child: const Text('別の質問'),
+                  ),
+              ],
+            ),
         ],
       ),
     );

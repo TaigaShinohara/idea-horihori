@@ -324,6 +324,97 @@ class IdeaStore extends ChangeNotifier {
     notifyListeners();
   });
 
+  (Idea, DigSession) _digSession(String ideaId, String sessionId) {
+    for (final idea in ideas) {
+      if (idea.id != ideaId || idea.archived) continue;
+      for (final session in idea.sessions) {
+        if (session.id == sessionId) return (idea, session);
+      }
+    }
+    throw const StoreFailure('深掘りの記録を確認できませんでした。');
+  }
+
+  Future<void> saveMemoDraft({
+    required String ideaId,
+    required String sessionId,
+    required String? expectedRevision,
+    required MemoDraft draft,
+    required bool reviewOpen,
+  }) => _changeIdeas(() async {
+    final (_, session) = _digSession(ideaId, sessionId);
+    final previous = session.reviewDraft;
+    final wasOpen = session.reviewOpen;
+    if (session.finished ||
+        previous?.revision != expectedRevision ||
+        draft.memo.input?.sessionId != session.id ||
+        draft.memo.input?.answerCount != session.answers.length) {
+      throw const StoreFailure('深掘りの記録が更新されました。');
+    }
+    session.reviewDraft = draft;
+    session.reviewOpen = reviewOpen;
+    try {
+      await _saveIdeas();
+    } catch (_) {
+      session.reviewDraft = previous;
+      session.reviewOpen = wasOpen;
+      rethrow;
+    }
+    notifyListeners();
+  });
+
+  Future<PlanMemo> confirmMemoDraft({
+    required String ideaId,
+    required String sessionId,
+    required String revision,
+    required PlanMemo edited,
+  }) => _changeIdeas(() async {
+    final (idea, session) = _digSession(ideaId, sessionId);
+    if (session.finished) {
+      for (final memo in idea.memos.reversed) {
+        if (memo.input?.sessionId == session.id) return memo;
+      }
+      throw const StoreFailure('すでに完了した深掘りです。');
+    }
+    final draft = session.reviewDraft;
+    if (draft == null ||
+        draft.revision != revision ||
+        draft.memo.input?.answerCount != session.answers.length) {
+      throw const StoreFailure('深掘りの記録が更新されました。');
+    }
+    final memo = draft.memo.copyWith(
+      what: edited.what.trim(),
+      who: edited.who.trim(),
+      why: edited.why.trim(),
+      how: edited.how.trim(),
+      nextStep: edited.nextStep.trim(),
+      openQuestions: edited.openQuestions?.trim() ?? '',
+      createdAt: _now(),
+      version: idea.memos.length + 1,
+    );
+    if (!memo.canConfirm(idea)) {
+      throw const StoreFailure('保存する内容を入力してください。');
+    }
+    final pending = session.pendingQuestion;
+    final wasOpen = session.reviewOpen;
+    idea.memos.add(memo);
+    session.finished = true;
+    session.pendingQuestion = null;
+    session.reviewDraft = null;
+    session.reviewOpen = false;
+    try {
+      await _saveIdeas();
+    } catch (_) {
+      idea.memos.removeLast();
+      session.finished = false;
+      session.pendingQuestion = pending;
+      session.reviewDraft = draft;
+      session.reviewOpen = wasOpen;
+      rethrow;
+    }
+    notifyListeners();
+    return memo;
+  });
+
   Future<void> archiveIdea(Idea idea) => _setArchived(idea, true);
 
   /// アーカイブから一覧へ戻す。
@@ -553,7 +644,9 @@ class IdeaStore extends ChangeNotifier {
   ResilientBackend backend() => ResilientBackend(
     null,
     onDevice: onDeviceBackend(),
-    chatGpt: chatGptSignedIn ? ChatGptBackend() : null,
+    chatGpt: chatGptSignedIn
+        ? ChatGptBackend(maySend: () => chatGptSignedIn)
+        : null,
     remoteFactory: _remote,
   );
 
