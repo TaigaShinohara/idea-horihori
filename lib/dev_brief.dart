@@ -7,12 +7,34 @@ import 'models.dart';
 String buildDevBrief(Idea idea, {PlanMemo? memo}) {
   memo ??= idea.memos.isEmpty ? null : idea.memos.last;
   final input = memo?.input;
+  final reviewed = memo?.openQuestions != null;
   final buf = StringBuffer();
   buf.writeln('アプリ開発の指示書: ${input?.title ?? idea.title}');
   buf.writeln();
 
   if (memo == null) {
     buf.writeln('（まだ企画メモがない）');
+  } else if (reviewed) {
+    buf.writeln('## 決めたこと');
+    for (final (label, value) in [
+      ('何を作る', memo.what),
+      ('誰に', memo.who),
+      ('なぜ', memo.why),
+      ('どうやって', memo.how),
+    ]) {
+      if (value.isNotEmpty) buf.writeln('- $label: $value');
+    }
+    if (!memo.hasConfirmedDetails) buf.writeln('（確認中）');
+    if (memo.openQuestions!.isNotEmpty) {
+      buf.writeln();
+      buf.writeln('## 未確認のこと');
+      buf.writeln(memo.openQuestions);
+    }
+    if (memo.nextStep.isNotEmpty) {
+      buf.writeln();
+      buf.writeln('## 次に試すこと');
+      buf.writeln(memo.nextStep);
+    }
   } else {
     buf.writeln('## 企画メモ');
     buf.writeln('- 何を作る: ${memo.what}');
@@ -49,6 +71,14 @@ String buildDevBrief(Idea idea, {PlanMemo? memo}) {
   if (input != null) {
     buf.writeln('元メモの制約を守り、矛盾や未確認の要件は実装前に本人へ確認してください。');
   }
-  buf.write('この企画でアプリを作ってください。まず設計案と画面一覧を出し、最小構成で動くところまで作ってください。');
+  if (reviewed) {
+    if (memo!.what.trim().isEmpty) {
+      buf.write('元メモと回答を読み、先に作るものと検証する仮説を本人に確認してください。');
+    } else {
+      buf.write('決めたことをもとに最小構成の設計案を作り、未確認のことは検証項目として扱ってください。');
+    }
+  } else {
+    buf.write('この企画でアプリを作ってください。まず設計案と画面一覧を出し、最小構成で動くところまで作ってください。');
+  }
   return buf.toString();
 }

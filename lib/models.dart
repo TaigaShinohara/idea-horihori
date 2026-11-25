@@ -41,6 +41,7 @@ class DigQuestion {
   final String text;
   final List<String> choices; // 最大3つ。3つ目は「広げる」選択肢
   final AnswerSource? source;
+  final String? axis;
 
   /// 逆張り質問かどうか（v0.2 項目3）。旧データには無いので既定 false。
   final bool isContrarian;
@@ -50,6 +51,7 @@ class DigQuestion {
     required this.choices,
     this.isContrarian = false,
     this.source,
+    this.axis,
   });
 
   DigQuestion copyWith({bool? isContrarian, AnswerSource? source}) =>
@@ -59,6 +61,7 @@ class DigQuestion {
         choices: choices,
         isContrarian: isContrarian ?? this.isContrarian,
         source: source ?? this.source,
+        axis: axis,
       );
 
   Map<String, dynamic> toJson() => {
@@ -67,6 +70,7 @@ class DigQuestion {
     'choices': choices,
     'isContrarian': isContrarian,
     if (source != null) 'source': source!.name,
+    if (axis != null) 'axis': axis,
   };
   factory DigQuestion.fromJson(Map<String, dynamic> j) => DigQuestion(
     id: j['id'] as String,
@@ -74,6 +78,7 @@ class DigQuestion {
     choices: (j['choices'] as List).map((e) => e.toString()).toList(),
     isContrarian: j['isContrarian'] as bool? ?? false,
     source: AnswerSource.fromJson(j['source']),
+    axis: j['axis'] is String ? j['axis'] as String : null,
   );
 }
 
@@ -83,6 +88,8 @@ class QaEntry {
   final String question;
   final String answer;
   final AnswerSource? source;
+  final String? axis;
+  final bool undecided;
 
   /// 回答時に提示されていた選択肢（v0.2 項目7）。
   /// 「1問もどる」で質問を復元するために記録する。旧データでは null で、
@@ -98,7 +105,12 @@ class QaEntry {
     this.choices,
     this.contrarian = false,
     this.source,
+    this.axis,
+    this.undecided = false,
   });
+
+  String get substantiveAnswer =>
+      undecided || isDigAnswerFiller(answer) ? '' : answer.trim();
 
   Map<String, dynamic> toJson() => {
     'questionId': questionId,
@@ -107,6 +119,8 @@ class QaEntry {
     'choices': choices,
     'contrarian': contrarian,
     if (source != null) 'source': source!.name,
+    if (axis != null) 'axis': axis,
+    if (undecided) 'undecided': true,
   };
   factory QaEntry.fromJson(Map<String, dynamic> j) => QaEntry(
     questionId: j['questionId'] as String,
@@ -115,6 +129,8 @@ class QaEntry {
     choices: (j['choices'] as List?)?.map((e) => e.toString()).toList(),
     contrarian: j['contrarian'] as bool? ?? false,
     source: AnswerSource.fromJson(j['source']),
+    axis: j['axis'] is String ? j['axis'] as String : null,
+    undecided: j['undecided'] == true,
   );
 }
 
@@ -178,6 +194,8 @@ class PlanMemo {
   final int version;
   final AnswerSource? source;
   final MemoInput? input;
+  /// 確認画面を通るメモでは空文字も可。null は従来の形式。
+  final String? openQuestions;
 
   /// 企画の体力測定（v0.2 項目4）: 作りやすさ／ワクワク度（各1〜3）。
   /// 旧メモには無いので nullable。null のときは表示自体を出さない。
@@ -195,24 +213,51 @@ class PlanMemo {
     this.spark,
     this.source,
     this.input,
+    this.openQuestions,
   });
 
-  PlanMemo copyWith({AnswerSource? source, MemoInput? input}) => PlanMemo(
-    what: what,
-    who: who,
-    why: why,
-    how: how,
-    nextStep: nextStep,
-    createdAt: createdAt,
-    version: version,
-    ease: ease,
-    spark: spark,
+  PlanMemo copyWith({
+    AnswerSource? source,
+    MemoInput? input,
+    String? what,
+    String? who,
+    String? why,
+    String? how,
+    String? nextStep,
+    String? openQuestions,
+    DateTime? createdAt,
+    int? version,
+  }) => PlanMemo(
+    what: what ?? this.what,
+    who: who ?? this.who,
+    why: why ?? this.why,
+    how: how ?? this.how,
+    nextStep: nextStep ?? this.nextStep,
+    createdAt: createdAt ?? this.createdAt,
+    version: version ?? this.version,
+    ease: openQuestions == null && this.openQuestions == null ? ease : null,
+    spark: openQuestions == null && this.openQuestions == null ? spark : null,
     source: source ?? this.source,
     input: input ?? this.input,
+    openQuestions: openQuestions ?? this.openQuestions,
   );
 
   /// 体力測定が1つでも入っているか。
   bool get hasFitness => ease != null || spark != null;
+
+  bool get hasConfirmedDetails =>
+      [what, who, why, how].any((field) => field.trim().isNotEmpty);
+
+  bool get hasReviewContent =>
+      hasConfirmedDetails ||
+      nextStep.trim().isNotEmpty ||
+      (openQuestions?.trim().isNotEmpty ?? false);
+
+  bool canConfirm(Idea idea) =>
+      hasReviewContent ||
+      (input?.note.trim().isNotEmpty ?? false) ||
+      (input?.answersFor(idea).any((entry) =>
+          entry.substantiveAnswer.isNotEmpty) ?? false);
 
   Map<String, dynamic> toJson() => {
     'what': what,
@@ -226,6 +271,7 @@ class PlanMemo {
     'spark': spark,
     if (source != null) 'source': source!.name,
     if (input != null) 'input': input!.toJson(),
+    if (openQuestions != null) 'openQuestions': openQuestions,
   };
   factory PlanMemo.fromJson(Map<String, dynamic> j) => PlanMemo(
     what: j['what'] as String? ?? '',
@@ -240,7 +286,39 @@ class PlanMemo {
     spark: fitnessValueOrNull(j['spark']),
     source: AnswerSource.fromJson(j['source']),
     input: MemoInput.fromJson(j['input']),
+    openQuestions: j['openQuestions'] is String
+        ? j['openQuestions'] as String
+        : null,
   );
+}
+
+class MemoDraft {
+  final String revision;
+  final PlanMemo memo;
+
+  const MemoDraft({required this.revision, required this.memo});
+
+  Map<String, dynamic> toJson() => {
+    'revision': revision,
+    'memo': memo.toJson(),
+  };
+
+  static MemoDraft? fromJson(Object? value) {
+    if (value case {
+      'revision': final String revision,
+      'memo': final Map<String, dynamic> json,
+    } when revision.isNotEmpty) {
+      try {
+        final memo = PlanMemo.fromJson(json);
+        if (memo.input != null && memo.openQuestions != null) {
+          return MemoDraft(revision: revision, memo: memo);
+        }
+      } on TypeError {
+        // 下書きの破損で、回答や保存済みの版まで失わない。
+      }
+    }
+    return null;
+  }
 }
 
 /// 体力測定の値を 1〜3 に収める。範囲外・欠落・型違いは null（表示なし）。
@@ -262,6 +340,10 @@ class DigSession {
   final List<QaEntry> answers;
   DigQuestion? pendingQuestion; // 次に答える質問（再開時に復元）
   bool finished;
+  final bool guidedOpening;
+  final Set<int> replacedPositions;
+  MemoDraft? reviewDraft;
+  bool reviewOpen;
 
   /// 視点掘りの視点（v0.2 項目2）。旧データは none 扱い。
   DigViewpoint viewpoint;
@@ -276,7 +358,12 @@ class DigSession {
     this.finished = false,
     this.viewpoint = DigViewpoint.none,
     this.contrarianAsked = false,
-  }) : answers = answers ?? [];
+    this.guidedOpening = false,
+    Set<int>? replacedPositions,
+    this.reviewDraft,
+    this.reviewOpen = false,
+  }) : answers = answers ?? [],
+       replacedPositions = replacedPositions ?? <int>{};
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -286,6 +373,11 @@ class DigSession {
         'finished': finished,
         'viewpoint': viewpoint.storageValue,
         'contrarianAsked': contrarianAsked,
+        if (guidedOpening) 'guidedOpening': true,
+        if (replacedPositions.isNotEmpty)
+          'replacedPositions': replacedPositions.toList(),
+        if (reviewDraft != null) 'reviewDraft': reviewDraft!.toJson(),
+        if (reviewDraft != null && reviewOpen) 'reviewOpen': true,
       };
   factory DigSession.fromJson(Map<String, dynamic> j) => DigSession(
         id: j['id'] as String,
@@ -299,6 +391,13 @@ class DigSession {
         finished: j['finished'] as bool? ?? false,
         viewpoint: DigViewpointX.fromStorage(j['viewpoint'] as String?),
         contrarianAsked: j['contrarianAsked'] as bool? ?? false,
+        guidedOpening: j['guidedOpening'] == true,
+        replacedPositions: switch (j['replacedPositions']) {
+          final List<dynamic> positions => positions.whereType<int>().toSet(),
+          _ => null,
+        },
+        reviewDraft: MemoDraft.fromJson(j['reviewDraft']),
+        reviewOpen: j['reviewOpen'] == true,
       );
 }
 

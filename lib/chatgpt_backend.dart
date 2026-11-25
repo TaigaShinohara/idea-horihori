@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'ai_backend.dart';
 import 'chatgpt_auth_service.dart';
 import 'dig_mode.dart';
+import 'first_dig.dart';
 import 'models.dart';
 import 'prompts.dart';
 
@@ -24,13 +25,18 @@ class ChatGptException implements Exception {
 /// 動かなくなる可能性がある。プロンプトと JSON パースは他バックエンドと
 /// 共通の [Prompts] を使い、実装の型は [OnDeviceBackend] と揃える。
 /// 設計は ProfileMaker の ChatGPT 実装と同一方式（v0.4.0）。
-class ChatGptBackend implements AiBackend {
+class ChatGptBackend implements GuidedDigBackend {
   final ChatGptAuthService _auth;
   final http.Client _client;
+  final bool Function()? maySend;
+  int _revision = 0;
 
-  ChatGptBackend({ChatGptAuthService? authService, http.Client? client})
-    : _auth = authService ?? ChatGptAuthService(),
-      _client = client ?? http.Client();
+  ChatGptBackend({
+    ChatGptAuthService? authService,
+    http.Client? client,
+    this.maySend,
+  }) : _auth = authService ?? ChatGptAuthService(),
+       _client = client ?? http.Client();
 
   static const String endpoint =
       'https://chatgpt.com/backend-api/codex/responses';
@@ -67,13 +73,25 @@ class ChatGptBackend implements AiBackend {
     return buffer.toString();
   }
 
-  Future<String> _generate(String prompt) async {
+  void cancelPending() => _revision++;
+
+  void _checkCurrent(int revision) {
+    if (revision != _revision) throw const AiCancelled();
+    if (maySend?.call() == false) {
+      throw ChatGptException('ChatGPTへの送信を停止しました');
+    }
+  }
+
+  Future<String> _generate(String prompt, int revision) async {
     try {
+      _checkCurrent(revision);
       final token = await _auth.getValidAccessToken();
+      _checkCurrent(revision);
       if (token == null) {
         throw ChatGptException('ChatGPTにサインインしていない');
       }
       final accountId = await _auth.getAccountId();
+      _checkCurrent(revision);
       final res = await _client
           .post(
             Uri.parse(endpoint),
@@ -99,13 +117,11 @@ class ChatGptBackend implements AiBackend {
           )
           .timeout(
             generateTimeout,
-            onTimeout: () =>
-                throw ChatGptException('ChatGPTの生成がタイムアウトした'),
+            onTimeout: () => throw ChatGptException('ChatGPTの生成がタイムアウトした'),
           );
+      _checkCurrent(revision);
       if (res.statusCode != 200) {
-        throw ChatGptException(
-          'ChatGPTでの生成に失敗した (Status: ${res.statusCode})',
-        );
+        throw ChatGptException('ChatGPTでの生成に失敗した (Status: ${res.statusCode})');
       }
       final decoded = jsonDecode(utf8.decode(res.bodyBytes));
       if (decoded is! Map<String, dynamic>) {
@@ -114,10 +130,14 @@ class ChatGptBackend implements AiBackend {
       final text = extractOutputText(decoded);
       if (text.trim().isEmpty) throw ChatGptException('ChatGPTの応答が空だった');
       return text;
+    } on AiCancelled {
+      rethrow;
     } on ChatGptException catch (e) {
+      if (revision != _revision) throw const AiCancelled();
       lastError = e.message;
       rethrow;
     } catch (e) {
+      if (revision != _revision) throw const AiCancelled();
       lastError = 'generation failed: $e';
       throw ChatGptException('generation failed: $e');
     }
@@ -129,8 +149,10 @@ class ChatGptBackend implements AiBackend {
     T? Function(String text) parse,
     String what,
   ) async {
+    final revision = ++_revision;
+    lastError = null;
     for (var attempt = 1; attempt <= 2; attempt++) {
-      final text = await _generate(prompt);
+      final text = await _generate(prompt, revision);
       final parsed = parse(text);
       if (parsed != null) return parsed;
     }
@@ -144,7 +166,27 @@ class ChatGptBackend implements AiBackend {
     DigStyle style = DigStyle.friend,
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
+    FirstDigContext? firstDig,
   }) async {
+    if (firstDig != null) {
+      final input = Prompts.firstDigQuestion(
+        title: idea.title,
+        note: idea.note,
+        context: firstDig,
+          style: style,
+        viewpoint: viewpoint,
+      );
+      return _generateParsed(
+        input.prompt,
+        (text) => Prompts.parseFirstDigQuestion(
+          text,
+          context: firstDig,
+          anchorSource: input.anchorSource,
+        style: style,
+        ),
+        'question',
+      );
+    }
     final q = await _generateParsed(
       Prompts.nextQuestion(
         title: idea.title,
@@ -167,16 +209,25 @@ class ChatGptBackend implements AiBackend {
     required List<QaEntry> history,
     required int version,
     DigStyle style = DigStyle.friend,
+    bool reviewDraft = false,
   }) async {
+    final note = idea.note;
     return _generateParsed(
       Prompts.summarize(
         title: idea.title,
-        note: idea.note,
+        note: note,
         history: history,
         latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
         style: style,
+        reviewDraft: reviewDraft,
       ),
-      (text) => Prompts.parseMemo(text, version: version),
+      (text) => Prompts.parseMemo(
+        text,
+        version: version,
+        reviewDraft: reviewDraft,
+        history: history,
+        note: note,
+      ),
       'memo',
     );
   }

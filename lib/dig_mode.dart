@@ -2,6 +2,29 @@
 /// UI・バックエンド双方から使え、単体テストで検証できる形に寄せている。
 library;
 
+final _ignoredDigPunctuation = RegExp(r'[\s　。、！？!?.,．：:・「」『』]');
+
+String normalizeDigText(String text) =>
+    text.toLowerCase().replaceAll(_ignoredDigPunctuation, '');
+
+bool isDigAnswerFiller(String text) => switch (normalizeDigText(text)) {
+  '' ||
+  'はい' ||
+  'いいえ' ||
+  'それ' ||
+  '特になし' ||
+  'わからない' ||
+  '分からない' ||
+  'まだわからない' ||
+  'まだ分からない' ||
+  '未定' ||
+  'yes' ||
+  'no' ||
+  'that' ||
+  'idk' => true,
+  _ => false,
+};
+
 /// 深掘りの現在モード。
 enum DigModeKind {
   /// オンデバイスAI（Gemini Nano）が質問している（v0.3.0 PoC）。

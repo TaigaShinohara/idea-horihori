@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -15,6 +16,20 @@ class _FakeAuth extends ChatGptAuthService {
   @override
   Future<String?> getAccountId() async => 'acc-1';
 }
+
+class _WaitingAuth extends _FakeAuth {
+  final requested = Completer<void>();
+  final token = Completer<String?>();
+
+  @override
+  Future<String?> getValidAccessToken() {
+    requested.complete();
+    return token.future;
+  }
+}
+
+Idea _fixtureIdea() =>
+    Idea(id: 'fixture', title: '試作を記録するアプリ', createdAt: DateTime(2026));
 
 String _codexResponse(String text) => jsonEncode({
   'output': [
@@ -81,6 +96,76 @@ void main() {
   });
 
   group('ChatGPT バックエンド', () {
+    test('認証待ちの取消後は生成を送信しない', () async {
+      final auth = _WaitingAuth();
+      var sends = 0;
+      final backend = ResilientBackend(
+        null,
+        chatGpt: ChatGptBackend(
+          authService: auth,
+          client: MockClient((_) async {
+            sends++;
+            return _jsonResponse(_codexResponse('Invalid JSON'));
+          }),
+        ),
+      );
+      final pending = backend.nextQuestion(idea: _fixtureIdea(), history: []);
+      final cancelled = expectLater(pending, throwsA(isA<AiCancelled>()));
+      await auth.requested.future;
+      backend.cancelPending();
+      await cancelled;
+      auth.token.complete('fake-token');
+      await Future<void>.delayed(Duration.zero);
+      expect(sends, 0);
+    });
+
+    test('送信済みの応答が取消後に戻っても再試行しない', () async {
+      final dispatched = Completer<void>();
+      final response = Completer<http.Response>();
+      var sends = 0;
+      final backend = ResilientBackend(
+        null,
+        chatGpt: ChatGptBackend(
+          authService: _FakeAuth(),
+          client: MockClient((_) {
+            sends++;
+            if (!dispatched.isCompleted) dispatched.complete();
+            return response.future;
+          }),
+        ),
+      );
+      final pending = backend.nextQuestion(idea: _fixtureIdea(), history: []);
+      final cancelled = expectLater(pending, throwsA(isA<AiCancelled>()));
+      await dispatched.future;
+      backend.cancelPending();
+      await cancelled;
+      response.complete(_jsonResponse(_codexResponse('Invalid JSON')));
+      await Future<void>.delayed(Duration.zero);
+      expect(sends, 1);
+      expect(backend.lastSource, isNull);
+    });
+
+    test('認証後にサインアウトすると生成を送信しない', () async {
+      final auth = _WaitingAuth();
+      var maySend = true;
+      var sends = 0;
+      final backend = ChatGptBackend(
+        authService: auth,
+        maySend: () => maySend,
+        client: MockClient((_) async {
+          sends++;
+          return _jsonResponse(_codexResponse('Invalid JSON'));
+        }),
+      );
+      final pending = backend.nextQuestion(idea: _fixtureIdea(), history: []);
+      final revoked = expectLater(pending, throwsA(isA<ChatGptException>()));
+      await auth.requested.future;
+      maySend = false;
+      auth.token.complete('fake-token');
+      await revoked;
+      expect(sends, 0);
+    });
+
     test('Responses API の output からテキストを取り出す', () {
       final text = ChatGptBackend.extractOutputText({
         'output': [

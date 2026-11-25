@@ -5,6 +5,7 @@ import 'package:flutter_device_ai/flutter_device_ai.dart';
 
 import 'ai_backend.dart';
 import 'dig_mode.dart';
+import 'first_dig.dart';
 import 'models.dart';
 import 'prompts.dart';
 
@@ -15,6 +16,10 @@ String get onDeviceModelName => defaultTargetPlatform == TargetPlatform.iOS
 String get onDeviceServiceName => defaultTargetPlatform == TargetPlatform.iOS
     ? 'Apple Intelligence'
     : 'AICore';
+
+bool get _usesNativeSchemas =>
+    defaultTargetPlatform == TargetPlatform.iOS ||
+    defaultTargetPlatform == TargetPlatform.macOS;
 
 enum OnDeviceStatus { available, needsDownload, unavailable, checkFailed }
 
@@ -100,12 +105,18 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
   }
 
   @override
-  Future<String> generate(String prompt) async {
+  Future<String> generate(String prompt, {Map<String, Object>? schema}) async {
     final revision = _revision;
     // 専用のシステム指示はNano V3以降で使える。指示はテキストに含める。
-    final session = await _ai.createSession(
-      config: const GenerationConfig(maxTokens: 512, temperature: 0.3),
+    final useSchema = schema != null && _usesNativeSchemas;
+    final config = GenerationConfig(
+      maxTokens: 512,
+      temperature: 0.3,
+      responseFormat: useSchema ? ResponseFormat.json : ResponseFormat.text,
+      schema: useSchema ? schema : null,
+      maxRepairAttempts: 0,
     );
+    final session = await _ai.createSession(config: config);
     try {
       _checkCurrent(revision);
       _session = session;
@@ -167,7 +178,7 @@ class _OnDeviceInputTooLong implements Exception {
   const _OnDeviceInputTooLong();
 }
 
-class OnDeviceBackend implements AiBackend {
+class OnDeviceBackend implements GuidedDigBackend {
   final OnDeviceTextClient _client;
   final Duration statusTimeout;
   final Duration downloadTimeout;
@@ -309,15 +320,21 @@ class OnDeviceBackend implements AiBackend {
 
   Future<T> _generateParsed<T>(
     String Function(int budget) prompt,
-    T? Function(String text) parse, {
+    T? Function(String text, int budget) parse, {
     bool allowDownload = false,
+    Map<String, Object> Function(int budget)? schema,
   }) async {
     final revision = ++_revision;
     _cancelClient();
     lastError = null;
     try {
       await _prepare(revision, allowDownload: allowDownload);
-      return await _tryOutput(revision, prompt, parse).timeout(generateTimeout);
+      return await _tryOutput(
+        revision,
+        prompt,
+        parse,
+        schema,
+      ).timeout(generateTimeout);
     } on TimeoutException {
       _checkCurrent(revision);
       final phase = lifecycle;
@@ -346,7 +363,8 @@ class OnDeviceBackend implements AiBackend {
   Future<T> _tryOutput<T>(
     int revision,
     String Function(int budget) prompt,
-    T? Function(String text) parse,
+    T? Function(String text, int budget) parse,
+    Map<String, Object> Function(int budget)? schema,
   ) async {
     var budget = Prompts.nanoBudget;
     var inputTooLong = false;
@@ -354,13 +372,19 @@ class OnDeviceBackend implements AiBackend {
       _checkCurrent(revision);
       inputTooLong = false;
       try {
-        final text = await _client.generate(prompt(budget));
+        final client = _client;
+        final input = prompt(budget);
+        final text = client is FlutterOnDeviceClient
+            ? await client.generate(input, schema: schema?.call(budget))
+            : await client.generate(input);
         _checkCurrent(revision);
-        final value = parse(text);
+        final value = parse(text, budget);
         if (value != null) return value;
       } on _OnDeviceInputTooLong {
         inputTooLong = true;
         budget = Prompts.compactNanoBudget;
+      } on OnDeviceAiStructuredOutputException {
+        // SDKの補修を使わず、既存の生成回数上限でやり直す。
       }
     }
     if (inputTooLong) {
@@ -376,13 +400,41 @@ class OnDeviceBackend implements AiBackend {
     DigStyle style = DigStyle.friend,
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
-  }) => _nextQuestion(
-    idea: idea,
-    history: history,
-    style: style,
-    viewpoint: viewpoint,
-    contrarianDue: contrarianDue,
-  );
+    FirstDigContext? firstDig,
+  }) {
+    if (firstDig != null) {
+      final title = idea.title;
+      final note = idea.note;
+      final context = firstDig;
+      ({String prompt, String anchorSource, Map<String, Object> schema})
+      input(int budget) => Prompts.firstDigQuestion(
+        title: title,
+        note: note,
+        context: context,
+        style: style,
+        viewpoint: viewpoint,
+        budget: budget,
+        structuredOutput: _usesNativeSchemas,
+      );
+      return _generateParsed(
+        (budget) => input(budget).prompt,
+        (text, budget) => Prompts.parseFirstDigQuestion(
+          text,
+          context: context,
+          anchorSource: input(budget).anchorSource,
+          style: style,
+        ),
+        schema: (budget) => input(budget).schema,
+      );
+    }
+    return _nextQuestion(
+      idea: idea,
+      history: history,
+      style: style,
+      viewpoint: viewpoint,
+      contrarianDue: contrarianDue,
+    );
+  }
 
   Future<DigQuestion> _nextQuestion({
     required Idea idea,
@@ -403,7 +455,7 @@ class OnDeviceBackend implements AiBackend {
         contrarian: contrarianDue,
         budget: budget,
       ),
-      Prompts.parseQuestion,
+      (text, _) => Prompts.parseQuestion(text),
       allowDownload: allowDownload,
     );
     return contrarianDue ? question.copyWith(isContrarian: true) : question;
@@ -415,17 +467,31 @@ class OnDeviceBackend implements AiBackend {
     required List<QaEntry> history,
     required int version,
     DigStyle style = DigStyle.friend,
-  }) => _generateParsed(
-    (budget) => Prompts.summarize(
-      title: idea.title,
-      note: idea.note,
-      history: history,
-      latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
-      style: style,
-      budget: budget,
-    ),
-    (text) => Prompts.parseMemo(text, version: version),
-  );
+    bool reviewDraft = false,
+  }) {
+    final note = idea.note;
+    return _generateParsed(
+      (budget) => Prompts.summarize(
+        title: idea.title,
+        note: note,
+        history: history,
+        latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
+        style: style,
+        budget: budget,
+        reviewDraft: reviewDraft,
+        structuredOutput: _usesNativeSchemas,
+      ),
+      (text, budget) => Prompts.parseMemo(
+        text,
+        version: version,
+        reviewDraft: reviewDraft,
+        history: history,
+        budget: budget,
+        note: note,
+      ),
+      schema: reviewDraft ? (_) => Prompts.reviewMemoSchema : null,
+    );
+  }
 
   @override
   Future<List<String>> nameCandidates({required Idea idea}) {
@@ -436,7 +502,7 @@ class OnDeviceBackend implements AiBackend {
         memo: idea.memos.last,
         budget: budget,
       ),
-      (text) {
+      (text, _) {
         final names = Prompts.parseNameCandidates(text);
         return names.length == 3 ? names : null;
       },

@@ -1,5 +1,8 @@
 import 'dig_mode.dart';
+import 'first_dig.dart';
 import 'models.dart';
+import 'prompts.dart';
+import 'review_draft_grounding.dart';
 
 /// APIキー未設定／オフラインでも深掘りが成立するための
 /// 組み込み定型質問セット（5問＝1セッション分）。
@@ -32,6 +35,50 @@ class FallbackQuestions {
       choices: ['まず自分が毎日使う', '知り合いに試してもらう', '似たアプリを調べる'],
     ),
   ];
+
+  static final _firstScene = OpeningFocus.scene.toQuestion();
+  static final _firstObstacle = OpeningFocus.obstacle.toQuestion();
+  static final _firstTest = OpeningFocus.test.toQuestion();
+  static final _firstAudience = OpeningFocus.audience.toQuestion();
+
+  static DigQuestion firstDig(
+    FirstDigContext context,
+    DigStyle style,
+    DigViewpoint viewpoint,
+  ) {
+    final initial = switch (context.firstAnswer) {
+      null => _firstScene,
+      QaEntry(axis: 'test') => _firstObstacle,
+      _ => _firstTest,
+    };
+    final focused = viewpointQuestions[viewpoint] ?? const [];
+    final axes = switch (viewpoint) {
+      DigViewpoint.none => const <String>[],
+      DigViewpoint.money => const ['audience', 'approach', 'test'],
+      DigViewpoint.tech => const ['obstacle', 'test', 'approach'],
+      DigViewpoint.user => const ['scene', 'approach', 'obstacle'],
+    };
+    for (final candidate in {
+      for (var index = 0; index < focused.length; index++)
+        DigQuestion(
+          id: focused[index].id,
+          axis: axes[index],
+          text: focused[index].text,
+          choices: focused[index].choices,
+        ),
+      initial,
+      _firstObstacle,
+      _firstAudience,
+    }) {
+      if (candidate.axis == context.firstAnswer?.axis ||
+          candidate.axis == context.excludedQuestion?.axis) {
+        continue;
+      }
+      final question = styled(candidate, style);
+      if (context.acceptsQuestion(question.text)) return question;
+    }
+    return context.excludedQuestion ?? styled(initial, style);
+  }
 
   /// 回答済み件数の次に出す質問。全部答えたら null。
   static DigQuestion? nextAfter(int answeredCount) {
@@ -150,6 +197,7 @@ class FallbackQuestions {
       id: q.id,
       text: '$prefix${q.text}',
       choices: q.choices,
+      axis: q.axis,
       isContrarian: q.isContrarian,
     );
   }
@@ -159,19 +207,38 @@ class FallbackQuestions {
 class LocalMemoBuilder {
   static PlanMemo build({
     required String title,
+    String note = '',
     required List<QaEntry> answers,
     required int version,
     DateTime? now,
+    bool reviewDraft = false,
   }) {
     final slots = <String, String>{};
+    final selection = <String, String>{};
     for (final question in FallbackQuestions.questions) {
-      for (final entry in answers.reversed) {
-        if (!_matchesTemplate(entry, question) || entry.answer.trim().isEmpty) {
+      for (var index = answers.length - 1; index >= 0; index--) {
+        final entry = answers[index];
+        if (!_matchesTemplate(entry, question) ||
+            entry.undecided ||
+            entry.answer.trim().isEmpty) {
           continue;
         }
-        slots[question.id] = entry.answer;
+        if (reviewDraft) {
+          if (entry.substantiveAnswer.isEmpty) continue;
+          final field = question.id == 'next' ? 'nextStep' : question.id;
+          selection[field] = 'a${index + 1}';
+        } else {
+          slots[question.id] = entry.answer;
+        }
         break;
       }
+    }
+    if (reviewDraft) {
+      return ReviewDraftGrounding.fromAnswers(
+        answers,
+        budget: Prompts.standardBudget,
+        note: note,
+      ).build(version: version, now: now, selection: selection);
     }
 
     String slot(String id) => slots[id] ?? '';
@@ -180,21 +247,22 @@ class LocalMemoBuilder {
     final what = form.isEmpty
         ? title
         : (title.contains('アプリ') || form.contains('アプリ'))
-            ? '「$title」— $form'
-            : '「$title」— $formアプリ';
+        ? '「$title」— $form'
+        : '「$title」— $formアプリ';
 
     // 体力測定（v0.2 項目4）の簡易ルール。単純で説明可能に保つ:
     // - 作りやすさ ease: 「形（what）／どうやって（how）／次の一歩（next）」の
     //   3欄のうち埋まった数（最低1）。作る道筋が見えるほど高い。
     // - ワクワク度 spark: 1 +「誰に（who）」が埋まれば1 +「なぜ（why）」が
     //   埋まれば1（最大3）。誰の何を解くかが見えるほど高い。
-    final buildSlots = ['what', 'how', 'next']
-        .where((id) => slot(id).isNotEmpty)
-        .length;
+    final buildSlots = [
+      'what',
+      'how',
+      'next',
+    ].where((id) => slot(id).isNotEmpty).length;
     final ease = buildSlots == 0 ? 1 : buildSlots;
-    final spark = 1 +
-        (slot('who').isNotEmpty ? 1 : 0) +
-        (slot('why').isNotEmpty ? 1 : 0);
+    final spark =
+        1 + (slot('who').isNotEmpty ? 1 : 0) + (slot('why').isNotEmpty ? 1 : 0);
 
     return PlanMemo(
       what: what,
@@ -212,8 +280,11 @@ class LocalMemoBuilder {
   // 生成された質問の ID は任意。旧データでは定型の本文と一致する場合だけ使う。
   static bool _matchesTemplate(QaEntry entry, DigQuestion question) {
     if (entry.questionId != question.id || entry.contrarian) return false;
-    if (entry.source != null && entry.source != AnswerSource.local) return false;
+    if (entry.source != null && entry.source != AnswerSource.local) {
+      return false;
+    }
     return entry.question == question.text ||
-        entry.question == FallbackQuestions.styled(question, DigStyle.boss).text;
+        entry.question ==
+            FallbackQuestions.styled(question, DigStyle.boss).text;
   }
 }
