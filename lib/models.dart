@@ -118,6 +118,54 @@ class QaEntry {
   );
 }
 
+/// 入力原文と、版の作成に使った回答の範囲。
+class MemoInput {
+  final String title;
+  final String note;
+  final String sessionId;
+  final int answerCount;
+
+  const MemoInput({
+    required this.title,
+    required this.note,
+    required this.sessionId,
+    required this.answerCount,
+  });
+
+  List<QaEntry> answersFor(Idea idea) {
+    for (final session in idea.sessions) {
+      if (session.id == sessionId) {
+        return session.answers.take(answerCount).toList(growable: false);
+      }
+    }
+    return const [];
+  }
+
+  Map<String, dynamic> toJson() => {
+    'title': title,
+    'note': note,
+    'sessionId': sessionId,
+    'answerCount': answerCount,
+  };
+
+  static MemoInput? fromJson(Object? value) {
+    if (value case {
+      'title': final String title,
+      'note': final String note,
+      'sessionId': final String sessionId,
+      'answerCount': final int answerCount,
+    } when sessionId.isNotEmpty && answerCount >= 0) {
+      return MemoInput(
+        title: title,
+        note: note,
+        sessionId: sessionId,
+        answerCount: answerCount,
+      );
+    }
+    return null;
+  }
+}
+
 /// 企画メモ（型: What / 誰に / なぜ / どうやって / 次の一歩）。
 /// アイデアごとに版として積む（上書きしない）。
 class PlanMemo {
@@ -129,6 +177,7 @@ class PlanMemo {
   final DateTime createdAt;
   final int version;
   final AnswerSource? source;
+  final MemoInput? input;
 
   /// 企画の体力測定（v0.2 項目4）: 作りやすさ／ワクワク度（各1〜3）。
   /// 旧メモには無いので nullable。null のときは表示自体を出さない。
@@ -145,9 +194,10 @@ class PlanMemo {
     this.ease,
     this.spark,
     this.source,
+    this.input,
   });
 
-  PlanMemo withSource(AnswerSource source) => PlanMemo(
+  PlanMemo copyWith({AnswerSource? source, MemoInput? input}) => PlanMemo(
     what: what,
     who: who,
     why: why,
@@ -157,7 +207,8 @@ class PlanMemo {
     version: version,
     ease: ease,
     spark: spark,
-    source: source,
+    source: source ?? this.source,
+    input: input ?? this.input,
   );
 
   /// 体力測定が1つでも入っているか。
@@ -174,6 +225,7 @@ class PlanMemo {
     'ease': ease,
     'spark': spark,
     if (source != null) 'source': source!.name,
+    if (input != null) 'input': input!.toJson(),
   };
   factory PlanMemo.fromJson(Map<String, dynamic> j) => PlanMemo(
     what: j['what'] as String? ?? '',
@@ -187,6 +239,7 @@ class PlanMemo {
     ease: fitnessValueOrNull(j['ease']),
     spark: fitnessValueOrNull(j['spark']),
     source: AnswerSource.fromJson(j['source']),
+    input: MemoInput.fromJson(j['input']),
   );
 }
 

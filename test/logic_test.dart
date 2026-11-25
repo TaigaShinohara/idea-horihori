@@ -91,7 +91,10 @@ void main() {
     test('回答が型の各欄に埋まる', () {
       final answers = FallbackQuestions.questions
           .map((q) => QaEntry(
-              questionId: q.id, question: q.text, answer: q.choices.first))
+              questionId: q.id,
+              question: q.text,
+              answer: q.choices.first,
+              source: AnswerSource.local))
           .toList();
       final memo = LocalMemoBuilder.build(
           title: '天気アプリ', answers: answers, version: 1);
@@ -123,10 +126,52 @@ void main() {
       expect(p, contains('個人'));
     });
     test('要約プロンプトに型のキーが入る', () {
-      final p = Prompts.summarize(title: 't', history: const []);
+      final p = Prompts.summarize(
+        title: 'レシートで返品期限を覚える',
+        note: 'レシート画像は端末外へ送らない。',
+        history: const [
+          QaEntry(questionId: 'q1', question: 'どんな場面？', answer: '期限を忘れた。'),
+        ],
+        latestMemo: _memo(1),
+        budget: Prompts.compactNanoBudget,
+      );
       for (final k in ['what', 'who', 'why', 'how', 'nextStep']) {
         expect(p, contains(k));
       }
+      expect(p, contains('レシート画像は端末外へ送らない。'));
+      expect(p, contains('期限を忘れた。'));
+      expect(p.indexOf('元メモ'), lessThan(p.indexOf('今回のQ&A')));
+      expect(p.indexOf('今回のQ&A'), lessThan(p.indexOf('参考情報')));
+    });
+    test('要約には予算内の元メモと回答を省略せずに入れる', () {
+      final note = 'まずは手元のレシートで試す。${'使い方' * 64}。末尾の条件は画像を端末外へ送らないこと。';
+      final answer = '紙に書いた返品期限を忘れた。${'経緯' * 145}。次は手入力で試したい。';
+      final prompt = Prompts.summarize(
+        title: '返品期限メモ',
+        note: note,
+        history: [QaEntry(questionId: 'q1', question: 'どんな場面？', answer: answer)],
+        latestMemo: _memo(1),
+        budget: Prompts.compactNanoBudget,
+      );
+      expect(prompt, contains(note));
+      expect(prompt, contains(answer));
+      expect(prompt, contains('前回の企画メモ'));
+    });
+    test('長い元メモは前回メモより優先し、冒頭と末尾の条件を残す', () {
+      final prompt = Prompts.summarize(
+        title: '返品期限メモ',
+        note: '冒頭の意図は返品期限を忘れないこと。${'説明' * 1200}末尾の条件はレシート画像を端末外へ送らないこと。',
+        history: const [
+          QaEntry(questionId: 'q1', question: 'どんな場面？', answer: '期限を知っていたが忘れた。'),
+        ],
+        latestMemo: _memo(1),
+        budget: Prompts.compactNanoBudget,
+      );
+      expect(prompt, contains('冒頭の意図は返品期限を忘れないこと。'));
+      expect(prompt, contains('（元メモの一部を省略）'));
+      expect(prompt, contains('末尾の条件はレシート画像を端末外へ送らないこと。'));
+      expect(prompt, contains('期限を知っていたが忘れた。'));
+      expect(prompt, isNot(contains('前回の企画メモ')));
     });
     test('質問JSONを解釈できる（フェンス付きでも）', () {
       final q = Prompts.parseQuestion(
@@ -150,39 +195,46 @@ void main() {
     });
   });
 
-  group('ローカルメモ整形 v0.1.1', () {
+  group('定型要約の出典', () {
     test('同じIDは最後の回答が使われる（再深掘り反映）', () {
       final memo = LocalMemoBuilder.build(
         title: 'x',
         answers: const [
-          QaEntry(questionId: 'who', question: '誰の？', answer: '古い相手'),
-          QaEntry(questionId: 'who', question: '誰の？', answer: '新しい相手'),
+          QaEntry(questionId: 'who', question: '誰のためのアプリ？', answer: '古い相手'),
+          QaEntry(
+            questionId: 'who',
+            question: '対象をはっきりさせよう。誰のためのアプリ？',
+            answer: '新しい相手',
+          ),
         ],
         version: 2,
       );
       expect(memo.who, '新しい相手');
     });
 
-    test('テンプレ外IDは質問文キーワードで振り分けられる', () {
+    test('定型のIDや本文が似ていてもAIの回答は欄に割り当てない', () {
       final memo = LocalMemoBuilder.build(
-        title: '天気アプリ',
+        title: 'レシートアプリ',
         answers: const [
-          QaEntry(questionId: 'q1', question: '誰のためのもの？', answer: '忙しい親'),
-          QaEntry(questionId: 'q2', question: '困っていることは？', answer: '朝の服選び'),
-          QaEntry(questionId: 'q3', question: 'どうやって助ける？', answer: '通知で知らせる'),
-          QaEntry(questionId: 'q4', question: '最初の一歩は？', answer: '自分で試す'),
-          QaEntry(questionId: 'q5', question: 'どんな形がいい？', answer: 'サッと見る道具'),
+          QaEntry(
+            questionId: 'who',
+            question: '誰のためのアプリ？',
+            answer: '忙しい親',
+            source: AnswerSource.remote,
+          ),
+          QaEntry(
+            questionId: 'who',
+            question: '画像はどこに保存する？',
+            answer: '画像は端末内だけに保存する',
+          ),
         ],
         version: 1,
       );
-      expect(memo.who, '忙しい親');
-      expect(memo.why, '朝の服選び');
-      expect(memo.how, '通知で知らせる');
-      expect(memo.nextStep, '自分で試す');
-      expect(memo.what, contains('サッと見る道具'));
+      expect(memo.who, '（まだ掘れていない）');
+      expect(memo.what, 'レシートアプリ');
     });
 
-    test('キーワードで振り分けられない回答は空き欄へ順に割り当てる', () {
+    test('自由な質問の回答で要約の空欄を埋めない', () {
       final memo = LocalMemoBuilder.build(
         title: 'x',
         answers: const [
@@ -191,11 +243,11 @@ void main() {
         ],
         version: 1,
       );
-      expect(memo.who, 'Aさん');
-      expect(memo.why, 'Bの悩み');
+      expect(memo.who, '（まだ掘れていない）');
+      expect(memo.why, '（まだ掘れていない）');
     });
 
-    test('全欄が埋まった後の余りだけ What の補足になる', () {
+    test('定型5問の後の自由回答もWhatへ混ぜない', () {
       final answers = <QaEntry>[
         ...FallbackQuestions.questions.map((q) =>
             QaEntry(questionId: q.id, question: q.text, answer: q.choices.first)),
@@ -203,7 +255,7 @@ void main() {
       ];
       final memo =
           LocalMemoBuilder.build(title: 'x', answers: answers, version: 1);
-      expect(memo.what, contains('追加メモ'));
+      expect(memo.what, isNot(contains('追加メモ')));
       expect(memo.who, '自分みたいな個人');
     });
   });

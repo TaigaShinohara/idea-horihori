@@ -5,6 +5,7 @@ import '../ai_backend.dart';
 import '../models.dart';
 import '../store.dart';
 import '../widgets/glass.dart';
+import '../widgets/memo_input_view.dart';
 import 'dev_brief_screen.dart';
 import 'dig_screen.dart';
 
@@ -89,7 +90,7 @@ class _DetailScreenState extends State<DetailScreen> {
     }
   }
 
-  Future<void> _openBrief() async {
+  Future<void> _openBrief({PlanMemo? memo}) async {
     if (_openingBrief ||
         _archiving ||
         _editing ||
@@ -102,7 +103,7 @@ class _DetailScreenState extends State<DetailScreen> {
     try {
       await Navigator.push<void>(
         context,
-        MaterialPageRoute(builder: (_) => DevBriefScreen(idea: idea)),
+        MaterialPageRoute(builder: (_) => DevBriefScreen(idea: idea, memo: memo)),
       );
     } finally {
       _openingBrief = false;
@@ -305,7 +306,7 @@ class _DetailScreenState extends State<DetailScreen> {
                   _CelebratedFadeIn(
                     key: ValueKey('memo-$_celebrateCount-${latest.version}'),
                     animate: _celebrateCount > 0,
-                    child: _MemoView(memo: latest),
+                    child: _MemoView(memo: latest, idea: idea),
                   ),
                   const SizedBox(height: 14),
                   // K5: CTAはメモの後へ降格し、トーンも落とす。
@@ -366,7 +367,11 @@ class _DetailScreenState extends State<DetailScreen> {
                     ),
                     const SizedBox(height: 8),
                     for (final memo in older) ...[
-                      _OldMemoTile(memo: memo),
+                      _OldMemoTile(
+                        memo: memo,
+                        idea: idea,
+                        onOpenBrief: () => _openBrief(memo: memo),
+                      ),
                       const SizedBox(height: 10),
                     ],
                   ],
@@ -452,7 +457,8 @@ class _MemoBody extends StatelessWidget {
 /// 最新メモの表示（読み物ガラスで大きく）。
 class _MemoView extends StatelessWidget {
   final PlanMemo memo;
-  const _MemoView({required this.memo});
+  final Idea idea;
+  const _MemoView({required this.memo, required this.idea});
 
   @override
   Widget build(BuildContext context) {
@@ -496,6 +502,8 @@ class _MemoView extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           _MemoBody(memo: memo),
+          if (memo.input case final input?)
+            MemoInputView(input: input, idea: idea),
           // 体力測定（項目4）: 値がある時だけ、末尾に静かに1行添える。
           if (memo.hasFitness) ...[
             const SizedBox(height: 14),
@@ -609,7 +617,13 @@ class _SessionHistoryTileState extends State<_SessionHistoryTile> {
 /// 旧メモの折りたたみ（K5）。閉じた見出しは「メモ vN」だけ、展開内ヘッダ右端に生成元。
 class _OldMemoTile extends StatefulWidget {
   final PlanMemo memo;
-  const _OldMemoTile({required this.memo});
+  final Idea idea;
+  final VoidCallback onOpenBrief;
+  const _OldMemoTile({
+    required this.memo,
+    required this.idea,
+    required this.onOpenBrief,
+  });
 
   @override
   State<_OldMemoTile> createState() => _OldMemoTileState();
@@ -676,6 +690,13 @@ class _OldMemoTileState extends State<_OldMemoTile> {
                     const SizedBox(height: 6),
                   ],
                   _MemoBody(memo: widget.memo),
+                  if (widget.memo.input case final input?) ...[
+                    MemoInputView(input: input, idea: widget.idea),
+                    TextButton(
+                      onPressed: widget.onOpenBrief,
+                      child: const Text('この版の指示書'),
+                    ),
+                  ],
                 ],
               ),
             ),

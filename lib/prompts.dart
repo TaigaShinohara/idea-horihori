@@ -48,6 +48,34 @@ class Prompts {
     ].join('\n');
   }
 
+  static String _summaryNote(String note, int limit) {
+    final runes = note.runes;
+    final size = runes.length;
+    if (size <= limit) return note;
+    const omission = '\n（元メモの一部を省略）\n';
+    final kept = limit - omission.runes.length;
+    if (kept < 2) return _clip(omission, limit);
+    final head = kept ~/ 2;
+    return '${String.fromCharCodes(runes.take(head))}$omission'
+        '${String.fromCharCodes(runes.skip(size - (kept - head)))}';
+  }
+
+  static String _summaryHistory(List<String> turns, int limit) {
+    const omission = '（回答の一部を省略）';
+    final recent = <String>[];
+    var remaining = limit - omission.runes.length - 1;
+    for (final turn in turns.reversed) {
+      if (remaining <= 0) break;
+      if (turn.runes.length > remaining) {
+        if (recent.isEmpty) recent.add(_clip(turn, remaining));
+        break;
+      }
+      recent.add(turn);
+      remaining -= turn.runes.length + 1;
+    }
+    return [_clip(omission, limit), ...recent.reversed].join('\n');
+  }
+
   static String _memoText(PlanMemo memo, int budget) => [
     ('What', memo.what),
     ('誰に', memo.who),
@@ -97,16 +125,50 @@ ${_historyText(history, budget)}
   /// 出力には体力測定（ease/spark、各1〜3）も含める（v0.2 項目4）。
   static String summarize({
     required String title,
+    String note = '',
     required List<QaEntry> history,
     PlanMemo? latestMemo,
     DigStyle style = DigStyle.friend,
     int budget = standardBudget,
   }) {
+    final titleText = _clip(title, 120);
+    final noteText = note.trim();
+    const noteHeading = '\n元メモ（本人の原文・制約）:\n';
+    const historyHeading = '\n今回のQ&A:\n';
+    const previousHeading = '\n前回の企画メモ（今回の入力とは別の参考情報）:\n';
+    final turns = [
+      for (final entry in history) 'Q: ${entry.question}\nA: ${entry.answer}',
+    ];
+    final fullHistory = turns.isEmpty ? '（まだ回答なし）' : turns.join('\n');
+    final noteSize = noteText.runes.length;
+    final historySize = fullHistory.runes.length;
+    final primaryBudget =
+        (budget -
+                titleText.runes.length -
+                historyHeading.runes.length -
+                (noteText.isEmpty ? 0 : noteHeading.runes.length))
+            .clamp(0, budget);
+    // 一方が短ければ、空いた枠をもう一方に回す。両方が長い場合のみ分ける。
+    final reservedNote = noteSize.clamp(0, primaryBudget ~/ 2);
+    final historyBudget = historySize.clamp(0, primaryBudget - reservedNote);
+    final noteBudget = noteSize.clamp(0, primaryBudget - historyBudget);
+    final notePart = noteText.isEmpty
+        ? ''
+        : '$noteHeading${_summaryNote(noteText, noteBudget)}';
+    final historyPart = historySize <= historyBudget
+        ? fullHistory
+        : _summaryHistory(turns, historyBudget);
+    final previousBudget = (primaryBudget - noteSize - historySize).clamp(
+      0,
+      budget ~/ 4,
+    );
+    final previousTextBudget = previousBudget - previousHeading.runes.length;
+    final previousPart = latestMemo == null || previousTextBudget < 40
+        ? ''
+        : '$previousHeading${_clip(_memoText(latestMemo, budget ~/ 2), previousTextBudget)}';
     return '''
-アプリのアイデア「${_clip(title, 120)}」について、以下のQ&Aをもとに企画メモを整理してください。あなたの役割: ${style.personaPrompt}
-${_historyText(history, budget)}
-${latestMemo == null ? '' : '前回のメモ（改善してよい）:\n${_memoText(latestMemo, budget)}'}
-各項目は1〜2文の日本語で、Q&Aに無いことは盛らないでください。
+アプリのアイデア「$titleText」の企画メモを整理してください。あなたの役割: ${style.personaPrompt}$notePart$historyHeading$historyPart$previousPart
+各項目は1〜2文の日本語で、元メモの制約と今回の回答を守り、根拠のない内容は加えず未確認と書いてください。
 あわせて体力測定として、作りやすさ ease とワクワク度 spark をそれぞれ1〜3の整数で付けてください。
 出力はJSONのみ（コードフェンス禁止）:
 {"what":"何を作るか","who":"誰のためか","why":"どんな困りごとを解くか","how":"どうやって助けるか","nextStep":"次の一歩","ease":2,"spark":3}

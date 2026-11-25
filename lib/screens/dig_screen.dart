@@ -401,14 +401,27 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     });
     PlanMemo? memo;
     final previousPending = _session.pendingQuestion;
+    final answers = List<QaEntry>.of(_session.answers);
+    final input = MemoInput(
+      title: idea.title,
+      note: idea.note,
+      sessionId: _session.id,
+      answerCount: answers.length,
+    );
     try {
-      memo = await _backend.summarize(
-        idea: idea,
-        history: [for (final s in idea.sessions) ...s.answers],
+      memo = (await _backend.summarize(
+        idea: Idea(
+          id: idea.id,
+          title: input.title,
+          note: input.note,
+          createdAt: idea.createdAt,
+          memos: List.of(idea.memos),
+        ),
+        history: answers,
         version: idea.memos.length + 1,
         style: widget.store.digStyle,
         templateOnly: templateOnly,
-      );
+      )).copyWith(input: input);
       if (!_current(request)) return;
       idea.memos.add(memo);
       _session.finished = true;

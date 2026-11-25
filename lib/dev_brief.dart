@@ -4,12 +4,13 @@ import 'models.dart';
 /// 育った企画メモを「アプリを作って」と他のAI／開発者へ渡せる指示文に変換する純関数。
 /// メモが無いアイデアでは呼び出し側でボタンを無効化すること（ここでは
 /// メモ欄を「（まだ企画メモがない）」として組み立てる）。
-String buildDevBrief(Idea idea) {
+String buildDevBrief(Idea idea, {PlanMemo? memo}) {
+  memo ??= idea.memos.isEmpty ? null : idea.memos.last;
+  final input = memo?.input;
   final buf = StringBuffer();
-  buf.writeln('アプリ開発の指示書: ${idea.title}');
+  buf.writeln('アプリ開発の指示書: ${input?.title ?? idea.title}');
   buf.writeln();
 
-  final memo = idea.memos.isEmpty ? null : idea.memos.last;
   if (memo == null) {
     buf.writeln('（まだ企画メモがない）');
   } else {
@@ -28,16 +29,26 @@ String buildDevBrief(Idea idea) {
     }
   }
 
-  final allAnswers = [for (final s in idea.sessions) ...s.answers];
-  if (allAnswers.isNotEmpty) {
+  if (input != null && input.note.isNotEmpty) {
     buf.writeln();
-    buf.writeln('## 深掘りQ&Aの要点');
-    for (final a in allAnswers) {
+    buf.writeln('## 元メモ');
+    buf.writeln(input.note);
+  }
+
+  final answers = input?.answersFor(idea) ??
+      [for (final s in idea.sessions) ...s.answers];
+  if (answers.isNotEmpty) {
+    buf.writeln();
+    buf.writeln(input == null ? '## 深掘りQ&Aの要点' : '## この版の質問と回答');
+    for (final a in answers) {
       buf.writeln('- Q: ${a.question} → A: ${a.answer}');
     }
   }
 
   buf.writeln();
+  if (input != null) {
+    buf.writeln('元メモの制約を守り、矛盾や未確認の要件は実装前に本人へ確認してください。');
+  }
   buf.write('この企画でアプリを作ってください。まず設計案と画面一覧を出し、最小構成で動くところまで作ってください。');
   return buf.toString();
 }

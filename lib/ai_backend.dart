@@ -297,6 +297,7 @@ class GeminiBackend implements AiBackend {
     final text = await _generate(
       Prompts.summarize(
         title: idea.title,
+        note: idea.note,
         history: history,
         latestMemo: idea.memos.isEmpty ? null : idea.memos.last,
         style: style,
@@ -701,7 +702,7 @@ class ResilientBackend implements AiBackend {
       ),
       templateOnly: templateOnly,
     );
-    return memo.withSource(source);
+    return memo.copyWith(source: source);
   }
 
   @override

@@ -10,11 +10,12 @@ import '../widgets/glass.dart';
 /// 共有シートは新規依存を増やさない範囲では用意せず、コピーを必須とする。
 class DevBriefScreen extends StatelessWidget {
   final Idea idea;
-  const DevBriefScreen({super.key, required this.idea});
+  final PlanMemo? memo;
+  const DevBriefScreen({super.key, required this.idea, this.memo});
 
   @override
   Widget build(BuildContext context) {
-    final brief = buildDevBrief(idea);
+    final brief = buildDevBrief(idea, memo: memo);
     return GlassBackground(
       child: Scaffold(
         backgroundColor: Colors.transparent,
