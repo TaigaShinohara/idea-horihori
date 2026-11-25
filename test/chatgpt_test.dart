@@ -79,12 +79,15 @@ void main() {
           '${seg({'alg': 'none'})}.${seg({
             'https://api.openai.com/auth': {'chatgpt_account_id': 'acc-9'},
           })}.sig';
-      final tokens = ChatGptAuthService.parseTokenResponse({
-        'access_token': 'at',
-        'refresh_token': 'rt',
-        'id_token': idToken,
-        'expires_in': 3600,
-      }, now: DateTime(2026, 1, 1));
+      final tokens = ChatGptAuthService.parseTokenResponse(
+        {
+          'access_token': 'at',
+          'refresh_token': 'rt',
+          'id_token': idToken,
+          'expires_in': 3600,
+        },
+        now: DateTime(2026, 1, 1),
+      );
       expect(tokens.accessToken, 'at');
       expect(tokens.refreshToken, 'rt');
       expect(tokens.accountId, 'acc-9');
@@ -166,7 +169,10 @@ void main() {
     test('Responses API の output からテキストを取り出す', () {
       final text = ChatGptBackend.extractOutputText({
         'output': [
-          {'type': 'reasoning', 'content': []},
+          {
+            'type': 'reasoning',
+            'content': [],
+          },
           {
             'type': 'message',
             'content': [
@@ -187,18 +193,11 @@ void main() {
           expect(req.headers['Authorization'], 'Bearer fake-token');
           expect(req.headers['chatgpt-account-id'], 'acc-1');
           return _jsonResponse(
-            _codexResponse(
-              '{"id": "q1", "text": "誰に届けたい？", "choices": ["個人", "チーム", "企業"]}',
-            ),
+            _codexResponse('{"id": "q1", "text": "誰に届けたい？", "choices": ["個人", "チーム", "企業"]}'),
           );
         }),
       );
-      final idea = Idea(
-        id: '1',
-        title: 'アイデア',
-        note: '',
-        createdAt: DateTime(2026),
-      );
+      final idea = Idea(id: '1', title: 'アイデア', note: '', createdAt: DateTime(2026));
       final q = await backend.nextQuestion(idea: idea, history: const []);
       expect(q.text, '誰に届けたい？');
       expect(q.choices, hasLength(3));
@@ -206,15 +205,12 @@ void main() {
 
     test('未サインイン（トークンなし）では失敗して理由が残る', () async {
       final backend = ChatGptBackend(
-        authService: ChatGptAuthService(store: _MemoryTokenStore()),
+        authService: ChatGptAuthService(
+          store: _MemoryTokenStore(),
+        ),
         client: MockClient((_) async => _jsonResponse('{}')),
       );
-      final idea = Idea(
-        id: '1',
-        title: 'x',
-        note: '',
-        createdAt: DateTime(2026),
-      );
+      final idea = Idea(id: '1', title: 'x', note: '', createdAt: DateTime(2026));
       await expectLater(
         backend.nextQuestion(idea: idea, history: const []),
         throwsA(isA<ChatGptException>()),
@@ -230,21 +226,12 @@ void main() {
         onDevice: _ThrowingBackend(),
         chatGpt: ChatGptBackend(
           authService: _FakeAuth(),
-          client: MockClient(
-            (_) async => _jsonResponse(
-              _codexResponse(
-                '{"id": "q1", "text": "質問？", "choices": ["a", "b", "c"]}',
-              ),
-            ),
-          ),
+          client: MockClient((_) async => _jsonResponse(
+                _codexResponse('{"id": "q1", "text": "質問？", "choices": ["a", "b", "c"]}'),
+              )),
         ),
       );
-      final idea = Idea(
-        id: '1',
-        title: 'x',
-        note: '',
-        createdAt: DateTime(2026),
-      );
+      final idea = Idea(id: '1', title: 'x', note: '', createdAt: DateTime(2026));
       final q = await backend.nextQuestion(idea: idea, history: const []);
       expect(q.text, '質問？');
       expect(backend.lastSource, AnswerSource.chatGpt);
@@ -266,14 +253,16 @@ class _ThrowingBackend implements AiBackend {
     DigStyle style = DigStyle.friend,
     DigViewpoint viewpoint = DigViewpoint.none,
     bool contrarianDue = false,
-  }) async => throw Exception('on-device unavailable');
+  }) async =>
+      throw Exception('on-device unavailable');
   @override
   Future<PlanMemo> summarize({
     required Idea idea,
     required List<QaEntry> history,
     required int version,
     DigStyle style = DigStyle.friend,
-  }) async => throw Exception('on-device unavailable');
+  }) async =>
+      throw Exception('on-device unavailable');
   @override
   Future<List<String>> nameCandidates({required Idea idea}) async =>
       throw Exception('on-device unavailable');
