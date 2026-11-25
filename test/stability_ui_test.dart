@@ -126,7 +126,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(
-        find.text('AICoreの状態を確認できませんでした。少し待って再確認してください。'),
+        find.text('AICoreの状態を確認できませんでした（使えないと確定ではありません）。下の「質問を試す」で、実際に生成できるか確かめられます。'),
         findsOneWidget,
       );
       // v0.4.0 で ChatGPT カードが増え「詳細・動作確認」が ListView の

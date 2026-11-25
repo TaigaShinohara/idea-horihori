@@ -278,7 +278,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     OnDeviceStatus.available => '利用できます（オフラインで動作します）',
     OnDeviceStatus.needsDownload => 'モデルの準備が必要です。',
     OnDeviceStatus.unavailable => 'この端末では利用できません。',
-    OnDeviceStatus.checkFailed => '$onDeviceServiceNameの状態を確認できませんでした。少し待って再確認してください。',
+    OnDeviceStatus.checkFailed => '$onDeviceServiceNameの状態を確認できませんでした（使えないと確定ではありません）。下の「質問を試す」で、実際に生成できるか確かめられます。',
     null => _checking ? '対応状況を確認しています…' : '未確認',
   };
 

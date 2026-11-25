@@ -33,6 +33,28 @@ android {
         versionName = flutter.versionName
     }
 
+    // v0.4.2: flutter_device_ai が依存として引き込むローカルLLM実行系
+    // （llamadart / LiteRT-LM / llama.cpp / ggml / WebGPU）を APK から除外。
+    // 合計で約100MB（非圧縮）あり、120MB APK の主因だった。
+    // 根拠: 本アプリのオンデバイス経路は AICore（ML Kit GenAI Prompt API）
+    // のみで、生成は AICore のシステムプロセス側で実行されるため、これらの
+    // .so は一切ロードされない。ローカルモデル用フォールバック
+    // （LocalLlmFallbackAdapter / GGUF）も使っていない
+    // （FlutterDeviceAi.withFallback() にアダプタを渡していない）。
+    // 万一ローカルLLM経路を使う改修をする場合は、この除外を外すこと。
+    packaging {
+        jniLibs {
+            excludes += listOf(
+                "lib/*/libLiteRt*.so",
+                "lib/*/libGemmaModelConstraintProvider.so",
+                "lib/*/libggml*.so",
+                "lib/*/libllama*.so",
+                "lib/*/libmtmd.so",
+                "lib/*/libwebgpu_dawn.so",
+            )
+        }
+    }
+
     signingConfigs {
         if (hasDedicatedSigning) {
             create("horihori") {

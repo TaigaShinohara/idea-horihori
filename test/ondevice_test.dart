@@ -124,6 +124,54 @@ void main() {
       expect(client.downloadCalls, 1);
     });
 
+    test('状態確認が取れなくても生成を試し、成功すれば利用可に昇格する', () async {
+      final client = FakeOnDeviceClient(
+        status: OnDeviceStatus.checkFailed,
+        message: 'Could not query AICore: null',
+        responses: [_qJson],
+      );
+      final b = OnDeviceBackend(client: client);
+      final q = await b.nextQuestion(idea: _idea(), history: const []);
+      expect(q.text, '誰に使ってほしい？');
+      expect(client.generateCalls, 1);
+      expect(b.lastStatus, OnDeviceStatus.available);
+    });
+
+    test('状態確認が取れず生成も失敗すれば例外（フォールバック可能にする）', () async {
+      final b = OnDeviceBackend(
+        client: FakeOnDeviceClient(
+          status: OnDeviceStatus.checkFailed,
+          message: 'Could not query AICore: null',
+          responses: ['x', 'y'],
+        ),
+      );
+      await expectLater(
+        b.nextQuestion(idea: _idea(), history: const []),
+        throwsA(isA<OnDeviceException>()),
+      );
+      expect(b.lastStatus, OnDeviceStatus.checkFailed);
+    });
+
+    test('状態確認が取れない端末では prepareModel は生成で確かめる案内を出す',
+        () async {
+      final b = OnDeviceBackend(
+        client: FakeOnDeviceClient(
+          status: OnDeviceStatus.checkFailed,
+          message: 'Could not query AICore: null',
+        ),
+      );
+      await expectLater(
+        b.prepareModel(),
+        throwsA(
+          isA<OnDeviceException>().having(
+            (e) => e.message,
+            'message',
+            contains('質問を試す'),
+          ),
+        ),
+      );
+    });
+
     test('利用不可の端末では例外', () async {
       final b = OnDeviceBackend(
           client: FakeOnDeviceClient(status: OnDeviceStatus.unavailable));

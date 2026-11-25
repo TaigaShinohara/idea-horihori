@@ -215,7 +215,11 @@ class OnDeviceBackend implements GuidedDigBackend {
     if (client is FlutterOnDeviceClient) client.cancelPending();
   }
 
-  Future<void> _prepare(int revision, {required bool allowDownload}) async {
+  Future<void> _prepare(
+    int revision, {
+    required bool allowDownload,
+    bool probeOnCheckFailed = false,
+  }) async {
     lifecycle = OnDeviceLifecycle.checking;
     final OnDeviceCheck check;
     final cached = allowDownload ? null : readCachedStatus?.call();
@@ -242,7 +246,25 @@ class OnDeviceBackend implements GuidedDigBackend {
         _checkCurrent(revision);
         lastStatus = OnDeviceStatus.available;
         writeCachedStatus?.call(const OnDeviceCheck(OnDeviceStatus.available));
-      case OnDeviceStatus.unavailable || OnDeviceStatus.checkFailed:
+      case OnDeviceStatus.checkFailed:
+        // 状態確認（ML Kit の checkStatus）だけが失敗し、生成そのものは
+        // 通る端末がある（Pixel 10 Pro で実測: checkStatus が
+        // 「Could not query AICore: null」を返す一方、別パッケージの
+        // 検証版では生成が成功した。docs/ONDEVICE_POC.md 参照）。
+        // プラグインの生成経路は checkStatus を経由しないため、
+        // 生成系の呼び出しでは「使えない」と決めつけず、実際に
+        // 生成を1回試して結果で判定する（probe）。
+        if (!probeOnCheckFailed) {
+          lifecycle = OnDeviceLifecycle.unavailable;
+          throw OnDeviceException(
+            '$onDeviceServiceNameの状態を確認できませんでした。'
+            '状態が取れなくても生成できる場合があるため、'
+            '設定の「質問を試す」ボタンで実際に生成できるか確認してください。'
+            '${check.message.isEmpty ? '' : '（${check.message}）'}',
+          );
+        }
+        break;
+      case OnDeviceStatus.unavailable:
         lifecycle = OnDeviceLifecycle.unavailable;
         throw OnDeviceException(
           check.message.isEmpty ? '端末AIは現在利用できません。' : check.message,
@@ -328,13 +350,24 @@ class OnDeviceBackend implements GuidedDigBackend {
     _cancelClient();
     lastError = null;
     try {
-      await _prepare(revision, allowDownload: allowDownload);
-      return await _tryOutput(
+      await _prepare(
+        revision,
+        allowDownload: allowDownload,
+        probeOnCheckFailed: true,
+      );
+      final value = await _tryOutput(
         revision,
         prompt,
         parse,
         schema,
       ).timeout(generateTimeout);
+      if (lastStatus == OnDeviceStatus.checkFailed) {
+        // 状態確認は失敗したが生成は通った。生成の成功が事実として
+        // 確定なので、状態は「利用可」に昇格させてキャッシュする。
+        lastStatus = OnDeviceStatus.available;
+        writeCachedStatus?.call(const OnDeviceCheck(OnDeviceStatus.available));
+      }
+      return value;
     } on TimeoutException {
       _checkCurrent(revision);
       final phase = lifecycle;
