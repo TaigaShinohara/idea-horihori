@@ -100,6 +100,11 @@ class ChatGptAuthService {
   final Duration signInTimeout;
 
   String? _pendingVerifier;
+  HttpServer? _activeServer;
+  bool _preserveVerifierOnCancel = false;
+  bool _signInCancelled = false;
+
+  bool get hasPendingSignIn => _pendingVerifier != null;
 
   ChatGptAuthService({
     http.Client? httpClient,
@@ -225,8 +230,26 @@ class ChatGptAuthService {
     return launchUrl(uri, mode: LaunchMode.externalApplication);
   }
 
+  /// 進行中のサインイン待ち受けを停止する。
+  /// [preserveVerifier] が true の場合は認可コード手動入力用に verifier を保持する。
+  Future<void> cancelSignIn({bool preserveVerifier = false}) async {
+    _preserveVerifierOnCancel = preserveVerifier;
+    _signInCancelled = !preserveVerifier;
+    if (!preserveVerifier) {
+      _pendingVerifier = null;
+    }
+    final server = _activeServer;
+    _activeServer = null;
+    if (server != null) {
+      await server.close(force: true);
+    }
+  }
+
   /// ブラウザで認可ページを開き、localhost コールバックでコードを受け取る。
   Future<void> signIn() async {
+    await cancelSignIn();
+    _preserveVerifierOnCancel = false;
+    _signInCancelled = false;
     final verifier = generateCodeVerifier();
     final state = generateState();
     _pendingVerifier = verifier;
@@ -243,6 +266,7 @@ class ChatGptAuthService {
         'サインイン用の待ち受けを開始できませんでした。しばらくしてから再試行してください。',
       );
     }
+    _activeServer = server;
 
     try {
       final uri = buildAuthorizeUri(
@@ -291,9 +315,15 @@ class ChatGptAuthService {
       );
       await exchangeCodeForTokens(code, verifier);
     } catch (_) {
-      _pendingVerifier = null;
+      if (!_preserveVerifierOnCancel) {
+        _pendingVerifier = null;
+      }
       rethrow;
     } finally {
+      if (identical(_activeServer, server)) {
+        _activeServer = null;
+      }
+      _preserveVerifierOnCancel = false;
       await server.close(force: true);
     }
   }
@@ -316,6 +346,9 @@ class ChatGptAuthService {
           ),
         );
         if (!hasNext) {
+          if (_signInCancelled) {
+            throw const ChatGptAuthException('ChatGPT のサインインがキャンセルされました。');
+          }
           throw const ChatGptAuthException(
             'サインイン用の待ち受けが終了しました。もう一度お試しください。',
           );

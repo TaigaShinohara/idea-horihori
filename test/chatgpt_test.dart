@@ -245,6 +245,68 @@ void main() {
         throwsA(isA<ChatGptAuthException>()),
       );
     });
+
+    test('cancelSignIn で待ち受けを即時終了し、preserveVerifier でコード交換を続けられる', () async {
+      final tokenStore = _MemoryTokenStore();
+      final launched = Completer<void>();
+      final auth = ChatGptAuthService(
+        store: tokenStore,
+        urlLauncher: (_) async {
+          if (!launched.isCompleted) launched.complete();
+          return true;
+        },
+        httpClient: MockClient((req) async {
+          expect(req.bodyFields['code'], 'manual-code-123');
+          expect(req.bodyFields['code_verifier'], isNotEmpty);
+          return _jsonResponse(
+            jsonEncode({
+              'access_token': 'at-manual',
+              'refresh_token': 'rt-manual',
+              'expires_in': 3600,
+            }),
+          );
+        }),
+      );
+
+      final signInFuture = auth.signIn();
+      await launched.future;
+      expect(auth.hasPendingSignIn, isTrue);
+
+      await auth.cancelSignIn(preserveVerifier: true);
+      await expectLater(
+        signInFuture,
+        throwsA(isA<ChatGptAuthException>()),
+      );
+      expect(auth.hasPendingSignIn, isTrue);
+
+      await auth.signInWithCode('manual-code-123');
+      expect(await auth.isSignedIn, isTrue);
+      expect(auth.hasPendingSignIn, isFalse);
+
+      // 通常の cancelSignIn() は verifier も破棄し、待ち受けを即時終了する
+      final launched2 = Completer<void>();
+      final auth2 = ChatGptAuthService(
+        store: tokenStore,
+        urlLauncher: (_) async {
+          if (!launched2.isCompleted) launched2.complete();
+          return true;
+        },
+      );
+      final signIn2 = auth2.signIn();
+      await launched2.future;
+      await auth2.cancelSignIn();
+      await expectLater(
+        signIn2,
+        throwsA(
+          isA<ChatGptAuthException>().having(
+            (e) => e.message,
+            'message',
+            contains('キャンセル'),
+          ),
+        ),
+      );
+      expect(auth2.hasPendingSignIn, isFalse);
+    });
   });
 
   group('チェーン: オンデバイス失敗 → ChatGPT → Gemini → ローカル', () {
