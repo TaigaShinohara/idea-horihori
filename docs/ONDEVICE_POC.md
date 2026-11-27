@@ -89,3 +89,24 @@
 - 対処: android/app/build.gradle.kts の packaging.jniLibs.excludes で該当 .so（libLiteRt* / libGemmaModelConstraintProvider / libggml* / libllama* / libmtmd / libwebgpu_dawn）を除外。サイズ実測: 除外前 125,250,388 バイト（約120MB）→ 除外後 20,276,253 バイト（約20MB）、−84%。署名・版数（0.4.2+12）も apksigner で確認済み。
 - リスクと残件: 除外した .so が実機でロードされないことの最終確認は実機待ち（ロードされるのは AICore 経路と無関係な初期化が無いことまでをコードで確認済み）。ローカルLLM経路を使う改修時は除外を外すこと（build.gradle.kts にコメント明記）。
 - 起動まわり: main() は store.load() を非同期に流しており、起動時の同期的な重い処理はコード上見当たらなかったため、今回はサイズ削減のみ。
+
+## 実機報告: probe は通ったが生成自体が失敗（2026-11-27、Pixel 10 Pro・v0.5.1）
+
+本人が v0.5.1 を Pixel 10 Pro で起動し、端末AI生成を試したところ「Gemini Nanoから応答を取得できませんでした」と表示され使えなかった、と報告。なお iPhone 16 では Apple Intelligence での生成は成功している（経路が別なので矛盾なし）。
+
+### 確定していること（コード・プラグイン実物確認済み）
+
+- v0.4.2 の probe（状態不明でも生成を試す）は動作しており、今回は **generateContent 自体が GenAiException で失敗** している。checkStatus が例外（message null）を投げ続ける件とは別の段階の失敗。
+- 失敗の理由は特定できていない。アプリの `_describeAiError`（lib/on_device_backend.dart）が `OnDeviceAiGenerationException` を固定文「応答を取得できませんでした」に置換し、**ネイティブ例外の message（"GenAI error <code>" 等）を捨てていた** ため、理由が追えなかった。これが今回の最大の問題（アプリ側の情報保全の欠落）。
+- Android では `_usesNativeSchemas=false`（テキストモード生成）なので、JSON スキーマ起因ではない。
+- 2026-11-23 には同じ Pixel 10 Pro で別パッケージ検証版の生成成功記録がある（本ドキュメント「Pixel 10 Proでの推論確認」）。端末が完全非対応ではない。
+
+### 対処（v0.5.2）
+
+- **エラー理由の保全**: バックエンドに `lastGenerationErrorDetail` を追加。ネイティブ例外（OnDeviceAiException）の code＋message を切り詰め（最大300字）て保持し、設定→詳細・動作確認の診断表示で見えるようにした。ユーザー向けの短い文面は従来どおり維持し、生メッセージはそちらには出さない。再試行で回復した一時的な失敗も記録する。
+- **リトライ**: 生成が `OnDeviceAiGenerationException` で失敗したら、1秒待って1回だけ再試行する（AICore の初回初期化失敗は再試行で通ることが知られている）。再試行はパース再試行の枠を消費せず、生成呼び出しの上限は「パース再試行込み2周＋生成再試行1回＝最大3回」と明記した。キャンセル時は待機後に revision チェックで AiCancelled を伝播させる。
+
+### 未確定事項（次回の実機診断待ち）
+
+- **生成の実エラー理由（ネイティブのエラーコード）は未確定**。v0.5.2 を入れた実機で再度「質問を試す」を実行し、設定→詳細・動作確認に表示される「最後の生成エラーの詳細」（例: "GENERATION_FAILED: GenAI error <code>: ..."）を確認して初めて切り分けられる。憶測で原因は断定しない。
+- v0.5.2 のリトライで実機生成が通るかも未確認（再試行が効くのは初回初期化失敗型の場合のみ）。
