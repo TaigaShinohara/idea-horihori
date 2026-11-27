@@ -53,6 +53,7 @@ class DevBriefScreen extends StatelessWidget {
                     var message = '指示書をコピーしました';
                     try {
                       await Clipboard.setData(ClipboardData(text: brief));
+                      HapticFeedback.lightImpact();
                     } catch (_) {
                       message = 'コピーできませんでした。本文を選択してコピーできます。';
                     }

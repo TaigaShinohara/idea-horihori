@@ -156,6 +156,8 @@ class HomeScreen extends StatelessWidget {
                         style: Theme.of(context).textTheme.titleMedium,
                         textAlign: TextAlign.center,
                       ),
+                      const SizedBox(height: 16),
+                      const _EmptyFlowHint(),
                       if (store.ideasRecoveryNotice case final notice?) ...[
                         const SizedBox(height: 16),
                         _RecoveryNoticeBanner(
@@ -330,7 +332,7 @@ class _QuickAddSheetState extends State<_QuickAddSheet> {
           TextField(
             controller: _note,
             enabled: !_saving,
-            maxLines: 2,
+            maxLines: 4,
             minLines: 1,
             style: const TextStyle(fontSize: 14),
             decoration: glassInputDecoration(
@@ -377,6 +379,16 @@ class _IdeaCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final stage = idea.stage;
+    final resumable = idea.resumableSession;
+    final isReviewPending =
+        resumable?.reviewOpen == true && resumable?.reviewDraft != null;
+    final digLabel = isReviewPending
+        ? '下書きを確認'
+        : resumable != null
+        ? 'つづきを掘る'
+        : idea.memos.isNotEmpty
+        ? 'もっと深掘り'
+        : '深掘り';
     return GlassCard(
       onTap: () => _open(
         context,
@@ -416,10 +428,52 @@ class _IdeaCard extends StatelessWidget {
                 context,
                 DigScreen(store: store, idea: idea),
               ),
-              icon: const Icon(Icons.chat_bubble_outline, size: 18),
-              label: Text(idea.resumableSession != null ? 'つづきを掘る' : '深掘り'),
+              icon: Icon(
+                isReviewPending
+                    ? Icons.fact_check_outlined
+                    : Icons.chat_bubble_outline,
+                size: 18,
+              ),
+              label: Text(digLabel),
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EmptyFlowHint extends StatelessWidget {
+  const _EmptyFlowHint();
+
+  @override
+  Widget build(BuildContext context) {
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+    Widget step(IconData icon, String text) => Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 15, color: muted),
+        const SizedBox(width: 4),
+        Text(text, style: TextStyle(fontSize: 13, color: muted)),
+      ],
+    );
+    return GlassCard(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      child: Wrap(
+        alignment: WrapAlignment.center,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: 8,
+        runSpacing: 6,
+        children: [
+          step(Icons.edit_note_outlined, '1行メモ'),
+          ExcludeSemantics(
+            child: Icon(Icons.arrow_forward, size: 14, color: muted),
+          ),
+          step(Icons.chat_bubble_outline, '質問に答える'),
+          ExcludeSemantics(
+            child: Icon(Icons.arrow_forward, size: 14, color: muted),
+          ),
+          step(Icons.description_outlined, '企画メモ'),
         ],
       ),
     );
