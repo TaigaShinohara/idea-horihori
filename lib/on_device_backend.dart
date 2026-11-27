@@ -246,12 +246,24 @@ class OnDeviceBackend implements GuidedDigBackend {
   final Duration statusTimeout;
   final Duration downloadTimeout;
   final Duration generateTimeout;
+
+  /// 生成が [OnDeviceAiGenerationException] で失敗したときの再試行までの待機。
+  /// AICore は初回呼び出しの初期化で失敗し、少し置くと通ることがある。
+  final Duration generationRetryDelay;
   final OnDeviceCheck? Function()? readCachedStatus;
   final void Function(OnDeviceCheck)? writeCachedStatus;
   final void Function()? clearCachedStatus;
   int _revision = 0;
 
   String? lastError;
+
+  /// 最後に発生したネイティブ生成エラーの詳細（コード＋メッセージ）。
+  ///
+  /// ユーザー向け文面（[lastError]）にはネイティブ例外の生メッセージを
+  /// 出さない代わりに、ここへ保全し、設定→詳細・動作確認の診断表示で
+  /// 理由を追えるようにする。再試行で回復した一時的な失敗も記録する。
+  /// 生成系の呼び出しごとにリセットされる。
+  String? lastGenerationErrorDetail;
   OnDeviceStatus? lastStatus;
   OnDeviceLifecycle lifecycle = OnDeviceLifecycle.idle;
 
@@ -264,6 +276,7 @@ class OnDeviceBackend implements GuidedDigBackend {
     this.statusTimeout = const Duration(seconds: 6),
     this.downloadTimeout = const Duration(seconds: 120),
     this.generateTimeout = const Duration(seconds: 18),
+    this.generationRetryDelay = const Duration(seconds: 1),
   }) : _client =
            client ??
            FlutterOnDeviceClient(onDownloadProgress: onDownloadProgress);
@@ -299,6 +312,23 @@ class OnDeviceBackend implements GuidedDigBackend {
       return '$onDeviceModelNameから応答を取得できませんでした。';
     }
     return fallback;
+  }
+
+  /// ネイティブ例外の詳細を診断用に整形する（長すぎる場合は切り詰める）。
+  static String _nativeErrorDetail(Object error) {
+    final raw = error is OnDeviceAiException
+        ? '${error.code}: ${error.message}'
+        : '$error';
+    final trimmed = raw.trim();
+    return trimmed.length <= 300 ? trimmed : '${trimmed.substring(0, 300)}…';
+  }
+
+  /// ネイティブ例外の理由を [lastGenerationErrorDetail] へ保全する。
+  /// ユーザー向け文面には出さないが、診断で理由を追えるようにするため。
+  void _recordGenerationError(Object error) {
+    if (error is OnDeviceAiException) {
+      lastGenerationErrorDetail = _nativeErrorDetail(error);
+    }
   }
 
   Future<void> _prepare(
@@ -444,6 +474,7 @@ class OnDeviceBackend implements GuidedDigBackend {
     final revision = ++_revision;
     _cancelClient();
     lastError = null;
+    lastGenerationErrorDetail = null;
     try {
       await _prepare(
         revision,
@@ -479,6 +510,7 @@ class OnDeviceBackend implements GuidedDigBackend {
       rethrow;
     } catch (error) {
       _checkCurrent(revision);
+      _recordGenerationError(error);
       final failure = error is OnDeviceException
           ? error
           : OnDeviceException(
@@ -501,6 +533,9 @@ class OnDeviceBackend implements GuidedDigBackend {
   }) async {
     var budget = Prompts.nanoBudget;
     var inputTooLong = false;
+    var generationRetried = false;
+    // 試行回数の上限: パース再試行込みで最大2周＋生成エラーの再試行1回
+    // ＝生成呼び出しは最大3回まで。再試行はパース再試行の枠を消費しない。
     for (var attempt = 0; attempt < 2; attempt++) {
       _checkCurrent(revision);
       inputTooLong = false;
@@ -522,6 +557,16 @@ class OnDeviceBackend implements GuidedDigBackend {
         budget = Prompts.compactNanoBudget;
       } on OnDeviceAiStructuredOutputException {
         // SDKの補修を使わず、既存の生成回数上限でやり直す。
+      } on OnDeviceAiGenerationException catch (error) {
+        // AICore の初回初期化失敗は、短い待機を挟んだ再試行で通ることが
+        // 知られている。理由は診断用に保全してから、全体で1回だけ
+        // 再試行する（2回目の失敗はそのまま伝播させ、次候補へ落とす）。
+        _recordGenerationError(error);
+        if (generationRetried) rethrow;
+        generationRetried = true;
+        await Future<void>.delayed(generationRetryDelay);
+        _checkCurrent(revision);
+        attempt--;
       }
     }
     if (inputTooLong) {

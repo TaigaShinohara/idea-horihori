@@ -1081,6 +1081,24 @@ class _SettingsScreenState extends State<SettingsScreen>
                           ),
                         ),
                       ],
+                      // v0.5.2: 生成が失敗したとき、ネイティブ例外の理由を
+                      // 診断で追えるよう保全した詳細をここにだけ出す
+                      // （ユーザー向け文面には生メッセージを出さない）。
+                      if (_nano.lastGenerationErrorDetail case final detail?) ...[
+                        const SizedBox(height: 8),
+                        const Text(
+                          '最後の生成エラーの詳細',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          detail,
+                          style: TextStyle(fontSize: 12, color: muted),
+                        ),
+                      ],
                       if (_sampleQuestion case final question?) ...[
                         const SizedBox(height: 10),
                         Text(
