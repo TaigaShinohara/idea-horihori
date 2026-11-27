@@ -21,6 +21,9 @@ class FakeOnDeviceClient implements OnDeviceTextClient {
   Object? statusError;
   Object? downloadError;
   Object? generateError;
+
+  /// 先に消費される生成エラーのキュー（「1回だけ失敗して回復」の再現用）。
+  List<Object> generateErrorQueue;
   int checkStatusCalls = 0;
   int generateCalls = 0;
   int downloadCalls = 0;
@@ -35,7 +38,9 @@ class FakeOnDeviceClient implements OnDeviceTextClient {
     this.statusError,
     this.downloadError,
     this.generateError,
-  }) : responses = responses ?? [];
+    List<Object>? generateErrorQueue,
+  }) : responses = responses ?? [],
+       generateErrorQueue = generateErrorQueue ?? [];
 
   @override
   Future<OnDeviceCheck> checkStatus() async {
@@ -63,6 +68,7 @@ class FakeOnDeviceClient implements OnDeviceTextClient {
     if (generateDelay > Duration.zero) {
       await Future<void>.delayed(generateDelay);
     }
+    if (generateErrorQueue.isNotEmpty) throw generateErrorQueue.removeAt(0);
     if (generateError != null) throw generateError!;
     if (responses.isEmpty) throw Exception('no fake response');
     return responses.removeAt(0);
@@ -248,6 +254,93 @@ void main() {
         b.nextQuestion(idea: _idea(), history: const []),
         throwsA(isA<OnDeviceException>()),
       );
+    });
+  });
+
+  group('生成エラーの詳細保全と再試行（v0.5.2）', () {
+    test('生成のネイティブ例外は詳細に残り、ユーザー向け文面には露出しない', () async {
+      final client = FakeOnDeviceClient(
+        generateError: const OnDeviceAiGenerationException(
+          'GenAI error 8: AICore internal failure',
+        ),
+      );
+      final b = OnDeviceBackend(
+        client: client,
+        generationRetryDelay: Duration.zero,
+      );
+      await expectLater(
+        b.nextQuestion(idea: _idea(), history: const []),
+        throwsA(
+          isA<OnDeviceException>().having(
+            (e) => e.message,
+            'message',
+            isNot(contains('GenAI error')),
+          ),
+        ),
+      );
+      // 初回＋再試行1回で打ち切り、それ以上は暴走しない。
+      expect(client.generateCalls, 2);
+      expect(b.lastError, isNot(contains('GenAI error')));
+      expect(b.lastGenerationErrorDetail, contains('GENERATION_FAILED'));
+      expect(
+        b.lastGenerationErrorDetail,
+        contains('GenAI error 8: AICore internal failure'),
+      );
+    });
+
+    test('生成が1回失敗しても再試行で成功し、一時的な失敗は詳細に残る', () async {
+      final client = FakeOnDeviceClient(
+        generateErrorQueue: [
+          const OnDeviceAiGenerationException('GenAI error 3: not ready'),
+        ],
+        responses: [_qJson],
+      );
+      final b = OnDeviceBackend(
+        client: client,
+        generationRetryDelay: Duration.zero,
+      );
+      final q = await b.nextQuestion(idea: _idea(), history: const []);
+      expect(q.text, '誰に使ってほしい？');
+      expect(client.generateCalls, 2);
+      expect(b.lastGenerationErrorDetail, contains('GenAI error 3'));
+    });
+
+    test('再試行しても失敗すれば従来どおり次候補（定型）へ落ちる', () async {
+      final client = FakeOnDeviceClient(
+        generateError: const OnDeviceAiGenerationException(
+          'GenAI error 8: AICore internal failure',
+        ),
+      );
+      final backend = ResilientBackend(
+        null,
+        onDevice: OnDeviceBackend(
+          client: client,
+          generationRetryDelay: Duration.zero,
+        ),
+      );
+      final q = await backend.nextQuestion(idea: _idea(), history: const []);
+      expect(q.text, isNotEmpty); // 定型質問が返る
+      expect(backend.lastSource, AnswerSource.local);
+      expect(backend.lastOnDeviceFailed, isTrue);
+      expect(client.generateCalls, 2);
+    });
+
+    test('長いネイティブ message は詳細で切り詰められる', () async {
+      final b = OnDeviceBackend(
+        client: FakeOnDeviceClient(
+          generateError: OnDeviceAiGenerationException('E' * 1000),
+        ),
+        generationRetryDelay: Duration.zero,
+      );
+      await expectLater(
+        b.nextQuestion(idea: _idea(), history: const []),
+        throwsA(isA<OnDeviceException>()),
+      );
+      final detail = b.lastGenerationErrorDetail;
+      expect(detail, isNotNull);
+      expect(detail, startsWith('GENERATION_FAILED: '));
+      expect(detail!.length, 301); // 300字＋省略記号
+      expect(detail, endsWith('…'));
     });
   });
 
