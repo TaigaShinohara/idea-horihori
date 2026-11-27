@@ -193,7 +193,7 @@ void main() {
       expect(store.ideas, isEmpty);
     });
 
-    test('cachedOnDeviceStatus expires unavailable/needsDownload after TTL', () {
+    test('cachedOnDeviceStatus expires unavailable/needsDownload and available after TTL', () {
       var now = DateTime(2026, 1, 1, 12, 0, 0);
       final store = IdeaStore(secrets: _MemorySecrets(), now: () => now);
 
@@ -208,8 +208,10 @@ void main() {
       store.updateOnDeviceStatusCache(
         const OnDeviceCheck(OnDeviceStatus.available),
       );
-      now = now.add(const Duration(hours: 1));
+      now = now.add(const Duration(minutes: 4));
       expect(store.cachedOnDeviceStatus?.status, OnDeviceStatus.available);
+      now = now.add(const Duration(minutes: 1));
+      expect(store.cachedOnDeviceStatus, isNull);
     });
   });
 
@@ -271,14 +273,75 @@ void main() {
       expect(q.id, 'q1');
     });
 
-    test('GeminiBackend handles non-JSON 400 and SocketException', () async {
+    test('GeminiBackend classifies 400 errors and SocketException', () async {
       final bad400 = GeminiBackend(
         apiKey: 'key',
         client: MockClient((_) async => http.Response('<html>Bad</html>', 400)),
       );
       await expectLater(
         bad400.verifyConnection(),
+        throwsA(GeminiFailure.invalidResponse),
+      );
+
+      final precondition = GeminiBackend(
+        apiKey: 'key',
+        client: MockClient(
+          (_) async => http.Response(
+            jsonEncode({
+              'error': {
+                'code': 400,
+                'status': 'FAILED_PRECONDITION',
+                'message': 'User location is not supported',
+              },
+            }),
+            400,
+          ),
+        ),
+      );
+      await expectLater(
+        precondition.verifyConnection(),
+        throwsA(GeminiFailure.unavailable),
+      );
+
+      final badModel = GeminiBackend(
+        apiKey: 'key',
+        client: MockClient(
+          (_) async => http.Response(
+            jsonEncode({
+              'error': {
+                'code': 400,
+                'status': 'INVALID_ARGUMENT',
+                'message': 'Invalid model name',
+              },
+            }),
+            400,
+          ),
+        ),
+      );
+      await expectLater(
+        badModel.verifyConnection(),
         throwsA(GeminiFailure.invalidModel),
+      );
+
+      final badKey = GeminiBackend(
+        apiKey: 'key',
+        client: MockClient(
+          (_) async => http.Response(
+            jsonEncode({
+              'error': {
+                'code': 400,
+                'details': [
+                  {'reason': 'API_KEY_INVALID'},
+                ],
+              },
+            }),
+            400,
+          ),
+        ),
+      );
+      await expectLater(
+        badKey.verifyConnection(),
+        throwsA(GeminiFailure.invalidKey),
       );
 
       final sock = GeminiBackend(

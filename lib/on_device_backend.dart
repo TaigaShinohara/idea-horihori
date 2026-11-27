@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_device_ai/flutter_device_ai.dart';
+import 'package:flutter_device_ai/flutter_device_ai_platform_interface.dart';
 
 import 'ai_backend.dart';
 import 'dig_mode.dart';
@@ -48,13 +49,15 @@ abstract class OnDeviceTextClient {
 
 class FlutterOnDeviceClient implements OnDeviceTextClient {
   final FlutterDeviceAi _ai;
+  final bool _useCustomAi;
   final void Function(double?)? onDownloadProgress;
   StreamIterator<ModelDownloadStatus>? _download;
-  OnDeviceAiSession? _session;
+  Future<void> Function()? _closeActiveSession;
   int _revision = 0;
 
   FlutterOnDeviceClient({FlutterDeviceAi? ai, this.onDownloadProgress})
-    : _ai = ai ?? FlutterDeviceAi.withFallback();
+    : _ai = ai ?? FlutterDeviceAi.withFallback(),
+      _useCustomAi = ai != null;
 
   void _checkCurrent(int revision) {
     if (revision != _revision) throw const AiCancelled();
@@ -63,10 +66,14 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
   @override
   Future<OnDeviceCheck> checkStatus() async {
     final availability = await _ai.availability();
+    final isIosNotReady =
+        defaultTargetPlatform == TargetPlatform.iOS &&
+        (availability.status == ModelFeatureStatus.downloadable ||
+            availability.status == ModelFeatureStatus.downloading);
     final status = switch (availability.status) {
       ModelFeatureStatus.available => OnDeviceStatus.available,
       ModelFeatureStatus.downloadable || ModelFeatureStatus.downloading =>
-        defaultTargetPlatform == TargetPlatform.iOS
+        isIosNotReady
             ? OnDeviceStatus.unavailable
             : OnDeviceStatus.needsDownload,
       ModelFeatureStatus.unavailable
@@ -74,7 +81,10 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
         OnDeviceStatus.checkFailed,
       ModelFeatureStatus.unavailable => OnDeviceStatus.unavailable,
     };
-    return OnDeviceCheck(status, availability.message);
+    final message = isIosNotReady
+        ? 'Apple Intelligence の準備が完了していない可能性があります。端末の設定を確認してください。'
+        : availability.message;
+    return OnDeviceCheck(status, message);
   }
 
   @override
@@ -88,7 +98,7 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
         final event = iterator.current;
         if (event.status == ModelFeatureStatus.available) return;
         if (event.status == ModelFeatureStatus.unavailable) {
-          throw OnDeviceException(event.errorMessage ?? 'モデルを取得できませんでした。');
+          throw const OnDeviceException('モデルを取得できませんでした。');
         }
         onDownloadProgress?.call(event.progress?.clamp(0.0, 1.0));
       }
@@ -105,7 +115,11 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
   }
 
   @override
-  Future<String> generate(String prompt, {Map<String, Object>? schema}) async {
+  Future<String> generate(
+    String prompt, {
+    Map<String, Object>? schema,
+    bool bypassAvailabilityCheck = false,
+  }) async {
     final revision = _revision;
     // 専用のシステム指示はNano V3以降で使える。指示はテキストに含める。
     final useSchema = schema != null && _usesNativeSchemas;
@@ -116,10 +130,14 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
       schema: useSchema ? schema : null,
       maxRepairAttempts: 0,
     );
+    if (bypassAvailabilityCheck && !_useCustomAi) {
+      return _generateBypassingAvailability(revision, prompt, config);
+    }
     final session = await _ai.createSession(config: config);
+    Future<void> closeSession() => session.close();
     try {
       _checkCurrent(revision);
-      _session = session;
+      _closeActiveSession = closeSession;
       final tokens = await _countTokens(session, prompt);
       _checkCurrent(revision);
       if (tokens > 3400) throw const _OnDeviceInputTooLong();
@@ -127,34 +145,79 @@ class FlutterOnDeviceClient implements OnDeviceTextClient {
       _checkCurrent(revision);
       return response.text;
     } finally {
-      if (identical(_session, session)) _session = null;
-      await _release(session.close());
+      if (identical(_closeActiveSession, closeSession)) {
+        _closeActiveSession = null;
+      }
+      await _release(closeSession());
+    }
+  }
+
+  Future<String> _generateBypassingAvailability(
+    int revision,
+    String prompt,
+    GenerationConfig config,
+  ) async {
+    final platform = FlutterDeviceAiPlatform.instance;
+    final sessionId = await platform.createSession(config: config);
+    Future<void> closeSession() => platform.sessionClose(sessionId);
+    try {
+      _checkCurrent(revision);
+      _closeActiveSession = closeSession;
+      final tokens = await _countTokensWith(
+        () => platform.sessionCountTokens(sessionId, text: prompt),
+        prompt,
+      );
+      _checkCurrent(revision);
+      if (tokens > 3400) throw const _OnDeviceInputTooLong();
+      await platform.sessionAddQuery(sessionId, prompt);
+      _checkCurrent(revision);
+      final response = await platform.sessionGetResponse(
+        sessionId,
+        config: config,
+      );
+      _checkCurrent(revision);
+      return response.text;
+    } finally {
+      if (identical(_closeActiveSession, closeSession)) {
+        _closeActiveSession = null;
+      }
+      await _release(closeSession());
     }
   }
 
   static int _estimateTokens(String prompt) =>
       (prompt.runes.length * 1.2).ceil();
 
-  Future<int> _countTokens(OnDeviceAiSession session, String prompt) async {
+  Future<int> _countTokens(OnDeviceAiSession session, String prompt) =>
+      _countTokensWith(() => session.countTokens(text: prompt), prompt);
+
+  Future<int> _countTokensWith(
+    Future<int> Function() count,
+    String prompt,
+  ) async {
+    final estimated = _estimateTokens(prompt);
     try {
-      return await session
-          .countTokens(text: prompt)
-          .timeout(const Duration(seconds: 2));
+      final nativeCount = await count().timeout(const Duration(seconds: 2));
+      if (defaultTargetPlatform == TargetPlatform.iOS ||
+          defaultTargetPlatform == TargetPlatform.macOS) {
+        return nativeCount > estimated ? nativeCount : estimated;
+      }
+      return nativeCount;
     } on OnDeviceAiException {
-      return _estimateTokens(prompt);
+      return estimated;
     } on TimeoutException {
-      return _estimateTokens(prompt);
+      return estimated;
     }
   }
 
   void cancelPending() {
     _revision++;
     final download = _download;
-    final session = _session;
+    final closeSession = _closeActiveSession;
     _download = null;
-    _session = null;
+    _closeActiveSession = null;
     if (download != null) unawaited(_release(download.cancel()));
-    if (session != null) unawaited(_release(session.close()));
+    if (closeSession != null) unawaited(_release(closeSession()));
   }
 
   Future<void> _release(Future<void> operation) async {
@@ -185,6 +248,7 @@ class OnDeviceBackend implements GuidedDigBackend {
   final Duration generateTimeout;
   final OnDeviceCheck? Function()? readCachedStatus;
   final void Function(OnDeviceCheck)? writeCachedStatus;
+  final void Function()? clearCachedStatus;
   int _revision = 0;
 
   String? lastError;
@@ -196,6 +260,7 @@ class OnDeviceBackend implements GuidedDigBackend {
     void Function(double?)? onDownloadProgress,
     this.readCachedStatus,
     this.writeCachedStatus,
+    this.clearCachedStatus,
     this.statusTimeout = const Duration(seconds: 6),
     this.downloadTimeout = const Duration(seconds: 120),
     this.generateTimeout = const Duration(seconds: 18),
@@ -215,6 +280,27 @@ class OnDeviceBackend implements GuidedDigBackend {
     if (client is FlutterOnDeviceClient) client.cancelPending();
   }
 
+  String _describeAiError(Object error, {required String fallback}) {
+    if (error is OnDeviceAiUnavailableException) {
+      return '$onDeviceModelNameは現在利用できません。';
+    }
+    if (error is OnDeviceAiUnsupportedException) {
+      return 'この端末では$onDeviceModelNameを利用できません。';
+    }
+    if (error is OnDeviceAiSessionBusyException) {
+      return '$onDeviceModelNameが別の処理を実行中です。少し待ってからもう一度お試しください。';
+    }
+    if (error is OnDeviceAiCancelledException) {
+      return '$onDeviceModelNameの処理を中断しました。';
+    }
+    if (error is OnDeviceAiGenerationException ||
+        error is OnDeviceAiStructuredOutputException ||
+        error is OnDeviceAiSchemaException) {
+      return '$onDeviceModelNameから応答を取得できませんでした。';
+    }
+    return fallback;
+  }
+
   Future<void> _prepare(
     int revision, {
     required bool allowDownload,
@@ -228,7 +314,12 @@ class OnDeviceBackend implements GuidedDigBackend {
             cached.status == OnDeviceStatus.needsDownload)) {
       check = cached;
     } else {
-      check = await _client.checkStatus().timeout(statusTimeout);
+      try {
+        check = await _client.checkStatus().timeout(statusTimeout);
+      } catch (_) {
+        if (revision == _revision) clearCachedStatus?.call();
+        rethrow;
+      }
       _checkCurrent(revision);
       writeCachedStatus?.call(check);
     }
@@ -251,9 +342,8 @@ class OnDeviceBackend implements GuidedDigBackend {
         // 通る端末がある（Pixel 10 Pro で実測: checkStatus が
         // 「Could not query AICore: null」を返す一方、別パッケージの
         // 検証版では生成が成功した。docs/ONDEVICE_POC.md 参照）。
-        // プラグインの生成経路は checkStatus を経由しないため、
-        // 生成系の呼び出しでは「使えない」と決めつけず、実際に
-        // 生成を1回試して結果で判定する（probe）。
+        // プラグインの生成経路は availability() を挟まないプラットフォーム層で
+        // 実際に生成を1回試して結果で判定する（probe）。
         if (!probeOnCheckFailed) {
           lifecycle = OnDeviceLifecycle.unavailable;
           throw OnDeviceException(
@@ -281,13 +371,18 @@ class OnDeviceBackend implements GuidedDigBackend {
       return result;
     } on TimeoutException {
       lastStatus = OnDeviceStatus.checkFailed;
+      clearCachedStatus?.call();
       return OnDeviceCheck(
         OnDeviceStatus.checkFailed,
         '$onDeviceServiceNameから時間内に応答がありませんでした。',
       );
-    } catch (error) {
+    } catch (_) {
       lastStatus = OnDeviceStatus.checkFailed;
-      return OnDeviceCheck(OnDeviceStatus.checkFailed, error.toString());
+      clearCachedStatus?.call();
+      return OnDeviceCheck(
+        OnDeviceStatus.checkFailed,
+        '$onDeviceServiceNameの状態を確認できませんでした。',
+      );
     }
   }
 
@@ -317,7 +412,7 @@ class OnDeviceBackend implements GuidedDigBackend {
       final failure = error is OnDeviceException
           ? error
           : OnDeviceException(
-              '端末AIの準備に失敗しました。${error is OnDeviceAiException ? ' ${error.message}' : ''}',
+              _describeAiError(error, fallback: '端末AIの準備に失敗しました。'),
             );
       lastError = failure.message;
       throw failure;
@@ -360,6 +455,7 @@ class OnDeviceBackend implements GuidedDigBackend {
         prompt,
         parse,
         schema,
+        bypassAvailabilityCheck: lastStatus == OnDeviceStatus.checkFailed,
       ).timeout(generateTimeout);
       if (lastStatus == OnDeviceStatus.checkFailed) {
         // 状態確認は失敗したが生成は通った。生成の成功が事実として
@@ -386,7 +482,10 @@ class OnDeviceBackend implements GuidedDigBackend {
       final failure = error is OnDeviceException
           ? error
           : OnDeviceException(
-              '$onDeviceModelNameの処理に失敗しました。${error is OnDeviceAiException ? ' ${error.message}' : ''}',
+              _describeAiError(
+                error,
+                fallback: '$onDeviceModelNameの処理に失敗しました。',
+              ),
             );
       lastError = failure.message;
       throw failure;
@@ -397,8 +496,9 @@ class OnDeviceBackend implements GuidedDigBackend {
     int revision,
     String Function(int budget) prompt,
     T? Function(String text, int budget) parse,
-    Map<String, Object> Function(int budget)? schema,
-  ) async {
+    Map<String, Object> Function(int budget)? schema, {
+    bool bypassAvailabilityCheck = false,
+  }) async {
     var budget = Prompts.nanoBudget;
     var inputTooLong = false;
     for (var attempt = 0; attempt < 2; attempt++) {
@@ -408,7 +508,11 @@ class OnDeviceBackend implements GuidedDigBackend {
         final client = _client;
         final input = prompt(budget);
         final text = client is FlutterOnDeviceClient
-            ? await client.generate(input, schema: schema?.call(budget))
+            ? await client.generate(
+                input,
+                schema: schema?.call(budget),
+                bypassAvailabilityCheck: bypassAvailabilityCheck,
+              )
             : await client.generate(input);
         _checkCurrent(revision);
         final value = parse(text, budget);
@@ -539,6 +643,7 @@ class OnDeviceBackend implements GuidedDigBackend {
         final names = Prompts.parseNameCandidates(text);
         return names.length == 3 ? names : null;
       },
+      schema: (_) => Prompts.nameCandidatesSchema,
     );
   }
 }

@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'dig_mode.dart';
 import 'first_dig.dart';
 import 'models.dart';
-import 'review_draft_grounding.dart';
 
 /// Gemini へ渡すプロンプト生成と、応答JSONの解釈（純ロジック寄り）。
 class Prompts {
@@ -14,25 +13,52 @@ class Prompts {
   static const int nanoBudget = 1550;
   static const int compactNanoBudget = 750;
   static const _memoFields = ['what', 'who', 'why', 'how', 'nextStep'];
-  static const _draftFields = ['what', 'who', 'why', 'how', 'openQuestions'];
+  static const _draftFields = [
+    'what',
+    'who',
+    'why',
+    'how',
+    'openQuestions',
+    'nextStep',
+  ];
   static const reviewMemoSchema = {
     'type': 'object',
     'properties': {
-      'what': {'type': 'string', 'description': '作るものを決めた回答のID、なければnone'},
-      'who': {'type': 'string', 'description': '利用者を示した回答のID、なければnone'},
-      'why': {'type': 'string', 'description': '困りごとを話した回答のID、なければnone'},
-      'how': {'type': 'string', 'description': '手段を選んだ回答のID、なければnone'},
-      'openQuestions': {'type': 'string', 'description': '未確認の内容を話した回答のID、なければnone'},
+      'what': {'type': 'string', 'description': '何を作るか（未定なら空文字）'},
+      'who': {'type': 'string', 'description': '誰のためか（未定なら空文字）'},
+      'why': {'type': 'string', 'description': 'どんな困りごとを解くか（未定なら空文字）'},
+      'how': {'type': 'string', 'description': 'どうやって助けるか（未定なら空文字）'},
+      'openQuestions': {'type': 'string', 'description': '未確認・迷っていること（なければ空文字）'},
+      'nextStep': {'type': 'string', 'description': '次に試すこと（未定なら空文字）'},
     },
     'required': _draftFields,
   };
+
+  static const nameCandidatesSchema = {
+    'type': 'object',
+    'properties': {
+      'candidates': {
+        'type': 'array',
+        'items': {'type': 'string'},
+        'minItems': 3,
+        'maxItems': 3,
+      },
+    },
+    'required': ['candidates'],
+  };
+  static final _unsafeControlChars = RegExp(
+    r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\u0080-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]',
+  );
+  static final _unsafeIdControlChars = RegExp(
+    r'[\x00-\x1F\x7F\u0080-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]',
+  );
 
   /// AI出力の安全検証（S-03: UI側で自動リンク化しないプレーンテキスト表示前提）。
   /// 制御文字・空文字・過大長を拒否する。
   static bool _safeText(String value) {
     final text = value.trim();
     if (text.isEmpty || text.length > maxTextLength) return false;
-    if (RegExp(r'[\x00-\x08\x0B\x0C\x0E-\x1F]').hasMatch(text)) return false;
+    if (_unsafeControlChars.hasMatch(text)) return false;
     return true;
   }
 
@@ -177,6 +203,7 @@ ${_historyText(history, budget)}
         .join('\n');
     final viewpointLine = viewpoint.promptLine;
     final tone = style == DigStyle.friend ? '' : '具体的な未決事項を優先する。';
+    final exampleKey = keys.isEmpty ? 'scene' : keys.first;
     return (
       prompt: '''
 アプリ企画の最初に聞く観点を選ぶ。質問文は作らない。
@@ -184,7 +211,7 @@ ${_historyText(history, budget)}
 元メモ: $noteText
 $descriptions
 具体的な場面がまだ書かれていなければ scene。決まっていることは聞き直さない。$tone${viewpointLine == null ? '' : '\n$viewpointLine。'}
-許可された観点のキーを一つ選ぶ。${structuredOutput ? '' : 'JSONのみ。キーは choice。'}
+許可された観点のキーを一つ選ぶ。${structuredOutput ? '' : 'JSONのみ（コードフェンス禁止）: {"choice":"$exampleKey"}'}
 ''',
       anchorSource: anchorSource,
       schema: _choiceSchema(keys),
@@ -213,6 +240,7 @@ $descriptions
         .map((focus) => '${focus.name}: ${focus.description}')
         .join('\n');
     final viewpointLine = viewpoint.promptLine;
+    final exampleKey = keys.first;
     return (
       prompt: '''
 アプリ企画で次に確かめたいことを分類する。質問文は作らない。
@@ -225,7 +253,7 @@ $evidence
 分類:
 $descriptions
 情報そのものが入手できない場合は findInformation。候補はあるが見分けられないなら tellApart。知っていた内容を忘れたときだけ rememberInTime。選んだ観点の理由がある文を根拠にする。仮の例や否定された手段を本人の決定と扱わない。どれにも当てはまらない場合は observeOnce。${viewpointLine == null ? '' : '\n回答に根拠があれば、$viewpointLine。'}
-許可された「分類:根拠の番号」を一つ選ぶ: ${keys.join('、')}${structuredOutput ? '' : '\nJSONのみ。キーは choice。'}
+許可された「分類:根拠の番号」を一つ選ぶ: ${keys.join('、')}${structuredOutput ? '' : '\nJSONのみ（コードフェンス禁止）: {"choice":"$exampleKey"}'}
 ''',
       anchorSource: source,
       schema: _choiceSchema(keys),
@@ -246,8 +274,10 @@ $descriptions
     required String anchorSource,
     DigStyle style = DigStyle.friend,
   }) {
-    final choice = extractJson(text)?['choice'];
-    if (choice is! String) return null;
+    final rawChoice = extractJson(text)?['choice'];
+    if (rawChoice is! String) return null;
+    final choice = rawChoice.trim();
+    if (choice.isEmpty) return null;
     if (context.firstAnswer != null) {
       return context.followUpQuestion(choice, anchorSource, style: style);
     }
@@ -275,24 +305,6 @@ $descriptions
   }) {
     final titleText = _clip(title, 120);
     final noteText = note.trim();
-    if (reviewDraft) {
-      final evidence = ReviewDraftGrounding.fromAnswers(
-        history,
-        budget: budget,
-        note: noteText,
-      );
-      final noteForContext = _summaryNote(noteText, budget ~/ 3);
-      const plainFormat =
-          '\nJSONオブジェクトのみ。キーは what, who, why, how, openQuestions。コードフェンス禁止。';
-      return '''
-アプリ「$titleText」の確認用下書きに使える回答を選ぶ。
-各欄は、下にある回答IDを一つか none のみ。文章を作らない。同じ回答は最も合う欄一つだけ。
-各回答の角括弧にある欄にだけ、その回答IDを入れられる。元メモと食い違う回答や、適切な欄がない回答は選ばない。
-元メモ（条件の確認用）: $noteForContext
-本人の回答と使える欄:
-${evidence.promptEvidence}${structuredOutput ? '' : plainFormat}
-''';
-    }
     const noteHeading = '\n元メモ（本人の原文・制約）:\n';
     const historyHeading = '\n今回のQ&A:\n';
     const previousHeading = '\n前回の企画メモ（今回の入力とは別の参考情報）:\n';
@@ -326,6 +338,16 @@ ${evidence.promptEvidence}${structuredOutput ? '' : plainFormat}
     final previousPart = latestMemo == null || previousTextBudget < 40
         ? ''
         : '$previousHeading${_clip(_memoText(latestMemo, budget ~/ 2), previousTextBudget)}';
+    if (reviewDraft) {
+      const plainFormat =
+          '\n出力はJSONのみ（コードフェンス禁止）:\n'
+          '{"what":"何を作るか","who":"誰のためか","why":"どんな困りごとを解くか","how":"どうやって助けるか","openQuestions":"未確認のこと","nextStep":"次に試すこと"}';
+      return '''
+アプリのアイデア「$titleText」の確認用下書きを整理してください。あなたの役割: ${style.personaPrompt}$notePart$historyHeading$historyPart$previousPart
+各項目は元メモの制約と今回の回答をふまえ、1〜2文の簡潔な日本語でまとめてください。
+根拠のない内容は加えず、まだ決まっていない項目は空文字 "" にしてください。${structuredOutput ? '' : plainFormat}
+''';
+    }
     return '''
 アプリのアイデア「$titleText」の企画メモを整理してください。あなたの役割: ${style.personaPrompt}$notePart$historyHeading$historyPart$previousPart
 各項目は1〜2文の日本語で、元メモの制約と今回の回答を守り、根拠のない内容は加えず未確認と書いてください。
@@ -441,6 +463,10 @@ ${_memoText(memo, budget)}
     final rawId = j['id'];
     if (rawId != null && rawId is! String) return null;
     final id = (rawId as String?)?.trim() ?? '';
+    if (id.isNotEmpty &&
+        (id.length > 64 || _unsafeIdControlChars.hasMatch(id))) {
+      return null;
+    }
     return DigQuestion(
       id: id.isEmpty ? 'ai' : id,
       text: qText,
@@ -460,20 +486,31 @@ ${_memoText(memo, budget)}
     final j = extractJson(text);
     if (j == null) return null;
     if (reviewDraft) {
-      final selection = <String, String>{};
+      final values = <String, String>{};
       for (final key in _draftFields) {
-        final value = j[key];
-        if (value is! String) return null;
-        selection[key] = value.trim();
+        final raw = j[key];
+        if (raw == null) {
+          values[key] = '';
+          continue;
+        }
+        if (raw is! String) return null;
+        final trimmed = raw.trim();
+        if (trimmed.isEmpty || trimmed.toLowerCase() == 'none') {
+          values[key] = '';
+          continue;
+        }
+        if (!_safeText(trimmed)) return null;
+        values[key] = trimmed;
       }
-      return ReviewDraftGrounding.fromAnswers(
-        history,
-        budget: budget,
-        note: note,
-      ).build(
+      return PlanMemo(
+        what: values['what'] ?? '',
+        who: values['who'] ?? '',
+        why: values['why'] ?? '',
+        how: values['how'] ?? '',
+        nextStep: values['nextStep'] ?? '',
+        openQuestions: values['openQuestions'] ?? '',
+        createdAt: now ?? DateTime.now(),
         version: version,
-        now: now,
-        selection: selection,
       );
     }
     final values = <String>[];

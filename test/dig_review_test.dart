@@ -112,6 +112,7 @@ void main() {
     expect(idea.resumableSession!.pendingQuestion, isNull);
     await tapText(tester, 'ここまでをまとめる');
     expect(find.text('企画メモを確認'), findsOneWidget);
+    expect(find.text('定型'), findsOneWidget);
     expect(idea.memos, isEmpty);
     await tapText(tester, '元メモと回答');
     expect(find.text('端末外に画像を送らない。'), findsOneWidget);

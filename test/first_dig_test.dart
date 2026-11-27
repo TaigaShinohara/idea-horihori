@@ -225,8 +225,8 @@ void main() {
       'who': '',
       'why': '',
       'how': '',
-      'nextStep': 'a1',
-      'openQuestions': 'a2',
+      'nextStep': 'まず注文メールに期限が書いてあるか確かめる。',
+      'openQuestions': '期限が案内される場所は未確認。',
       'ease': 3,
       'spark': 3,
     };
@@ -234,15 +234,6 @@ void main() {
       jsonEncode(draft),
       version: 1,
       reviewDraft: true,
-      history: const [
-        QaEntry(
-          questionId: 'next',
-          question: '最初の一歩はどれ？',
-          answer: 'まず注文メールに期限が書いてあるか確かめる。',
-          source: AnswerSource.local,
-        ),
-        QaEntry(questionId: 'q2', question: '何が未定？', answer: '期限が案内される場所は未確認。'),
-      ],
     );
     expect(memo?.nextStep, 'まず注文メールに期限が書いてあるか確かめる。');
     expect(memo?.openQuestions, '期限が案内される場所は未確認。');

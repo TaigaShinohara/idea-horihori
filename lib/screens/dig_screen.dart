@@ -114,7 +114,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _backend.cancelPending();
+    _backend.dispose();
     _freeCtrl.dispose();
     super.dispose();
   }
@@ -182,7 +182,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
         MaterialPageRoute(builder: (_) => SettingsScreen(store: widget.store)),
       );
       if (!mounted || _leaving) return;
-      _backend.cancelPending();
+      _backend.dispose();
       _initBackend();
       setState(() {
         _returnedFromSettings = _question?.source == AnswerSource.local;
@@ -193,19 +193,30 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     }
   }
 
+  (bool hasCloudConfig, bool hasCloudConsent) _cloudConfigStatus() {
+    final hasCloudConfig =
+        widget.store.hasRemoteKey || widget.store.chatGptSignedIn;
+    final hasCloudConsent =
+        (widget.store.hasRemoteKey && widget.store.remoteConsent) ||
+        (widget.store.chatGptSignedIn && widget.store.chatGptConsent);
+    return (hasCloudConfig, hasCloudConsent);
+  }
+
   FallbackReason? _currentFallbackReason() {
     if (_busy || _question?.source != AnswerSource.local) return null;
+    final (hasCloudConfig, hasCloudConsent) = _cloudConfigStatus();
     final fromBackend = _backend.fallbackReason(
-      hasRemoteKey: widget.store.hasRemoteKey,
-      remoteConsent: widget.store.remoteConsent,
+      hasRemoteKey: hasCloudConfig,
+      remoteConsent: hasCloudConsent,
     );
     if (fromBackend != null) return fromBackend;
     final cachedStatus = widget.store.cachedOnDeviceStatus?.status;
     return fallbackReasonFor(
       isLocalSource: true,
-      hasRemoteKey: widget.store.hasRemoteKey,
-      remoteConsent: widget.store.remoteConsent,
-      lastRemoteFailed: _backend.lastRemoteError != null,
+      hasRemoteKey: hasCloudConfig,
+      remoteConsent: hasCloudConsent,
+      lastRemoteFailed:
+          _backend.lastRemoteError != null || _backend.lastChatGptFailed,
       onDeviceNeedsDownload: cachedStatus == OnDeviceStatus.needsDownload,
       manualTemplate: _backend.lastManualTemplate,
     );
@@ -214,7 +225,12 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
   bool _canRetryWithAi() {
     if (_busy || _question?.source != AnswerSource.local) return false;
     if (_returnedFromSettings) return true;
-    if (_backend.lastRemoteError != null) return true;
+    if (_backend.lastRemoteError != null || _backend.lastChatGptFailed) {
+      return true;
+    }
+    if (widget.store.chatGptSignedIn && widget.store.chatGptConsent) {
+      return true;
+    }
     if (widget.store.hasRemoteKey && widget.store.remoteConsent) return true;
     if (widget.store.cachedOnDeviceStatus?.status == OnDeviceStatus.available) {
       return true;
@@ -337,9 +353,10 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       );
       if (!_current(request)) return;
       if (!different && generated.source == AnswerSource.local) {
+        final (hasCloudConfig, hasCloudConsent) = _cloudConfigStatus();
         final reason = _backend.fallbackReason(
-          hasRemoteKey: widget.store.hasRemoteKey,
-          remoteConsent: widget.store.remoteConsent,
+          hasRemoteKey: hasCloudConfig,
+          remoteConsent: hasCloudConsent,
         );
         setState(() {
           _question = previousQuestion;
@@ -771,6 +788,24 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     DigStyle.boss => '上司',
   };
 
+  String _loadingLabel() {
+    if (_saving) return '保存しています…';
+    if (_summarizing) {
+      return switch (_phase) {
+        AiPhase.onDevice => '端末AIで企画メモにまとめています…',
+        AiPhase.chatGpt => 'ChatGPTで企画メモにまとめています…',
+        AiPhase.cloud => 'Geminiで企画メモにまとめています…',
+        null => '企画メモにまとめています…',
+      };
+    }
+    return switch (_phase) {
+      AiPhase.onDevice => '端末AIで考えています…',
+      AiPhase.chatGpt => 'ChatGPTで考えています…',
+      AiPhase.cloud => 'Geminiで考えています…',
+      null => 'つぎの質問を考えています…',
+    };
+  }
+
   Widget _buildReview() {
     final draft = _session.reviewDraft!;
     final edited = _reviewEdit ?? draft.memo;
@@ -822,11 +857,11 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     final canSummarize = canSummarizeSession(_session);
     final displaySource = _question?.source ?? _backend.lastSource;
     final fallbackReason = _currentFallbackReason();
-    final showOneTimeSettings =
-        fallbackReason != null &&
-        fallbackReason.suggestsSettings &&
-        (!widget.store.keyGuideShown || _guidePrompted);
-    if (showOneTimeSettings && !_guidePrompted) {
+    final showSettingsButton =
+        fallbackReason != null && fallbackReason.suggestsSettings;
+    final showOneTimeGuide =
+        showSettingsButton && (!widget.store.keyGuideShown || _guidePrompted);
+    if (showOneTimeGuide && !_guidePrompted) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _maybeMarkKeyGuideShown(fallbackReason);
       });
@@ -880,11 +915,13 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                   // R-03: 1行固定最小高さヘッダ（モード／現在値チップ／進捗）。
                   // 留意1・M-01: Flexible + ellipsis と minHeight で狭幅・文字拡大時の溢れを防ぐ。
                   ConstrainedBox(
-                    constraints: const BoxConstraints(minHeight: 36),
+                    constraints: const BoxConstraints(minHeight: 48),
                     child: Row(
                       children: [
                         if (displaySource != null)
-                          _ModeBadge(source: displaySource)
+                          Flexible(
+                            child: _ModeBadge(source: displaySource),
+                          )
                         else
                           const SizedBox(width: 4),
                         const SizedBox(width: 8),
@@ -918,11 +955,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                                   const CircularProgressIndicator(),
                                   const SizedBox(height: 14),
                                   Text(
-                                    _saving
-                                        ? '保存しています…'
-                                        : _summarizing
-                                        ? '企画メモにまとめています…'
-                                        : 'つぎの質問を考えています…',
+                                    _loadingLabel(),
                                     textAlign: TextAlign.center,
                                     style: const TextStyle(fontSize: 15),
                                   ),
@@ -987,7 +1020,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                                         _retryNotice ??
                                         _backend.lastRemoteError?.message ??
                                         fallbackReason!.message,
-                                    showSettings: showOneTimeSettings,
+                                    showSettings: showSettingsButton,
                                     onOpenSettings: _openSettings,
                                     showRetryAi: canRetryAi,
                                     onRetryAi: _retryQuestionWithAi,
@@ -1146,7 +1179,9 @@ class _StyleViewpointChip extends StatelessWidget {
   Widget build(BuildContext context) {
     final accentText = accentTextColor(context);
     return Semantics(
+      container: true,
       button: true,
+      enabled: enabled,
       label: '掘り方と視点を変更。現在：$label',
       child: ExcludeSemantics(
         child: Material(
@@ -1154,38 +1189,47 @@ class _StyleViewpointChip extends StatelessWidget {
           child: InkWell(
             onTap: enabled ? onTap : null,
             borderRadius: BorderRadius.circular(99),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-              decoration: BoxDecoration(
-                color: barTrackColor(context),
-                borderRadius: BorderRadius.circular(99),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Flexible(
-                    child: Text(
-                      label,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(minHeight: 48),
+              child: Center(
+                widthFactor: 1,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: barTrackColor(context),
+                    borderRadius: BorderRadius.circular(99),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Flexible(
+                        child: Text(
+                          label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: enabled
+                                ? accentText
+                                : accentText.withValues(alpha: 0.45),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 2),
+                      Icon(
+                        Icons.arrow_drop_down,
+                        size: 16,
                         color: enabled
                             ? accentText
                             : accentText.withValues(alpha: 0.45),
                       ),
-                    ),
+                    ],
                   ),
-                  const SizedBox(width: 2),
-                  Icon(
-                    Icons.arrow_drop_down,
-                    size: 16,
-                    color: enabled
-                        ? accentText
-                        : accentText.withValues(alpha: 0.45),
-                  ),
-                ],
+                ),
               ),
             ),
           ),
@@ -1426,12 +1470,16 @@ class _ModeBadge extends StatelessWidget {
                 color: accentText,
               ),
               const SizedBox(width: 5),
-              Text(
-                fullLabel,
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.bold,
-                  color: accentText,
+              Flexible(
+                child: Text(
+                  fullLabel,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: accentText,
+                  ),
                 ),
               ),
             ],

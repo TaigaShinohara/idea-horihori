@@ -1,7 +1,10 @@
 // ignore_for_file: prefer_initializing_formals
 // （gateway / uploader / httpClient はテスト差し替え用の注入パラメータで、
 //   初期化フォーマルでは既定値つき差し替えを表せないため意図的に通常代入を使う）
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show SocketException;
+import 'dart:math';
 
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
@@ -184,27 +187,36 @@ class GoogleDriveUploader {
       'https://www.googleapis.com/upload/drive/v3/files';
   static const String googleDocMimeType =
       'application/vnd.google-apps.document';
-  static const String multipartBoundary = 'horihori-drive-boundary';
+  static const Duration uploadTimeout = Duration(seconds: 20);
 
   final http.Client? _httpClient;
 
   GoogleDriveUploader({http.Client? httpClient}) : _httpClient = httpClient;
 
+  /// multipart 境界を暗号学的に安全な乱数で生成する。
+  static String generateBoundary({Random? random}) {
+    final rng = random ?? Random.secure();
+    final bytes = List<int>.generate(16, (_) => rng.nextInt(256));
+    final token = base64Url.encode(bytes).replaceAll('=', '');
+    return 'horihori-drive-$token';
+  }
+
   /// multipart/related のボディを組み立てる（テスト可能な静的ヘルパー）。
   static String buildMultipartBody({
     required String name,
     required String content,
-    String boundary = multipartBoundary,
+    String? boundary,
   }) {
+    final resolvedBoundary = boundary ?? generateBoundary();
     final metadata = jsonEncode({'name': name, 'mimeType': googleDocMimeType});
     final buf = StringBuffer()
-      ..write('--$boundary\r\n')
+      ..write('--$resolvedBoundary\r\n')
       ..write('Content-Type: application/json; charset=UTF-8\r\n\r\n')
       ..write('$metadata\r\n')
-      ..write('--$boundary\r\n')
+      ..write('--$resolvedBoundary\r\n')
       ..write('Content-Type: text/plain; charset=UTF-8\r\n\r\n')
       ..write(content)
-      ..write('\r\n--$boundary--\r\n');
+      ..write('\r\n--$resolvedBoundary--\r\n');
     return buf.toString();
   }
 
@@ -241,23 +253,48 @@ class GoogleDriveUploader {
         'fields': 'id,name,webViewLink',
       },
     );
-    final headers = {
-      'Authorization': 'Bearer $accessToken',
-      'Content-Type': 'multipart/related; boundary=$multipartBoundary',
-    };
-    final bodyBytes = utf8.encode(
-      buildMultipartBody(name: name, content: content),
-    );
-    final client = _httpClient;
-    final response = client != null
-        ? await client.post(uri, headers: headers, body: bodyBytes)
-        : await http.post(uri, headers: headers, body: bodyBytes);
-    if (response.statusCode != 200) {
-      throw GoogleWorkspaceException(
-        'ドライブへの送信に失敗しました (Status: ${response.statusCode})',
+    final boundary = generateBoundary();
+    final request = http.Request('POST', uri)
+      ..followRedirects = false
+      ..headers['Authorization'] = 'Bearer $accessToken'
+      ..headers['Content-Type'] = 'multipart/related; boundary=$boundary'
+      ..bodyBytes = utf8.encode(
+        buildMultipartBody(name: name, content: content, boundary: boundary),
       );
+    final ownedClient = _httpClient == null ? http.Client() : null;
+    final client = _httpClient ?? ownedClient!;
+    try {
+      final response = await client
+          .send(request)
+          .then(http.Response.fromStream)
+          .timeout(uploadTimeout);
+      if (response.statusCode != 200) {
+        throw GoogleWorkspaceException(
+          'ドライブへの送信に失敗しました (Status: ${response.statusCode})',
+        );
+      }
+      return parseUploadResponse(utf8.decode(response.bodyBytes));
+    } on GoogleWorkspaceException {
+      rethrow;
+    } on TimeoutException {
+      throw const GoogleWorkspaceException(
+        'ドライブへの送信がタイムアウトしました。通信状況を確認してもう一度お試しください。',
+      );
+    } on http.ClientException {
+      throw const GoogleWorkspaceException(
+        'ドライブに接続できませんでした。通信状況を確認してください。',
+      );
+    } on SocketException {
+      throw const GoogleWorkspaceException(
+        'ドライブに接続できませんでした。通信状況を確認してください。',
+      );
+    } on FormatException {
+      throw const GoogleWorkspaceException(
+        'ドライブへの送信に失敗しました（応答形式が不正です）。',
+      );
+    } finally {
+      ownedClient?.close();
     }
-    return parseUploadResponse(utf8.decode(response.bodyBytes));
   }
 }
 
@@ -267,6 +304,16 @@ class GoogleDriveUploader {
 /// 正直に「未設定」を伝える。設定済みビルドでは、サインイン状態の確認、
 /// サインイン／サインアウト、企画メモのドキュメント化を提供する。
 class GoogleWorkspaceService {
+  static const Set<String> _allowedExternalHosts = {
+    'docs.google.com',
+    'drive.google.com',
+  };
+
+  /// 外部ブラウザで開くことを許可する Google ドキュメント／ドライブ URL か検証する。
+  static bool isAllowedExternalUrl(Uri uri) =>
+      uri.scheme == 'https' &&
+      uri.userInfo.isEmpty &&
+      _allowedExternalHosts.contains(uri.host.toLowerCase());
   final GoogleWorkspaceConfig config;
   final GoogleAccountGateway? _gatewayOverride;
   final GoogleDriveUploader _uploader;

@@ -230,6 +230,43 @@ void main() {
     }, () => client);
   });
 
+  test('AppLifecycleState.inactiveでは継続し、pausedでは送信停止する', () async {
+    final store = await cloudStore();
+    await http.runWithClient(() async {
+      binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      final ai = store.backend().remote!;
+      final q = await ai.nextQuestion(idea: _idea(), history: const []);
+      expect(q.text, '試しに聞く質問');
+
+      binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      await expectLater(
+        ai.nextQuestion(idea: _idea(), history: const []),
+        throwsA(GeminiFailure.revoked),
+      );
+    }, () => MockClient((_) async => _questionResponse()));
+  });
+
+  test('ChatGPT開始済みHTTPは同意撤回で即時中止される', () async {
+    final secrets = FakeSecretStore()
+      ..values['chatgpt_access_token'] = 'fake-token'
+      ..values['chatgpt_expires_at'] = DateTime.now()
+          .add(const Duration(hours: 1))
+          .toIso8601String();
+    final store = IdeaStore(secrets: secrets);
+    await store.load();
+    await store.saveChatGptConsent(true);
+    final client = _AbortClient();
+    await http.runWithClient(() async {
+      final cg = store.backend().chatGpt!;
+      final pending = cg.nextQuestion(idea: _idea(), history: const []);
+      final outcome = expectLater(pending, throwsA(isA<Exception>()));
+      await client.started.future;
+      await store.saveChatGptConsent(false);
+      await client.aborted.future;
+      await outcome;
+    }, () => client);
+  });
+
   test('キャンセル後の遅延結果を保存せず、その後の定型生成は進む', () async {
     final client = _PendingDevice();
     var requests = 0;

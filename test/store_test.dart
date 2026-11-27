@@ -182,4 +182,56 @@ void main() {
       expect(store.cachedOnDeviceStatus, isNull);
     });
   });
+
+  group('ChatGPT 送信同意', () {
+    test('未サインインで同意をオンにすると失敗し、サインイン後のみ有効化できる', () async {
+      var signedIn = false;
+      final store = IdeaStore(
+        secrets: FakeSecretStore(),
+        chatGptChecker: () async => signedIn,
+      );
+      await store.load();
+      expect(store.chatGptSignedIn, isFalse);
+      expect(store.chatGptConsent, isFalse);
+      expect(store.backend().chatGpt, isNull);
+
+      await expectLater(
+        store.saveChatGptConsent(true),
+        throwsA(
+          isA<StoreFailure>().having(
+            (e) => e.message,
+            'message',
+            '先にChatGPTでサインインしてください。',
+          ),
+        ),
+      );
+      expect(store.chatGptConsent, isFalse);
+
+      signedIn = true;
+      await store.refreshChatGptStatus();
+      expect(store.chatGptSignedIn, isTrue);
+      expect(store.chatGptConsent, isFalse);
+      expect(store.backend().chatGpt, isNull);
+
+      await store.saveChatGptConsent(true);
+      expect(store.chatGptConsent, isTrue);
+      expect(store.backend().chatGpt, isNotNull);
+
+      // 再読み込み後も同意が維持される
+      final reloaded = IdeaStore(
+        secrets: FakeSecretStore(),
+        chatGptChecker: () async => true,
+      );
+      await reloaded.load();
+      expect(reloaded.chatGptConsent, isTrue);
+      expect(reloaded.backend().chatGpt, isNotNull);
+
+      // サインアウト検知時は同意も false に落ちる
+      signedIn = false;
+      await store.refreshChatGptStatus();
+      expect(store.chatGptSignedIn, isFalse);
+      expect(store.chatGptConsent, isFalse);
+      expect(store.backend().chatGpt, isNull);
+    });
+  });
 }
