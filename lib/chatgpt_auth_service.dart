@@ -34,10 +34,15 @@ abstract class TokenStore {
 
 /// flutter_secure_storage による [TokenStore] 実装。
 class SecureTokenStore implements TokenStore {
+  static const FlutterSecureStorage _defaultStorage = FlutterSecureStorage(
+    iOptions: IOSOptions(
+      accessibility: KeychainAccessibility.unlocked_this_device,
+    ),
+  );
   final FlutterSecureStorage _storage;
 
   const SecureTokenStore([FlutterSecureStorage? storage])
-    : _storage = storage ?? const FlutterSecureStorage();
+    : _storage = storage ?? _defaultStorage;
 
   @override
   Future<String?> read(String key) => _storage.read(key: key);
@@ -81,6 +86,7 @@ class ChatGptAuthService {
   static const String redirectUri = 'http://localhost:1455/auth/callback';
   static const String scope = 'openid profile email offline_access';
   static const int callbackPort = 1455;
+  static const Duration tokenTimeout = Duration(seconds: 15);
 
   static const String _keyAccessToken = 'chatgpt_access_token';
   static const String _keyRefreshToken = 'chatgpt_refresh_token';
@@ -232,6 +238,7 @@ class ChatGptAuthService {
         callbackPort,
       );
     } catch (_) {
+      _pendingVerifier = null;
       throw const ChatGptAuthException(
         'サインイン用の待ち受けを開始できませんでした。しばらくしてから再試行してください。',
       );
@@ -247,11 +254,7 @@ class ChatGptAuthService {
         throw const ChatGptAuthException('ブラウザを開けませんでした。');
       }
 
-      final request = await server.first.timeout(
-        signInTimeout,
-        onTimeout: () =>
-            throw const ChatGptAuthException('サインインがタイムアウトしました。もう一度お試しください。'),
-      );
+      final request = await _waitForCallback(server);
 
       final params = request.uri.queryParameters;
       final error = params['error'];
@@ -287,8 +290,46 @@ class ChatGptAuthService {
         'サインインが完了しました。この画面を閉じてアプリに戻ってください。',
       );
       await exchangeCodeForTokens(code, verifier);
+    } catch (_) {
+      _pendingVerifier = null;
+      rethrow;
     } finally {
       await server.close(force: true);
+    }
+  }
+
+  Future<HttpRequest> _waitForCallback(HttpServer server) async {
+    final deadline = DateTime.now().add(signInTimeout);
+    final iterator = StreamIterator<HttpRequest>(server);
+    try {
+      while (true) {
+        final remaining = deadline.difference(DateTime.now());
+        if (remaining <= Duration.zero) {
+          throw const ChatGptAuthException(
+            'サインインがタイムアウトしました。もう一度お試しください。',
+          );
+        }
+        final hasNext = await iterator.moveNext().timeout(
+          remaining,
+          onTimeout: () => throw const ChatGptAuthException(
+            'サインインがタイムアウトしました。もう一度お試しください。',
+          ),
+        );
+        if (!hasNext) {
+          throw const ChatGptAuthException(
+            'サインイン用の待ち受けが終了しました。もう一度お試しください。',
+          );
+        }
+        final request = iterator.current;
+        if (request.uri.path != '/auth/callback') {
+          request.response.statusCode = HttpStatus.notFound;
+          await request.response.close();
+          continue;
+        }
+        return request;
+      }
+    } finally {
+      await iterator.cancel();
     }
   }
 
@@ -339,20 +380,45 @@ class ChatGptAuthService {
   }
 
   Future<Map<String, dynamic>> _postToken(Map<String, String> body) async {
-    final client = _httpClient;
-    final response = client != null
-        ? await client.post(Uri.parse(tokenUrl), body: body)
-        : await http.post(Uri.parse(tokenUrl), body: body);
-    if (response.statusCode != 200) {
-      throw ChatGptAuthException(
-        'トークンの取得に失敗しました (Status: ${response.statusCode})',
+    final request = http.Request('POST', Uri.parse(tokenUrl))
+      ..followRedirects = false
+      ..bodyFields = body;
+    final ownedClient = _httpClient == null ? http.Client() : null;
+    final client = _httpClient ?? ownedClient!;
+    try {
+      final response = await client
+          .send(request)
+          .then(http.Response.fromStream)
+          .timeout(tokenTimeout);
+      if (response.statusCode != 200) {
+        throw ChatGptAuthException(
+          'トークンの取得に失敗しました (Status: ${response.statusCode})',
+        );
+      }
+      final decoded = json.decode(utf8.decode(response.bodyBytes));
+      if (decoded is! Map<String, dynamic>) {
+        throw const ChatGptAuthException('トークンの取得に失敗しました（応答形式が不正です）。');
+      }
+      return decoded;
+    } on ChatGptAuthException {
+      rethrow;
+    } on TimeoutException {
+      throw const ChatGptAuthException(
+        'トークンの取得がタイムアウトしました。通信状況を確認してもう一度お試しください。',
       );
-    }
-    final decoded = json.decode(utf8.decode(response.bodyBytes));
-    if (decoded is! Map<String, dynamic>) {
+    } on http.ClientException {
+      throw const ChatGptAuthException(
+        '認証サーバーに接続できませんでした。通信状況を確認してください。',
+      );
+    } on SocketException {
+      throw const ChatGptAuthException(
+        '認証サーバーに接続できませんでした。通信状況を確認してください。',
+      );
+    } on FormatException {
       throw const ChatGptAuthException('トークンの取得に失敗しました（応答形式が不正です）。');
+    } finally {
+      ownedClient?.close();
     }
-    return decoded;
   }
 
   Future<void> _persist(ChatGptTokens tokens) async {
@@ -440,15 +506,39 @@ class ChatGptAuthService {
   }
 
   Future<void> signOut() async {
-    try {
-      await _store.delete(_keyAccessToken);
-      await _store.delete(_keyRefreshToken);
-      await _store.delete(_keyIdToken);
-      await _store.delete(_keyAccountId);
-      await _store.delete(_keyExpiresAt);
-    } catch (_) {
-      // 保存先が無い環境では何もしない
-    }
     _pendingVerifier = null;
+    Object? failure;
+    for (final key in const [
+      _keyAccessToken,
+      _keyRefreshToken,
+      _keyIdToken,
+      _keyAccountId,
+      _keyExpiresAt,
+    ]) {
+      try {
+        await _store.delete(key);
+      } catch (e) {
+        failure ??= e;
+      }
+    }
+    if (failure != null) {
+      throw const ChatGptAuthException(
+        'サインアウトの保存削除に失敗しました。もう一度お試しください。',
+      );
+    }
+    try {
+      final remaining = await _store.read(_keyAccessToken);
+      if (remaining != null && remaining.isNotEmpty) {
+        throw const ChatGptAuthException(
+          'サインアウトの確認に失敗しました。もう一度お試しください。',
+        );
+      }
+    } on ChatGptAuthException {
+      rethrow;
+    } catch (_) {
+      throw const ChatGptAuthException(
+        'サインアウトの確認に失敗しました。もう一度お試しください。',
+      );
+    }
   }
 }

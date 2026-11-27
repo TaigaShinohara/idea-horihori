@@ -1,8 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:horihori/ai_backend.dart';
 import 'package:horihori/dig_mode.dart';
+import 'package:horihori/first_dig.dart';
 import 'package:horihori/models.dart';
 import 'package:horihori/on_device_backend.dart';
 import 'package:horihori/screens/archive_screen.dart';
@@ -42,11 +45,16 @@ class _TestIdeaStore extends IdeaStore {
     this.client,
     this.failSaveDigStyle = false,
     this.saveModelCompleter,
+    this.customBackend,
   }) : super(secrets: _MemorySecretStore());
 
   final OnDeviceTextClient? client;
   bool failSaveDigStyle;
   Completer<void>? saveModelCompleter;
+  ResilientBackend? customBackend;
+
+  @override
+  ResilientBackend backend() => customBackend ?? super.backend();
 
   @override
   OnDeviceBackend onDeviceBackend({
@@ -126,9 +134,16 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(
+        find.text('AIの優先順：端末AI → ChatGPT → Gemini API → 定型'),
+        findsOneWidget,
+      );
+      expect(
         find.text('AICoreの状態を確認できませんでした（使えないと確定ではありません）。下の「質問を試す」で、実際に生成できるか確かめられます。'),
         findsOneWidget,
       );
+      expect(find.widgetWithText(FilledButton, '質問を試す'), findsOneWidget);
+      expect(find.text('端末AIが使えないときにChatGPTを使う'), findsOneWidget);
+      expect(find.textContaining('OpenAIへ送信します'), findsOneWidget);
       // v0.4.0 で ChatGPT カードが増え「詳細・動作確認」が ListView の
       // 構築範囲外に出たため、ListView を明示してスクロールで出現させる
       // （Scrollable が複数あるため scrollUntilVisible の既定探索は使えない）。
@@ -139,6 +154,16 @@ void main() {
       );
       await tester.tap(find.text('詳細・動作確認'));
       await tester.pumpAndSettle();
+
+      await tester.dragUntilVisible(
+        find.text('モデル名を保存'),
+        find.byType(ListView),
+        const Offset(0, -100),
+      );
+      expect(
+        find.widgetWithText(OutlinedButton, 'モデル名を保存'),
+        findsOneWidget,
+      );
 
       await tester.dragUntilVisible(
         find.text('状態を確認する'),
@@ -178,7 +203,13 @@ void main() {
       await tester.tap(find.text('open'));
       await tester.pumpAndSettle();
 
+      await tester.dragUntilVisible(
+        find.text('保存する'),
+        find.byType(ListView),
+        const Offset(0, -150),
+      );
       await tester.ensureVisible(find.text('保存する'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('保存する'));
       await tester.pump();
 
@@ -190,6 +221,37 @@ void main() {
 
       final popScopeAfter = tester.widget<PopScope>(find.byType(PopScope));
       expect(popScopeAfter.canPop, isTrue);
+    });
+
+    testWidgets('background lifecycle re-obscures API key field', (
+      tester,
+    ) async {
+      final store = _TestIdeaStore();
+      await store.load();
+
+      await tester.pumpWidget(MaterialApp(home: SettingsScreen(store: store)));
+      await tester.pumpAndSettle();
+
+      await tester.dragUntilVisible(
+        find.byTooltip('APIキーを表示'),
+        find.byType(ListView),
+        const Offset(0, -150),
+      );
+      await tester.ensureVisible(find.byTooltip('APIキーを表示'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('APIキーを表示'));
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('APIキーを隠す'), findsOneWidget);
+
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      await tester.pump();
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('APIキーを表示'), findsOneWidget);
     });
   });
 
@@ -296,6 +358,52 @@ void main() {
 
       expect(tester.takeException(), isNull);
     });
+
+    testWidgets('DigScreen keeps settings button even after keyGuideShown and shows phase label', (
+      tester,
+    ) async {
+      final completer = Completer<DigQuestion>();
+      final backend = _PhaseTestBackend(completer);
+      final store = _TestIdeaStore(customBackend: backend);
+      await store.load();
+      await store.markKeyGuideShown();
+      final idea = await store.addIdea('アイデアタイトル', '');
+
+      await tester.pumpWidget(
+        _wrapApp(DigScreen(store: store, idea: idea)),
+      );
+      await tester.pump();
+
+      backend.onPhase?.call(AiPhase.chatGpt);
+      await tester.pump();
+      expect(find.text('ChatGPTで考えています…'), findsOneWidget);
+
+      backend.onPhase?.call(AiPhase.cloud);
+      await tester.pump();
+      expect(find.text('Geminiで考えています…'), findsOneWidget);
+
+      backend.lastSource = AnswerSource.local;
+      completer.complete(
+        const DigQuestion(
+          id: 'q1',
+          text: '誰のため？',
+          choices: ['自分', '友達', '家族'],
+          source: AnswerSource.local,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('設定を開く'), findsOneWidget);
+      final semantics = tester.ensureSemantics();
+      try {
+        await tester.pump();
+        final chipFinder = find.bySemanticsLabel('掘り方と視点を変更。現在：友達・通常');
+        expect(chipFinder, findsOneWidget);
+        expect(tester.getSize(chipFinder).height, greaterThanOrEqualTo(48));
+      } finally {
+        semantics.dispose();
+      }
+    });
   });
 
   group('DetailScreen stability', () {
@@ -369,5 +477,132 @@ void main() {
       expect(tester.takeException(), isNull);
       expect(find.byType(SnackBar), findsOneWidget);
     });
+
+    testWidgets('_NameCandidatesSheet shows paused notice on AiCancelled and copy notice inside sheet', (
+      tester,
+    ) async {
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        (call) async {
+          if (call.method == 'Clipboard.setData') return null;
+          return null;
+        },
+      );
+      addTearDown(
+        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          SystemChannels.platform,
+          null,
+        ),
+      );
+      final namesCompleter = Completer<List<String>>();
+      final backend = _NameSheetTestBackend(namesCompleter);
+      final store = _TestIdeaStore(customBackend: backend);
+      await store.load();
+      final idea = _sampleIdea(
+        memos: [
+          PlanMemo(
+            what: '朝の支度',
+            who: '忙しい人',
+            why: '迷わないため',
+            how: '通知する',
+            nextStep: '試す',
+            createdAt: DateTime(2026, 11, 24),
+            version: 1,
+            ease: 2,
+            spark: 3,
+            source: AnswerSource.local,
+          ),
+          PlanMemo(
+            what: '朝の支度v2',
+            who: '忙しい人',
+            why: '迷わないため',
+            how: '通知する',
+            nextStep: '試す',
+            createdAt: DateTime(2026, 11, 25),
+            version: 2,
+            source: AnswerSource.local,
+          ),
+        ],
+      );
+
+      await tester.pumpWidget(
+        _wrapApp(DetailScreen(store: store, idea: idea)),
+      );
+      await tester.pumpAndSettle();
+
+      // 旧メモの Semantics チェック
+      await tester.dragUntilVisible(
+        find.text('メモ v1'),
+        find.byType(ListView),
+        const Offset(0, -100),
+      );
+      await tester.tap(find.text('メモ v1'));
+      await tester.pumpAndSettle();
+      expect(find.bySemanticsLabel('作りやすさ 3段階中2'), findsOneWidget);
+      expect(find.bySemanticsLabel('ワクワク度 3段階中3'), findsOneWidget);
+
+      await tester.dragUntilVisible(
+        find.text('名前候補'),
+        find.byType(ListView),
+        const Offset(0, 100),
+      );
+      await tester.tap(find.text('名前候補'));
+      await tester.pump();
+      await tester.pump();
+
+      backend.onPhase?.call(AiPhase.chatGpt);
+      await tester.pump();
+      expect(find.text('ChatGPTで名前の候補を考えています…'), findsOneWidget);
+
+      namesCompleter.completeError(const AiCancelled());
+      await tester.pumpAndSettle();
+      expect(find.text('生成を中断しました。再開できます。'), findsOneWidget);
+      expect(find.text('再開する'), findsOneWidget);
+
+      backend.nextNames = Future.value(['アサラク', 'モニアプ', 'シタクン']);
+      await tester.tap(find.text('再開する'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('アサラクをコピー'));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.text('「アサラク」をコピーしました'), findsOneWidget);
+      expect(find.byType(SnackBar), findsNothing);
+      await tester.pump(const Duration(seconds: 4));
+    });
   });
+}
+
+class _PhaseTestBackend extends ResilientBackend {
+  _PhaseTestBackend(this._completer) : super(null);
+  final Completer<DigQuestion> _completer;
+
+  @override
+  Future<DigQuestion> nextQuestion({
+    required Idea idea,
+    required List<QaEntry> history,
+    DigStyle style = DigStyle.friend,
+    DigViewpoint viewpoint = DigViewpoint.none,
+    bool contrarianDue = false,
+    bool templateOnly = false,
+    List<QaEntry>? templateHistory,
+    FirstDigContext? firstDig,
+  }) => _completer.future;
+}
+
+class _NameSheetTestBackend extends ResilientBackend {
+  _NameSheetTestBackend(this.firstCompleter) : super(null);
+  final Completer<List<String>> firstCompleter;
+  Future<List<String>>? nextNames;
+
+  @override
+  Future<List<String>> nameCandidates({
+    required Idea idea,
+    bool templateOnly = false,
+  }) {
+    if (nextNames != null) {
+      lastSource = AnswerSource.local;
+      return nextNames!;
+    }
+    return firstCompleter.future;
+  }
 }

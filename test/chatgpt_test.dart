@@ -190,6 +190,7 @@ void main() {
         authService: _FakeAuth(),
         client: MockClient((req) async {
           expect(req.url.toString(), ChatGptBackend.endpoint);
+          expect(req.followRedirects, isFalse);
           expect(req.headers['Authorization'], 'Bearer fake-token');
           expect(req.headers['chatgpt-account-id'], 'acc-1');
           return _jsonResponse(
@@ -197,6 +198,7 @@ void main() {
           );
         }),
       );
+      expect(ChatGptBackend.generateTimeout, const Duration(seconds: 25));
       final idea = Idea(id: '1', title: 'アイデア', note: '', createdAt: DateTime(2026));
       final q = await backend.nextQuestion(idea: idea, history: const []);
       expect(q.text, '誰に届けたい？');
@@ -217,10 +219,37 @@ void main() {
       );
       expect(backend.lastError, contains('サインイン'));
     });
+
+    test('予期しない例外で生エラー文字列を露出しない', () async {
+      final backend = ChatGptBackend(
+        authService: _FakeAuth(),
+        client: MockClient((_) async => throw StateError('secret-internal-detail')),
+      );
+      await expectLater(
+        backend.nextQuestion(idea: _fixtureIdea(), history: const []),
+        throwsA(
+          isA<ChatGptException>().having(
+            (e) => e.message,
+            'message',
+            isNot(contains('secret-internal-detail')),
+          ),
+        ),
+      );
+      expect(backend.lastError, isNot(contains('secret-internal-detail')));
+    });
+
+    test('signOut で保存削除が失敗したら例外を投げる', () async {
+      final auth = ChatGptAuthService(store: _FailingDeleteTokenStore());
+      await expectLater(
+        auth.signOut(),
+        throwsA(isA<ChatGptAuthException>()),
+      );
+    });
   });
 
-  group('チェーン: オンデバイス失敗 → ChatGPT', () {
-    test('ChatGPT が応答元になり、モードは chatGpt になる', () async {
+  group('チェーン: オンデバイス失敗 → ChatGPT → Gemini → ローカル', () {
+    test('ChatGPT が応答元になり、モードは chatGpt・フェーズは chatGpt になる', () async {
+      final phases = <AiPhase>[];
       final backend = ResilientBackend(
         null,
         onDevice: _ThrowingBackend(),
@@ -230,17 +259,95 @@ void main() {
                 _codexResponse('{"id": "q1", "text": "質問？", "choices": ["a", "b", "c"]}'),
               )),
         ),
-      );
+      )..onPhase = phases.add;
       final idea = Idea(id: '1', title: 'x', note: '', createdAt: DateTime(2026));
       final q = await backend.nextQuestion(idea: idea, history: const []);
       expect(q.text, '質問？');
+      expect(phases, [AiPhase.onDevice, AiPhase.chatGpt]);
       expect(backend.lastSource, AnswerSource.chatGpt);
       expect(backend.lastOnDeviceFailed, isTrue);
+      expect(backend.lastChatGptFailed, isFalse);
       expect(backend.currentModeKind, DigModeKind.chatGpt);
       expect(DigModeKind.chatGpt.label, 'ChatGPTで深掘り中');
       expect(DigModeKind.chatGpt.isAi, isTrue);
     });
+
+    test('3段フォールバック: オンデバイス失敗 → ChatGPT失敗 → Gemini成功時は lastChatGptFailed が false', () async {
+      final phases = <AiPhase>[];
+      final backend = ResilientBackend(
+        GeminiBackend(
+          apiKey: 'fixture-key',
+          client: MockClient(
+            (_) async => http.Response.bytes(
+              utf8.encode(
+                jsonEncode({
+                  'candidates': [
+                    {
+                      'finishReason': 'STOP',
+                      'content': {
+                        'parts': [
+                          {
+                            'text':
+                                '{"id":"g1","text":"Gemini質問？","choices":["1","2","3"]}',
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                }),
+              ),
+              200,
+            ),
+          ),
+        ),
+        onDevice: _ThrowingBackend(),
+        chatGpt: ChatGptBackend(
+          authService: _FakeAuth(),
+          client: MockClient((_) async => http.Response('error', 503)),
+        ),
+      )..onPhase = phases.add;
+
+      final q = await backend.nextQuestion(idea: _fixtureIdea(), history: const []);
+      expect(q.text, 'Gemini質問？');
+      expect(phases, [AiPhase.onDevice, AiPhase.chatGpt, AiPhase.cloud]);
+      expect(backend.lastSource, AnswerSource.remote);
+      expect(backend.lastChatGptFailed, isFalse);
+      expect(backend.lastChatGptError, isNull);
+    });
+
+    test('fallbackReasonFor が ChatGPT 同意オフ・失敗を正しく判定する', () {
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: false,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+          hasChatGpt: true,
+          chatGptConsent: false,
+        ),
+        FallbackReason.remoteConsentOff,
+      );
+      expect(
+        fallbackReasonFor(
+          isLocalSource: true,
+          hasRemoteKey: false,
+          remoteConsent: false,
+          lastRemoteFailed: false,
+          hasChatGpt: true,
+          chatGptConsent: true,
+          lastChatGptFailed: true,
+        ),
+        FallbackReason.remoteFailed,
+      );
+    });
   });
+}
+
+class _FailingDeleteTokenStore extends _MemoryTokenStore {
+  @override
+  Future<void> delete(String key) async {
+    throw Exception('delete failed');
+  }
 }
 
 class _ThrowingBackend implements AiBackend {

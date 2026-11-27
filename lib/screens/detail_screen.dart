@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -177,9 +179,18 @@ class _DetailScreenState extends State<DetailScreen> {
                 onPressed: () async {
                   Navigator.pop(dialogCtx);
                   final uri = Uri.tryParse(doc.webViewLink!);
-                  if (uri != null) {
-                    await launchUrl(uri, mode: LaunchMode.externalApplication);
+                  if (uri == null ||
+                      !GoogleWorkspaceService.isAllowedExternalUrl(uri)) {
+                    if (mounted) {
+                      messenger.showSnackBar(
+                        const SnackBar(
+                          content: Text('安全に開けないURLのため、表示を中止しました。'),
+                        ),
+                      );
+                    }
+                    return;
                   }
+                  await launchUrl(uri, mode: LaunchMode.externalApplication);
                 },
                 child: const Text('開く'),
               ),
@@ -789,9 +800,21 @@ class _OldMemoTileState extends State<_OldMemoTile> {
                   if (widget.memo.hasFitness) ...[
                     const SizedBox(height: 12),
                     if (widget.memo.ease case final ease?)
-                      Text('作りやすさ ${fitnessDots(ease)}'),
+                      Semantics(
+                        container: true,
+                        label: '作りやすさ 3段階中${ease.clamp(1, 3)}',
+                        child: ExcludeSemantics(
+                          child: Text('作りやすさ ${fitnessDots(ease)}'),
+                        ),
+                      ),
                     if (widget.memo.spark case final spark?)
-                      Text('ワクワク度 ${fitnessDots(spark)}'),
+                      Semantics(
+                        container: true,
+                        label: 'ワクワク度 3段階中${spark.clamp(1, 3)}',
+                        child: ExcludeSemantics(
+                          child: Text('ワクワク度 ${fitnessDots(spark)}'),
+                        ),
+                      ),
                   ],
                   if (widget.memo.input case final input?) ...[
                     MemoInputView(input: input, idea: widget.idea),
@@ -881,6 +904,9 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
     with WidgetsBindingObserver {
   late final ResilientBackend _backend;
   late Future<List<String>> _names;
+  AiPhase? _phase;
+  String? _copyNotice;
+  Timer? _copyNoticeTimer;
   bool _applying = false;
 
   @override
@@ -888,8 +914,8 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _backend = widget.store.backend()
-      ..onPhase = (_) {
-        if (mounted) setState(() {});
+      ..onPhase = (phase) {
+        if (mounted) setState(() => _phase = phase);
       };
     _names = _backend.nameCandidates(idea: widget.idea);
   }
@@ -897,7 +923,8 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.hidden ||
-        state == AppLifecycleState.paused) {
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
       _backend.cancelPending();
     }
   }
@@ -905,7 +932,8 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _backend.cancelPending();
+    _copyNoticeTimer?.cancel();
+    _backend.dispose();
     super.dispose();
   }
 
@@ -915,7 +943,32 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
       idea: widget.idea,
       templateOnly: templateOnly,
     );
-    setState(() => _names = names);
+    setState(() {
+      _phase = null;
+      _copyNotice = null;
+      _names = names;
+    });
+  }
+
+  String _loadingLabel() => switch (_phase) {
+    AiPhase.onDevice => '端末AIで名前の候補を考えています…',
+    AiPhase.chatGpt => 'ChatGPTで名前の候補を考えています…',
+    AiPhase.cloud => 'Geminiで名前の候補を考えています…',
+    null => '名前の候補を考えています…',
+  };
+
+  String? _fallbackNotice(AnswerSource? source) {
+    if (_backend.lastRemoteError case final failure?) {
+      return failure.message;
+    }
+    if (source != AnswerSource.local) return null;
+    if (_backend.lastChatGptFailed || _backend.lastChatGptError != null) {
+      return 'ChatGPTに接続できなかったため、定型で候補を作成しました。';
+    }
+    if (_backend.lastOnDeviceFailed || _backend.lastOnDeviceError != null) {
+      return '端末AIで生成できなかったため、定型で候補を作成しました。';
+    }
+    return null;
   }
 
   Future<void> _copyName(String name) async {
@@ -925,10 +978,12 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
     } catch (_) {
       message = 'コピーできませんでした。';
     }
-    if (mounted) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(message)));
-    }
+    if (!mounted) return;
+    _copyNoticeTimer?.cancel();
+    setState(() => _copyNotice = message);
+    _copyNoticeTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _copyNotice = null);
+    });
   }
 
   Future<void> _confirmApplyTitle(String name) async {
@@ -1017,13 +1072,23 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
                 if (waiting) ...[
                   const LinearProgressIndicator(),
                   const SizedBox(height: 10),
-                  const Text('名前の候補を考えています…'),
+                  Text(_loadingLabel()),
                   const SizedBox(height: 4),
                   Align(
                     alignment: Alignment.centerRight,
                     child: TextButton(
                       onPressed: () => _generate(templateOnly: true),
                       child: const Text('定型で続ける'),
+                    ),
+                  ),
+                ] else if (snapshot.error is AiCancelled) ...[
+                  const Text('生成を中断しました。再開できます。'),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton(
+                      onPressed: _generate,
+                      child: const Text('再開する'),
                     ),
                   ),
                 ] else if (snapshot.hasError || names.isEmpty) ...[
@@ -1037,10 +1102,24 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
                     ),
                   ),
                 ] else ...[
-                  if (_backend.lastRemoteError case final failure?) ...[
+                  if (_fallbackNotice(source) case final notice?) ...[
                     Text(
-                      failure.message,
+                      notice,
                       style: TextStyle(fontSize: 13, color: muted),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                  if (_copyNotice case final copyNotice?) ...[
+                    Semantics(
+                      liveRegion: true,
+                      child: Text(
+                        copyNotice,
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: accentText,
+                        ),
+                      ),
                     ),
                     const SizedBox(height: 8),
                   ],

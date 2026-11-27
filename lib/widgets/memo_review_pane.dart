@@ -106,7 +106,22 @@ class _MemoReviewPaneState extends State<MemoReviewPane> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Text(intro, style: theme.textTheme.bodyMedium),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(child: Text(intro, style: theme.textTheme.bodyMedium)),
+              if (widget.memo.source case final source?) ...[
+                const SizedBox(width: 8),
+                Text(
+                  source.label,
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ],
+          ),
           const SizedBox(height: 16),
           ReadingGlass(
             child: Column(

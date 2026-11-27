@@ -174,13 +174,18 @@ FallbackReason? fallbackReasonFor({
   required bool lastRemoteFailed,
   bool onDeviceNeedsDownload = false,
   bool manualTemplate = false,
+  bool hasChatGpt = false,
+  bool chatGptConsent = false,
+  bool lastChatGptFailed = false,
 }) {
   if (!isLocalSource) return null;
   if (manualTemplate) return FallbackReason.manualTemplate;
-  if (lastRemoteFailed) return FallbackReason.remoteFailed;
-  if (hasRemoteKey && !remoteConsent) return FallbackReason.remoteConsentOff;
+  if (lastRemoteFailed || lastChatGptFailed) return FallbackReason.remoteFailed;
+  if ((hasRemoteKey && !remoteConsent) || (hasChatGpt && !chatGptConsent)) {
+    return FallbackReason.remoteConsentOff;
+  }
   if (onDeviceNeedsDownload) return FallbackReason.onDeviceNeedsDownload;
-  if (!hasRemoteKey) return FallbackReason.noRemoteKey;
+  if (!hasRemoteKey && !hasChatGpt) return FallbackReason.noRemoteKey;
   return FallbackReason.onDeviceUnavailable;
 }
 

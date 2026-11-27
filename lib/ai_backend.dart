@@ -24,16 +24,16 @@ class AiCancelled implements Exception {
   const AiCancelled();
 }
 
-enum AiPhase { onDevice, cloud }
+enum AiPhase { onDevice, chatGpt, cloud }
 
 enum GeminiFailure implements Exception {
   invalidKey('APIキーが拒否されました。Google AI Studioでキーとアクセス権を確認してください。'),
   invalidModel('このモデルを利用できません。モデル名と利用権を確認してください。'),
   quota('利用上限に達しました。時間を置くか、Google AI Studioで利用枠を確認してください。'),
   network('Geminiに接続できませんでした。通信状況を確認してください。'),
-  timeout('Geminiから時間内に応答がありませんでした。'),
+  timeout('Geminiから時間内に応答がありませんでした。通信状況を確認して少し待ってから再試行してください。'),
   unavailable('Geminiで一時的な障害が発生しています。少し待って再試行してください。'),
-  invalidResponse('Geminiからこの機能で使える応答が返りませんでした。'),
+  invalidResponse('Geminiからこの機能で使える応答が返りませんでした。少し待って再試行するか、設定でモデルを確認してください。'),
   revoked('クラウド送信を停止しました。');
 
   const GeminiFailure(this.message);
@@ -173,10 +173,19 @@ class GeminiBackend implements GuidedDigBackend {
                 )) {
               throw GeminiFailure.invalidKey;
             }
+            final status = details is Map ? details['status'] : null;
+            if (status == 'FAILED_PRECONDITION') {
+              throw GeminiFailure.unavailable;
+            }
+            final message = details is Map ? details['message'] : null;
+            if (message is String &&
+                message.toLowerCase().contains('model')) {
+              throw GeminiFailure.invalidModel;
+            }
           } on FormatException {
-            // 非JSONの400応答はモデル/リクエスト不正として扱う。
+            // 非JSONの400応答は汎用エラーとして扱う。
           }
-          throw GeminiFailure.invalidModel;
+          throw GeminiFailure.invalidResponse;
         case 404:
           throw GeminiFailure.invalidModel;
         case 429:
@@ -539,12 +548,16 @@ class ResilientBackend implements GuidedDigBackend {
   FallbackReason? fallbackReason({
     required bool hasRemoteKey,
     required bool remoteConsent,
+    bool hasChatGpt = false,
+    bool chatGptConsent = false,
   }) => fallbackReasonFor(
     isLocalSource: lastSource == AnswerSource.local,
     hasRemoteKey: hasRemoteKey,
     remoteConsent: remoteConsent,
-    // v0.4.0: ChatGPT の失敗も「クラウドAIに接続できなかった」に含める。
-    lastRemoteFailed: lastRemoteFailed || lastChatGptFailed,
+    hasChatGpt: hasChatGpt,
+    chatGptConsent: chatGptConsent,
+    lastRemoteFailed: lastRemoteFailed,
+    lastChatGptFailed: lastChatGptFailed,
     onDeviceNeedsDownload: lastOnDeviceStatus == OnDeviceStatus.needsDownload,
     manualTemplate: lastManualTemplate,
   );
@@ -566,6 +579,8 @@ class ResilientBackend implements GuidedDigBackend {
     cancelPending();
     final fixed = _fixedRemote;
     if (fixed is GeminiBackend) fixed.dispose();
+    final cg = chatGpt;
+    if (cg is ChatGptBackend) cg.dispose();
   }
 
   /// 現在のモード表示（DigScreen のバッジ用）。
@@ -619,6 +634,8 @@ class ResilientBackend implements GuidedDigBackend {
 
     var onDeviceFailed = false;
     String? onDeviceError;
+    var chatGptFailed = false;
+    String? chatGptError;
     var remoteFailed = false;
     GeminiFailure? remoteError;
 
@@ -626,6 +643,9 @@ class ResilientBackend implements GuidedDigBackend {
       checkCancelled();
       lastOnDeviceFailed = onDeviceFailed;
       lastOnDeviceError = onDeviceError;
+      // ChatGPT 失敗後に Gemini が成功した場合は ChatGPT 失敗フラグを残さない。
+      lastChatGptFailed = source == AnswerSource.local && chatGptFailed;
+      lastChatGptError = source == AnswerSource.local ? chatGptError : null;
       lastRemoteFailed = remoteFailed;
       lastRemoteError = remoteError;
       lastManualTemplate = templateOnly;
@@ -633,13 +653,12 @@ class ResilientBackend implements GuidedDigBackend {
       return (result, source);
     }
 
-    // 呼び出し開始時に前回の失敗状態をリセットする（ChatGPT 分岐は commit() を
-    // 通らず直接フィールドを書くため、ここでの初期化が要る）。
     lastOnDeviceFailed = false;
+    lastOnDeviceError = null;
     lastChatGptFailed = false;
+    lastChatGptError = null;
     lastRemoteFailed = false;
     lastRemoteError = null;
-    lastOnDeviceError = null;
     lastManualTemplate = templateOnly;
     if (!templateOnly && onDevice != null) {
       checkCancelled();
@@ -657,26 +676,27 @@ class ResilientBackend implements GuidedDigBackend {
             : e.toString();
       }
     }
-    // v0.4.0: 第2候補は ChatGPT（サインイン済みのときだけ非 null）。
-    // Gemini と同じクラウド扱いで、フェーズ通知・キャンセル規約に合わせる。
+    // v0.4.0: 第2候補は ChatGPT（サインイン＋同意済みのときだけ非 null）。
     final cg = chatGpt;
     if (!templateOnly && cg != null) {
-      onPhase?.call(AiPhase.cloud);
+      checkCancelled();
+      onPhase?.call(AiPhase.chatGpt);
       try {
         checkCancelled();
         if (cg is ChatGptBackend) _activeChatGpt = cg;
         final r = await op(cg);
-        final result = commit(r, AnswerSource.chatGpt);
-        lastChatGptError = null;
-        return result;
+        return commit(r, AnswerSource.chatGpt);
       } catch (e) {
         checkCancelled();
-        lastChatGptFailed = true;
-        lastChatGptError = cg is ChatGptBackend
-            ? (cg.lastError ?? e.toString())
-            : e.toString();
+        final revoked = e is ChatGptException && e.revoked;
+        chatGptFailed = !revoked;
+        if (chatGptFailed) {
+          chatGptError = cg is ChatGptBackend
+              ? (cg.lastError ?? e.toString())
+              : e.toString();
+        }
       } finally {
-        if (identical(_active, active)) _activeChatGpt = null;
+        if (identical(_activeChatGpt, cg)) _activeChatGpt = null;
       }
     }
     checkCancelled();

@@ -23,9 +23,14 @@ abstract class SecretStore {
 }
 
 class PlatformSecretStore implements SecretStore {
+  static const FlutterSecureStorage _defaultStorage = FlutterSecureStorage(
+    iOptions: IOSOptions(
+      accessibility: KeychainAccessibility.unlocked_this_device,
+    ),
+  );
   final FlutterSecureStorage _storage;
   PlatformSecretStore({FlutterSecureStorage? storage})
-    : _storage = storage ?? const FlutterSecureStorage();
+    : _storage = storage ?? _defaultStorage;
 
   @override
   Future<String?> read(String key) => _storage.read(key: key);
@@ -61,6 +66,7 @@ class _SecretStoreTokenStore implements TokenStore {
 
 class IdeaStore extends ChangeNotifier {
   static const Duration onDeviceCacheTtl = Duration(minutes: 2);
+  static const Duration onDeviceAvailableCacheTtl = Duration(minutes: 5);
 
   final SecretStore _secrets;
   final DateTime Function() _now;
@@ -98,6 +104,8 @@ class IdeaStore extends ChangeNotifier {
   String? loadError;
   bool _remoteConsent = false;
   bool get remoteConsent => _remoteConsent;
+  bool _chatGptConsent = false;
+  bool get chatGptConsent => _chatGptConsent;
   String? keyStorageError;
   String? ideasRecoveryNotice;
   bool _ideasWritable = true;
@@ -108,8 +116,10 @@ class IdeaStore extends ChangeNotifier {
     final cached = _cachedOnDeviceStatus;
     final at = _cachedOnDeviceStatusAt;
     if (cached == null || at == null) return null;
-    if (cached.status != OnDeviceStatus.available &&
-        _now().difference(at) >= onDeviceCacheTtl) {
+    final ttl = cached.status == OnDeviceStatus.available
+        ? onDeviceAvailableCacheTtl
+        : onDeviceCacheTtl;
+    if (_now().difference(at) >= ttl) {
       return null;
     }
     return cached;
@@ -118,6 +128,7 @@ class IdeaStore extends ChangeNotifier {
   final _cloudChanges = ChangeNotifier();
   int _cloudRevision = 0;
   int _consentRevision = 0;
+  int _chatGptConsentRevision = 0;
   int _idSeq = 0;
   Future<void> _settingsQueue = Future.value();
   Future<void> _ideasQueue = Future.value();
@@ -141,6 +152,17 @@ class IdeaStore extends ChangeNotifier {
       );
     } catch (_) {
       chatGptSignedIn = false;
+    }
+    if (!chatGptSignedIn) {
+      _chatGptConsentRevision++;
+      _chatGptConsent = false;
+      _invalidateCloud();
+      try {
+        final prefs = await _prefs();
+        await prefs.setBool(AppConfig.prefsChatGptConsentKey, false);
+      } catch (_) {
+        // 永続化のクリア失敗はメモリ上の遮断を妨げない。
+      }
     }
     notifyListeners();
   }
@@ -174,6 +196,8 @@ class IdeaStore extends ChangeNotifier {
   Future<void> _readPreferences(SharedPreferences prefs) async {
     keyStorageError = null;
     _revokeCloud();
+    _chatGptConsentRevision++;
+    _chatGptConsent = false;
     try {
       await _loadApiKey(prefs);
       _remoteConsent =
@@ -191,7 +215,7 @@ class IdeaStore extends ChangeNotifier {
         // 次回も読み込み時に旧モデルを移行する。
       }
     }
-    // v0.4.0: ChatGPT サインイン状態をキャッシュする（失敗時は未サインイン扱い）。
+    // v0.4.0: ChatGPT サインイン状態と送信同意をキャッシュする（失敗時は未サインイン扱い）。
     try {
       chatGptSignedIn = await _checkChatGptSignedIn().timeout(
         const Duration(seconds: 5),
@@ -200,6 +224,8 @@ class IdeaStore extends ChangeNotifier {
     } catch (_) {
       chatGptSignedIn = false;
     }
+    _chatGptConsent =
+        chatGptSignedIn && prefs.get(AppConfig.prefsChatGptConsentKey) == true;
     keyGuideShown = prefs.get(AppConfig.prefsKeyGuideShownKey) == true;
     final style = prefs.get(AppConfig.prefsDigStyleKey);
     digStyle = DigStyleX.fromStorage(style is String ? style : null);
@@ -602,6 +628,28 @@ class IdeaStore extends ChangeNotifier {
     });
   }
 
+  Future<void> saveChatGptConsent(bool consent) {
+    if (!consent) {
+      _chatGptConsentRevision++;
+      _chatGptConsent = false;
+      _invalidateCloud();
+    }
+    final revision = ++_chatGptConsentRevision;
+    return _saveSettings(() async {
+      if (consent && !chatGptSignedIn) {
+        throw const StoreFailure('先にChatGPTでサインインしてください。');
+      }
+      final prefs = await _prefs();
+      _checkWrite(
+        await prefs.setBool(AppConfig.prefsChatGptConsentKey, consent),
+      );
+      if (_chatGptConsentRevision == revision) {
+        _chatGptConsent = consent;
+        notifyListeners();
+      }
+    });
+  }
+
   Future<void> saveModel(String value) {
     final next = AppConfig.geminiModel(value);
     if (!AppConfig.validGeminiModel(next)) {
@@ -616,6 +664,13 @@ class IdeaStore extends ChangeNotifier {
     });
   }
 
+  bool _isForegroundLifecycle() {
+    final state = WidgetsBinding.instance.lifecycleState;
+    return state == null ||
+        state == AppLifecycleState.resumed ||
+        state == AppLifecycleState.inactive;
+  }
+
   GeminiBackend? _remote() {
     if (!remoteConsent || !hasRemoteKey || keyStorageError != null) return null;
     final grant = _cloudRevision;
@@ -623,12 +678,24 @@ class IdeaStore extends ChangeNotifier {
       apiKey: _apiKey,
       model: _model,
       consentChanges: _cloudChanges,
-      maySend: () {
-        final state = WidgetsBinding.instance.lifecycleState;
-        return remoteConsent &&
-            _cloudRevision == grant &&
-            (state == null || state == AppLifecycleState.resumed);
-      },
+      maySend: () =>
+          remoteConsent && _cloudRevision == grant && _isForegroundLifecycle(),
+    );
+  }
+
+  ChatGptBackend? _chatGpt() {
+    if (!chatGptSignedIn || !chatGptConsent) return null;
+    final grant = _cloudRevision;
+    return ChatGptBackend(
+      authService: ChatGptAuthService(
+        store: _SecretStoreTokenStore(_secrets),
+      ),
+      consentChanges: _cloudChanges,
+      maySend: () =>
+          chatGptSignedIn &&
+          chatGptConsent &&
+          _cloudRevision == grant &&
+          _isForegroundLifecycle(),
     );
   }
 
@@ -637,16 +704,15 @@ class IdeaStore extends ChangeNotifier {
         onDownloadProgress: onDownloadProgress,
         readCachedStatus: () => cachedOnDeviceStatus,
         writeCachedStatus: updateOnDeviceStatusCache,
+        clearCachedStatus: clearOnDeviceStatusCache,
       );
 
   /// 現在の設定でバックエンドを組む。
-  /// 優先順は オンデバイス → ChatGPT（サインイン時）→ Gemini（キー＋同意がある場合）→ 定型。
+  /// 優先順は オンデバイス → ChatGPT（サインイン＋同意時）→ Gemini（キー＋同意がある場合）→ 定型。
   ResilientBackend backend() => ResilientBackend(
     null,
     onDevice: onDeviceBackend(),
-    chatGpt: chatGptSignedIn
-        ? ChatGptBackend(maySend: () => chatGptSignedIn)
-        : null,
+    chatGpt: _chatGpt(),
     remoteFactory: _remote,
   );
 

@@ -169,15 +169,21 @@ void main() {
 
   group('GoogleDriveUploader', () {
     test('multipart ボディにメタデータ（Googleドキュメント変換）と本文が入る', () {
+      const boundary = 'test-boundary-123';
       final body = GoogleDriveUploader.buildMultipartBody(
         name: 'テスト 企画書',
         content: '本文です',
+        boundary: boundary,
       );
-      expect(body, startsWith('--${GoogleDriveUploader.multipartBoundary}'));
+      expect(body, startsWith('--$boundary'));
       expect(body, contains('"mimeType":"application/vnd.google-apps.document"'));
       expect(body, contains('"name":"テスト 企画書"'));
       expect(body, contains('本文です'));
-      expect(body, endsWith('--${GoogleDriveUploader.multipartBoundary}--\r\n'));
+      expect(body, endsWith('--$boundary--\r\n'));
+
+      final b1 = GoogleDriveUploader.generateBoundary();
+      final b2 = GoogleDriveUploader.generateBoundary();
+      expect(b1, isNot(equals(b2)));
     });
 
     test('アップロード要求の宛先・ヘッダ・応答パース', () async {
@@ -198,6 +204,7 @@ void main() {
         content: '本文',
       );
       final request = captured as http.Request;
+      expect(request.followRedirects, isFalse);
       expect(request.url.host, 'www.googleapis.com');
       expect(request.url.path, '/upload/drive/v3/files');
       expect(request.url.queryParameters['uploadType'], 'multipart');
@@ -350,6 +357,44 @@ void main() {
             contains('企画メモがまだありません'),
           ),
         ),
+      );
+    });
+    test('isAllowedExternalUrl が許可された Google URL のみを通す', () {
+      expect(
+        GoogleWorkspaceService.isAllowedExternalUrl(
+          Uri.parse('https://docs.google.com/document/d/doc-1/edit'),
+        ),
+        isTrue,
+      );
+      expect(
+        GoogleWorkspaceService.isAllowedExternalUrl(
+          Uri.parse('https://drive.google.com/file/d/file-1/view'),
+        ),
+        isTrue,
+      );
+      expect(
+        GoogleWorkspaceService.isAllowedExternalUrl(
+          Uri.parse('http://docs.google.com/document/d/doc-1/edit'),
+        ),
+        isFalse,
+      );
+      expect(
+        GoogleWorkspaceService.isAllowedExternalUrl(
+          Uri.parse('https://evil.example/document'),
+        ),
+        isFalse,
+      );
+      expect(
+        GoogleWorkspaceService.isAllowedExternalUrl(
+          Uri.parse('https://docs.google.com.evil.example/doc'),
+        ),
+        isFalse,
+      );
+      expect(
+        GoogleWorkspaceService.isAllowedExternalUrl(
+          Uri.parse('https://user@docs.google.com/doc'),
+        ),
+        isFalse,
       );
     });
   });
