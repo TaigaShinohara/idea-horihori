@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../ai_backend.dart';
@@ -14,7 +16,15 @@ class SettingsScreen extends StatefulWidget {
 
   /// v0.5.0: Google Workspace 連携（テストではフェイクを差し替える）。
   final GoogleWorkspaceService? googleService;
-  const SettingsScreen({super.key, required this.store, this.googleService});
+
+  /// テストではフェイクまたはカスタム [ChatGptAuthService] を差し替えられる。
+  final ChatGptAuthService? chatGptAuthService;
+  const SettingsScreen({
+    super.key,
+    required this.store,
+    this.googleService,
+    this.chatGptAuthService,
+  });
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -43,9 +53,13 @@ class _SettingsScreenState extends State<SettingsScreen>
   String? _nanoMessage;
 
   // v0.4.0: ChatGPT サインイン。
-  final ChatGptAuthService _chatGptAuth = ChatGptAuthService();
+  late final ChatGptAuthService _chatGptAuth =
+      widget.chatGptAuthService ?? widget.store.chatGptAuthService();
   final TextEditingController _codeCtrl = TextEditingController();
-  bool _cgBusy = false;
+  bool _cgWaitingBrowser = false;
+  bool _cgExchanging = false;
+  bool _cgSigningOut = false;
+  bool get _cgWorking => _cgExchanging || _cgSigningOut;
   String? _cgMessage;
 
   // v0.5.0: Google Workspace 連携。
@@ -108,15 +122,20 @@ class _SettingsScreenState extends State<SettingsScreen>
   }
 
   Future<void> _chatGptSignIn() async {
+    if (_cgWaitingBrowser || _cgWorking) return;
     setState(() {
-      _cgBusy = true;
+      _cgWaitingBrowser = true;
       _cgMessage = null;
     });
     try {
       await _chatGptAuth.signIn();
       await widget.store.refreshChatGptStatus();
       if (!mounted) return;
-      setState(() => _cgMessage = 'サインインしました');
+      setState(
+        () => _cgMessage = widget.store.chatGptConsent
+            ? 'サインインしました。'
+            : 'サインインしました。下のスイッチをONにすると利用できます。',
+      );
     } on ChatGptAuthException catch (e) {
       if (!mounted) return;
       setState(() => _cgMessage = e.message);
@@ -126,21 +145,39 @@ class _SettingsScreenState extends State<SettingsScreen>
         () => _cgMessage = 'ChatGPT サインインに失敗しました。通信状態を確認して、もう一度お試しください。',
       );
     } finally {
-      if (mounted) setState(() => _cgBusy = false);
+      if (mounted) setState(() => _cgWaitingBrowser = false);
     }
   }
 
-  Future<void> _chatGptSignInWithCode() async {
+  Future<void> _cancelChatGptSignIn() async {
+    await _chatGptAuth.cancelSignIn();
+    if (!mounted) return;
     setState(() {
-      _cgBusy = true;
+      _cgWaitingBrowser = false;
+      _cgMessage = 'サインインをキャンセルしました。';
+    });
+  }
+
+  Future<void> _chatGptSignInWithCode() async {
+    if (_cgWorking) return;
+    setState(() {
+      _cgExchanging = true;
       _cgMessage = null;
     });
     try {
+      if (_cgWaitingBrowser) {
+        await _chatGptAuth.cancelSignIn(preserveVerifier: true);
+        if (mounted) setState(() => _cgWaitingBrowser = false);
+      }
       await _chatGptAuth.signInWithCode(_codeCtrl.text);
       await widget.store.refreshChatGptStatus();
       if (!mounted) return;
       _codeCtrl.clear();
-      setState(() => _cgMessage = 'サインインしました');
+      setState(
+        () => _cgMessage = widget.store.chatGptConsent
+            ? 'サインインしました。'
+            : 'サインインしました。下のスイッチをONにすると利用できます。',
+      );
     } on ChatGptAuthException catch (e) {
       if (!mounted) return;
       setState(() => _cgMessage = e.message);
@@ -150,12 +187,13 @@ class _SettingsScreenState extends State<SettingsScreen>
         () => _cgMessage = '認可コードでのサインインに失敗しました。コードを確認して、もう一度お試しください。',
       );
     } finally {
-      if (mounted) setState(() => _cgBusy = false);
+      if (mounted) setState(() => _cgExchanging = false);
     }
   }
 
   Future<void> _chatGptSignOut() async {
-    setState(() => _cgBusy = true);
+    if (_cgWorking || _cgWaitingBrowser) return;
+    setState(() => _cgSigningOut = true);
     try {
       await _chatGptAuth.signOut();
       await widget.store.refreshChatGptStatus();
@@ -165,12 +203,12 @@ class _SettingsScreenState extends State<SettingsScreen>
       if (!mounted) return;
       setState(() => _cgMessage = 'サインアウトに失敗しました。もう一度お試しください。');
     } finally {
-      if (mounted) setState(() => _cgBusy = false);
+      if (mounted) setState(() => _cgSigningOut = false);
     }
   }
 
   Future<void> _toggleChatGptConsent(bool value) async {
-    if (_cgBusy || _editing) return;
+    if (_cgWorking || _editing) return;
     setState(() {
       _editing = true;
       _cgMessage = null;
@@ -448,9 +486,23 @@ class _SettingsScreenState extends State<SettingsScreen>
     null => _checking ? '対応状況を確認しています…' : '未確認',
   };
 
+  String _currentAiSummary() {
+    if (_diagnosis?.status == OnDeviceStatus.available) {
+      return '現在：端末AIが利用できます';
+    }
+    if (widget.store.chatGptSignedIn && widget.store.chatGptConsent) {
+      return '現在：ChatGPTが利用できます';
+    }
+    if (widget.store.hasRemoteKey && widget.store.remoteConsent) {
+      return '現在：Gemini APIが利用できます';
+    }
+    return '現在：定型モード（設定なしでも使えます）';
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    unawaited(_chatGptAuth.cancelSignIn());
     _connection?.dispose();
     _nano.cancelPending();
     _key.dispose();
@@ -471,7 +523,7 @@ class _SettingsScreenState extends State<SettingsScreen>
         widget.store.chatGptSignedIn || widget.store.chatGptConsent;
 
     return PopScope(
-      canPop: !(_editing || _preparingNano || _cgBusy),
+      canPop: !(_editing || _preparingNano || _cgWorking),
       child: GlassBackground(
         child: Scaffold(
           backgroundColor: Colors.transparent,
@@ -481,21 +533,45 @@ class _SettingsScreenState extends State<SettingsScreen>
             elevation: 0,
             scrolledUnderElevation: 0,
           ),
-          body: ListView(
-            padding: EdgeInsets.fromLTRB(
-              16,
-              8,
-              16,
-              24 + MediaQuery.paddingOf(context).bottom,
-            ),
-            children: [
-            Padding(
-              padding: const EdgeInsets.only(bottom: 12),
-              child: Text(
-                'AIの優先順：端末AI → ChatGPT → Gemini API → 定型',
-                style: TextStyle(fontSize: 13, color: muted, height: 1.4),
+          body: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTap: () => FocusScope.of(context).unfocus(),
+            child: ListView(
+              padding: EdgeInsets.fromLTRB(
+                16,
+                8,
+                16,
+                24 + MediaQuery.paddingOf(context).bottom,
               ),
-            ),
+              children: [
+                GlassCard(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 10,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.auto_awesome, size: 18, color: accentText),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          _currentAiSummary(),
+                          style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(top: 8, bottom: 12),
+                  child: Text(
+                    'AIの優先順：端末AI → ChatGPT → Gemini API → 定型',
+                    style: TextStyle(fontSize: 13, color: muted, height: 1.4),
+                  ),
+                ),
             // 1. 端末AI（通常面は状態1行＋未取得時は「モデルを準備する」＋確認失敗時は「質問を試す」）
             GlassCard(
               child: Column(
@@ -610,23 +686,52 @@ class _SettingsScreenState extends State<SettingsScreen>
                   const SizedBox(height: 12),
                   if (widget.store.chatGptSignedIn)
                     OutlinedButton(
-                      onPressed: _cgBusy ? null : _chatGptSignOut,
-                      child: const Text('サインアウト'),
+                      onPressed: _cgWorking ? null : _chatGptSignOut,
+                      child: Text(_cgSigningOut ? 'サインアウト中…' : 'サインアウト'),
+                    )
+                  else if (_cgWaitingBrowser)
+                    Row(
+                      children: [
+                        const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                        const SizedBox(width: 10),
+                        const Expanded(
+                          child: Text(
+                            'ブラウザでサインイン中…',
+                            style: TextStyle(fontSize: 13),
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: _cgWorking ? null : _cancelChatGptSignIn,
+                          child: const Text('キャンセル'),
+                        ),
+                      ],
                     )
                   else
-                    FilledButton(
-                      onPressed: _cgBusy ? null : _chatGptSignIn,
+                    FilledButton.tonal(
+                      onPressed: _cgWorking ? null : _chatGptSignIn,
                       style: FilledButton.styleFrom(
-                        backgroundColor: kButtonFill,
-                        foregroundColor: Colors.white,
+                        backgroundColor: accentTonalFill(context),
+                        foregroundColor: accentText,
                       ),
-                      child: Text(_cgBusy ? 'サインイン中…' : 'ChatGPTでサインイン'),
+                      child: Text(_cgExchanging ? 'サインイン中…' : 'ChatGPTでサインイン'),
                     ),
                   if (_cgMessage != null) ...[
                     const SizedBox(height: 10),
                     Text(
                       _cgMessage!,
-                      style: const TextStyle(fontSize: 13, height: 1.6),
+                      style: TextStyle(
+                        fontSize: 13,
+                        height: 1.6,
+                        color: widget.store.chatGptSignedIn &&
+                                !widget.store.chatGptConsent &&
+                                _cgMessage!.contains('スイッチをON')
+                            ? accentText
+                            : null,
+                      ),
                     ),
                   ],
                   const SizedBox(height: 14),
@@ -644,7 +749,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                             )
                           : null,
                       value: widget.store.chatGptConsent,
-                      onChanged: _cgBusy || _editing || !canToggleChatGptConsent
+                      onChanged: _cgWorking || _editing || !canToggleChatGptConsent
                           ? null
                           : _toggleChatGptConsent,
                     ),
@@ -674,10 +779,14 @@ class _SettingsScreenState extends State<SettingsScreen>
                           const SizedBox(height: 8),
                           TextField(
                             controller: _codeCtrl,
-                            enabled: !_cgBusy,
+                            enabled: !_cgWorking,
                             autocorrect: false,
                             enableSuggestions: false,
                             enableIMEPersonalizedLearning: false,
+                            textInputAction: TextInputAction.done,
+                            onSubmitted: (_) {
+                              if (!_cgWorking) _chatGptSignInWithCode();
+                            },
                             decoration: glassInputDecoration(
                               context,
                               labelText: '認可コード',
@@ -685,8 +794,10 @@ class _SettingsScreenState extends State<SettingsScreen>
                           ),
                           const SizedBox(height: 8),
                           OutlinedButton(
-                            onPressed: _cgBusy ? null : _chatGptSignInWithCode,
-                            child: const Text('コードでサインイン'),
+                            onPressed: _cgWorking ? null : _chatGptSignInWithCode,
+                            child: Text(
+                              _cgExchanging ? '確認中…' : 'コードでサインイン',
+                            ),
                           ),
                         ],
                       ),
@@ -718,6 +829,10 @@ class _SettingsScreenState extends State<SettingsScreen>
                     autocorrect: false,
                     enableSuggestions: false,
                     enableIMEPersonalizedLearning: false,
+                    textInputAction: TextInputAction.done,
+                    onSubmitted: (_) {
+                      if (!apiBusy) _save();
+                    },
                     decoration: glassInputDecoration(
                       context,
                       labelText: 'APIキー',
@@ -756,7 +871,15 @@ class _SettingsScreenState extends State<SettingsScreen>
                     Text(
                       message,
                       textAlign: TextAlign.center,
-                      style: const TextStyle(fontSize: 13, height: 1.5),
+                      style: TextStyle(
+                        fontSize: 13,
+                        height: 1.5,
+                        color: widget.store.hasRemoteKey &&
+                                !widget.store.remoteConsent &&
+                                message.contains('スイッチをON')
+                            ? accentText
+                            : null,
+                      ),
                     ),
                   ],
                   const SizedBox(height: 14),
@@ -805,9 +928,9 @@ class _SettingsScreenState extends State<SettingsScreen>
                           TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 6),
                   if (!_google.isConfigured)
-                    const Text(
+                    Text(
                       '未設定（セットアップ待ち）です。Google Cloud 側の設定が完了したビルドで有効になります。有効になると、完成した企画メモを Google ドキュメントとしてドライブへ送れます。',
-                      style: TextStyle(fontSize: 13, height: 1.6),
+                      style: TextStyle(fontSize: 13, color: muted, height: 1.6),
                     )
                   else if (_gAccount case final account?)
                     Text(
@@ -827,13 +950,13 @@ class _SettingsScreenState extends State<SettingsScreen>
                         child: const Text('サインアウト'),
                       )
                     else
-                      FilledButton(
+                      FilledButton.tonal(
                         onPressed: _gBusy || !_gChecked
                             ? null
                             : _googleSignIn,
                         style: FilledButton.styleFrom(
-                          backgroundColor: kButtonFill,
-                          foregroundColor: Colors.white,
+                          backgroundColor: accentTonalFill(context),
+                          foregroundColor: accentText,
                         ),
                         child: Text(_gBusy
                             ? 'サインイン中…'
@@ -974,6 +1097,7 @@ class _SettingsScreenState extends State<SettingsScreen>
               ),
             ),
             ],
+            ),
           ),
         ),
       ),
