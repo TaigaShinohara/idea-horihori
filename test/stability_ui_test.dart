@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:horihori/ai_backend.dart';
+import 'package:horihori/chatgpt_auth_service.dart';
 import 'package:horihori/dig_mode.dart';
 import 'package:horihori/first_dig.dart';
 import 'package:horihori/models.dart';
@@ -11,8 +12,10 @@ import 'package:horihori/on_device_backend.dart';
 import 'package:horihori/screens/archive_screen.dart';
 import 'package:horihori/screens/detail_screen.dart';
 import 'package:horihori/screens/dig_screen.dart';
+import 'package:horihori/screens/home_screen.dart';
 import 'package:horihori/screens/settings_screen.dart';
 import 'package:horihori/store.dart';
+import 'package:horihori/widgets/memo_review_pane.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class _MemorySecretStore implements SecretStore {
@@ -152,6 +155,8 @@ void main() {
         find.byType(ListView),
         const Offset(0, -100),
       );
+      await tester.ensureVisible(find.text('詳細・動作確認'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('詳細・動作確認'));
       await tester.pumpAndSettle();
 
@@ -252,6 +257,62 @@ void main() {
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await tester.pumpAndSettle();
       expect(find.byTooltip('APIキーを表示'), findsOneWidget);
+    });
+
+    testWidgets('shows current AI summary and allows cancel/manual code during browser sign-in', (
+      tester,
+    ) async {
+      final store = _TestIdeaStore();
+      await store.load();
+      store.updateOnDeviceStatusCache(
+        const OnDeviceCheck(OnDeviceStatus.unavailable),
+      );
+      final auth = _FakeChatGptAuthService();
+
+      await tester.pumpWidget(
+        _wrapApp(
+          SettingsScreen(store: store, chatGptAuthService: auth),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('現在：定型モード（設定なしでも使えます）'), findsOneWidget);
+
+      await tester.tap(find.text('ChatGPTでサインイン'));
+      await tester.pump();
+
+      expect(find.text('ブラウザでサインイン中…'), findsOneWidget);
+      expect(find.text('キャンセル'), findsOneWidget);
+      final popScope = tester.widget<PopScope>(find.byType(PopScope));
+      expect(popScope.canPop, isTrue);
+
+      await tester.dragUntilVisible(
+        find.text('ブラウザから戻れない時は'),
+        find.byType(ListView),
+        const Offset(0, -100),
+      );
+      await tester.ensureVisible(find.text('ブラウザから戻れない時は'));
+      await tester.pump();
+      await tester.tap(find.text('ブラウザから戻れない時は'));
+      await tester.pump(const Duration(milliseconds: 300));
+      final codeField = tester.widget<TextField>(
+        find.byWidgetPredicate(
+          (w) => w is TextField && w.decoration?.labelText == '認可コード',
+        ),
+      );
+      expect(codeField.enabled, isTrue);
+
+      await tester.dragUntilVisible(
+        find.text('キャンセル'),
+        find.byType(ListView),
+        const Offset(0, 100),
+      );
+      await tester.ensureVisible(find.text('キャンセル'));
+      await tester.pump();
+      await tester.tap(find.text('キャンセル'));
+      await tester.pumpAndSettle();
+      expect(auth.cancelCalls, 1);
+      expect(find.text('サインインをキャンセルしました。'), findsOneWidget);
     });
   });
 
@@ -403,6 +464,124 @@ void main() {
       } finally {
         semantics.dispose();
       }
+    });
+
+    testWidgets('DigScreen shows ChatGPT auth error with settings button and checkpoint answer preview', (
+      tester,
+    ) async {
+      final backend = _ChatGptErrorTestBackend();
+      final store = _TestIdeaStore(customBackend: backend);
+      await store.load();
+      final idea = await store.addIdea('散歩メモ', '');
+
+      await tester.pumpWidget(
+        _wrapApp(DigScreen(store: store, idea: idea)),
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('ChatGPTの認証が切れています。設定画面からサインインし直してください。'),
+        findsOneWidget,
+      );
+      expect(find.text('設定を開く'), findsOneWidget);
+
+      await tester.enterText(find.byType(TextField), '朝の散歩で使いたい');
+      await tester.pump();
+      await tester.ensureVisible(find.text('答える'));
+      await tester.pump();
+      await tester.tap(find.text('答える'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('ここまでの回答を保存しました'), findsOneWidget);
+      expect(find.text('A: 朝の散歩で使いたい'), findsOneWidget);
+      expect(find.text('もう1問'), findsOneWidget);
+      expect(find.text('ここまでをまとめる'), findsOneWidget);
+    });
+  });
+
+  group('HomeScreen & MemoReviewPane stability', () {
+    testWidgets('HomeScreen shows 3-step guide on empty state and review action for open draft', (
+      tester,
+    ) async {
+      final store = _TestIdeaStore();
+      await store.load();
+
+      await tester.pumpWidget(_wrapApp(HomeScreen(store: store)));
+      await tester.pumpAndSettle();
+
+      expect(find.text('1行メモ'), findsOneWidget);
+      expect(find.text('質問に答える'), findsOneWidget);
+      expect(find.text('企画メモ'), findsOneWidget);
+
+      final idea = await store.addIdea('テスト企画', 'メモ');
+      idea.sessions.add(
+        DigSession(
+          id: 's1',
+          startedAt: DateTime(2026, 11, 27),
+          reviewOpen: true,
+          reviewDraft: MemoDraft(
+            revision: 'rev1',
+            memo: PlanMemo(
+              what: 'テスト',
+              who: '',
+              why: '',
+              how: '',
+              nextStep: '',
+              openQuestions: '',
+              createdAt: DateTime(2026, 11, 27),
+              version: 1,
+              input: MemoInput(
+                title: 'テスト企画',
+                note: 'メモ',
+                sessionId: 's1',
+                answerCount: 0,
+              ),
+            ),
+          ),
+        ),
+      );
+      await store.updateIdea(idea);
+      await tester.pumpAndSettle();
+
+      expect(find.text('下書きを確認'), findsOneWidget);
+    });
+
+    testWidgets('MemoReviewPane keeps save button visible without scrolling', (
+      tester,
+    ) async {
+      final idea = _sampleIdea();
+      final memo = PlanMemo(
+        what: '長い内容\n' * 10,
+        who: '自分',
+        why: '忘れるから',
+        how: 'メモする',
+        nextStep: '試す',
+        openQuestions: '',
+        createdAt: DateTime(2026, 11, 27),
+        version: 1,
+      );
+
+      await tester.pumpWidget(
+        _wrapApp(
+          Scaffold(
+            body: MemoReviewPane(
+              idea: idea,
+              memo: memo,
+              busy: false,
+              canSave: true,
+              onChanged: (_) {},
+              onBlur: () {},
+              onSave: () {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final saveButton = find.text('企画メモを保存');
+      expect(saveButton, findsOneWidget);
+      final rect = tester.getRect(saveButton);
+      expect(rect.bottom, lessThanOrEqualTo(844));
     });
   });
 
@@ -569,6 +748,59 @@ void main() {
       expect(find.byType(SnackBar), findsNothing);
       await tester.pump(const Duration(seconds: 4));
     });
+
+    testWidgets('DetailScreen hides duplicate session history for latest memo and avoids empty dashes', (
+      tester,
+    ) async {
+      final store = _TestIdeaStore();
+      await store.load();
+      final idea = Idea(
+        id: 'dup-test',
+        title: '重複確認',
+        createdAt: DateTime(2026, 11, 27),
+        sessions: [
+          DigSession(
+            id: 's1',
+            startedAt: DateTime(2026, 11, 27),
+            finished: true,
+            answers: const [
+              QaEntry(questionId: 'q1', question: '場面は？', answer: '朝'),
+            ],
+          ),
+        ],
+        memos: [
+          PlanMemo(
+            what: '',
+            who: '',
+            why: '',
+            how: '',
+            nextStep: '',
+            openQuestions: '',
+            createdAt: DateTime(2026, 11, 27),
+            version: 1,
+            source: AnswerSource.local,
+            input: const MemoInput(
+              title: '重複確認',
+              note: '元のメモ',
+              sessionId: 's1',
+              answerCount: 1,
+            ),
+          ),
+        ],
+      );
+
+      await tester.pumpWidget(
+        _wrapApp(DetailScreen(store: store, idea: idea)),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('深掘りの記録'), findsNothing);
+      expect(
+        find.text('まだ整理中のメモです。「元メモと回答」に記録が残っています。'),
+        findsOneWidget,
+      );
+      expect(find.text('—'), findsNothing);
+    });
   });
 }
 
@@ -604,5 +836,54 @@ class _NameSheetTestBackend extends ResilientBackend {
       return nextNames!;
     }
     return firstCompleter.future;
+  }
+}
+
+class _FakeChatGptAuthService extends ChatGptAuthService {
+  Completer<void>? _pendingSignIn;
+  int cancelCalls = 0;
+
+  @override
+  Future<void> signIn() async {
+    _pendingSignIn = Completer<void>();
+    await _pendingSignIn!.future;
+  }
+
+  @override
+  Future<void> cancelSignIn({bool preserveVerifier = false}) async {
+    cancelCalls++;
+    final pending = _pendingSignIn;
+    if (pending != null && !pending.isCompleted) {
+      pending.completeError(
+        const ChatGptAuthException('ChatGPT のサインインがキャンセルされました。'),
+      );
+    }
+  }
+}
+
+class _ChatGptErrorTestBackend extends ResilientBackend {
+  _ChatGptErrorTestBackend() : super(null);
+
+  @override
+  Future<DigQuestion> nextQuestion({
+    required Idea idea,
+    required List<QaEntry> history,
+    DigStyle style = DigStyle.friend,
+    DigViewpoint viewpoint = DigViewpoint.none,
+    bool contrarianDue = false,
+    bool templateOnly = false,
+    List<QaEntry>? templateHistory,
+    FirstDigContext? firstDig,
+  }) async {
+    lastSource = AnswerSource.local;
+    lastChatGptFailed = true;
+    lastChatGptError = 'ChatGPTの認証が切れています。設定画面からサインインし直してください。';
+    return const DigQuestion(
+      id: 'guided_1_scene',
+      text: '最初にこのアプリを使うのはどんな場面？',
+      choices: ['困ったそのとき', '後で思い出すとき', '楽しみとして始めるとき'],
+      source: AnswerSource.local,
+      axis: 'scene',
+    );
   }
 }

@@ -139,6 +139,10 @@ class IdeaStore extends ChangeNotifier {
   /// 掘り方スタイル（v0.2 項目1）。既定は友達モード。再起動後も保持する。
   DigStyle digStyle = DigStyle.friend;
 
+  /// ChatGPT サインインサービスを組み立てる。
+  ChatGptAuthService chatGptAuthService() =>
+      ChatGptAuthService(store: _SecretStoreTokenStore(_secrets));
+
   /// ChatGPT にサインイン済みか（v0.4.0）。実体はセキュア保存のトークンで、
   /// ここは backend() 組み立て用のキャッシュ。load() と設定画面で更新する。
   bool chatGptSignedIn = false;

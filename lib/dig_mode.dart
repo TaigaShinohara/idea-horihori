@@ -137,27 +137,27 @@ extension DigModeKindX on DigModeKind {
 /// 深掘り画面で1行開示し、必要に応じて設定画面へ案内するために使う。
 enum FallbackReason {
   onDeviceNeedsDownload(
-    '端末AIのモデルが未準備のため定型で進めています。',
+    '端末AIは未準備のため定型で進めています。設定から準備できます。',
     suggestsSettings: true,
   ),
   noRemoteKey(
-    'AI設定が未完了のため定型で進めています。',
+    'このまま定型質問で進められます。AIを使う場合は設定から追加できます。',
     suggestsSettings: true,
   ),
   remoteConsentOff(
-    'クラウド送信がオフのため定型で進めています。',
+    'クラウド送信がオフのため定型で進めています。設定からオンにできます。',
     suggestsSettings: true,
   ),
   remoteFailed(
-    'クラウドAIに接続できなかったため定型で進めています。',
+    'AIに接続できなかったため定型で進めています。',
     suggestsSettings: false,
   ),
   onDeviceUnavailable(
-    '端末AIが利用できないため定型で進めています。',
+    'このまま定型質問で進められます。AIを使う場合は設定から追加できます。',
     suggestsSettings: true,
   ),
   manualTemplate(
-    '定型モードで進めています。',
+    '定型質問で進めています。',
     suggestsSettings: false,
   );
 

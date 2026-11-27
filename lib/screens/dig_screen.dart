@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../ai_backend.dart';
 import '../app_config.dart';
@@ -193,30 +194,24 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     }
   }
 
-  (bool hasCloudConfig, bool hasCloudConsent) _cloudConfigStatus() {
-    final hasCloudConfig =
-        widget.store.hasRemoteKey || widget.store.chatGptSignedIn;
-    final hasCloudConsent =
-        (widget.store.hasRemoteKey && widget.store.remoteConsent) ||
-        (widget.store.chatGptSignedIn && widget.store.chatGptConsent);
-    return (hasCloudConfig, hasCloudConsent);
-  }
-
   FallbackReason? _currentFallbackReason() {
     if (_busy || _question?.source != AnswerSource.local) return null;
-    final (hasCloudConfig, hasCloudConsent) = _cloudConfigStatus();
     final fromBackend = _backend.fallbackReason(
-      hasRemoteKey: hasCloudConfig,
-      remoteConsent: hasCloudConsent,
+      hasRemoteKey: widget.store.hasRemoteKey,
+      remoteConsent: widget.store.remoteConsent,
+      hasChatGpt: widget.store.chatGptSignedIn,
+      chatGptConsent: widget.store.chatGptConsent,
     );
     if (fromBackend != null) return fromBackend;
     final cachedStatus = widget.store.cachedOnDeviceStatus?.status;
     return fallbackReasonFor(
       isLocalSource: true,
-      hasRemoteKey: hasCloudConfig,
-      remoteConsent: hasCloudConsent,
-      lastRemoteFailed:
-          _backend.lastRemoteError != null || _backend.lastChatGptFailed,
+      hasRemoteKey: widget.store.hasRemoteKey,
+      remoteConsent: widget.store.remoteConsent,
+      hasChatGpt: widget.store.chatGptSignedIn,
+      chatGptConsent: widget.store.chatGptConsent,
+      lastRemoteFailed: _backend.lastRemoteError != null,
+      lastChatGptFailed: _backend.lastChatGptFailed,
       onDeviceNeedsDownload: cachedStatus == OnDeviceStatus.needsDownload,
       manualTemplate: _backend.lastManualTemplate,
     );
@@ -353,15 +348,17 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       );
       if (!_current(request)) return;
       if (!different && generated.source == AnswerSource.local) {
-        final (hasCloudConfig, hasCloudConsent) = _cloudConfigStatus();
         final reason = _backend.fallbackReason(
-          hasRemoteKey: hasCloudConfig,
-          remoteConsent: hasCloudConsent,
+          hasRemoteKey: widget.store.hasRemoteKey,
+          remoteConsent: widget.store.remoteConsent,
+          hasChatGpt: widget.store.chatGptSignedIn,
+          chatGptConsent: widget.store.chatGptConsent,
         );
         setState(() {
           _question = previousQuestion;
           _retryNotice =
               _backend.lastRemoteError?.message ??
+              _backend.lastChatGptError ??
               reason?.message ??
               'AIでの聞き直しができませんでした。このまま定型で続けられます。';
         });
@@ -464,6 +461,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       return;
     }
     if (!mounted || _leaving) return;
+    HapticFeedback.lightImpact();
     _unsavedDraft = null;
     _freeCtrl.clear();
     setState(() {
@@ -545,9 +543,11 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       if (!mounted || !_current(request)) return;
       _unsavedDraft = null;
       _reviewEdit = draft.memo;
-      if (_backend.lastRemoteError case final failure?) {
+      final failureMessage =
+          _backend.lastRemoteError?.message ?? _backend.lastChatGptError;
+      if (failureMessage != null) {
         ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(failure.message)));
+            .showSnackBar(SnackBar(content: Text(failureMessage)));
       }
     } on AiCancelled {
       return;
@@ -640,6 +640,7 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
       return;
     }
     if (!mounted) return;
+    HapticFeedback.lightImpact();
     _leaving = true;
     if (widget.fromDetail) {
       Navigator.pop(context, true);
@@ -858,7 +859,9 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
     final displaySource = _question?.source ?? _backend.lastSource;
     final fallbackReason = _currentFallbackReason();
     final showSettingsButton =
-        fallbackReason != null && fallbackReason.suggestsSettings;
+        (fallbackReason != null && fallbackReason.suggestsSettings) ||
+        _backend.lastRemoteError == GeminiFailure.invalidKey ||
+        (_backend.lastChatGptError?.contains('サインイン') ?? false);
     final showOneTimeGuide =
         showSettingsButton && (!widget.store.keyGuideShown || _guidePrompted);
     if (showOneTimeGuide && !_guidePrompted) {
@@ -1013,12 +1016,14 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                                 ),
                                 if (_retryNotice != null ||
                                     _backend.lastRemoteError != null ||
+                                    _backend.lastChatGptError != null ||
                                     fallbackReason != null) ...[
                                   const SizedBox(height: 10),
                                   _FallbackBanner(
                                     message:
                                         _retryNotice ??
                                         _backend.lastRemoteError?.message ??
+                                        _backend.lastChatGptError ??
                                         fallbackReason!.message,
                                     showSettings: showSettingsButton,
                                     onOpenSettings: _openSettings,
@@ -1030,53 +1035,89 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                             ),
                           )
                         : _atOpeningCheckpoint
-                        ? const Center(child: Text('ここまでの回答を保存しました。'))
+                        ? Center(
+                            child: SingleChildScrollView(
+                              child: _OpeningCheckpointCard(
+                                answers: _session.answers,
+                              ),
+                            ),
+                          )
                         : const SizedBox.shrink(),
                   ),
                   const SizedBox(height: 12),
                   // P1-1 #3: ロード中も下部操作枠を維持し、毎問の縦ジャンプを防ぐ。
-                  FilledButton(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: kButtonFill,
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                    ),
-                    onPressed: primaryAction,
-                    child: Text(
-                      _atOpeningCheckpoint ? 'もう1問' : '答える',
-                      style: const TextStyle(fontSize: 16),
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      Flexible(
-                        child: TextButton(
-                          onPressed:
-                              !_busy &&
-                                  _failure == null &&
-                                  canUndoLastAnswer(_session)
-                              ? _undo
-                              : null,
-                          child: const Text('1問もどる'),
-                        ),
+                  if (_atOpeningCheckpoint) ...[
+                    FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: kButtonFill,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
                       ),
-                      Flexible(
-                        child: TextButton(
-                          onPressed:
-                              !_busy && _failure == null && canSummarize
-                              ? () => _summarize()
-                              : null,
-                          child: Text(
-                            _atOpeningCheckpoint
-                                ? 'ここまでをまとめる'
-                                : 'いったんまとめる',
+                      onPressed: primaryAction,
+                      child: const Text('もう1問', style: TextStyle(fontSize: 16)),
+                    ),
+                    const SizedBox(height: 8),
+                    FilledButton.tonal(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: accentTonalFill(context),
+                        foregroundColor: accentTextColor(context),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                      onPressed:
+                          !_busy && _failure == null && canSummarize
+                          ? () => _summarize()
+                          : null,
+                      child: const Text('ここまでをまとめる'),
+                    ),
+                    const SizedBox(height: 2),
+                    Center(
+                      child: TextButton(
+                        onPressed:
+                            !_busy &&
+                                _failure == null &&
+                                canUndoLastAnswer(_session)
+                            ? _undo
+                            : null,
+                        child: const Text('1問もどる'),
+                      ),
+                    ),
+                  ] else ...[
+                    FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: kButtonFill,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                      onPressed: primaryAction,
+                      child: const Text('答える', style: TextStyle(fontSize: 16)),
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        Flexible(
+                          child: TextButton(
+                            onPressed:
+                                !_busy &&
+                                    _failure == null &&
+                                    canUndoLastAnswer(_session)
+                                ? _undo
+                                : null,
+                            child: const Text('1問もどる'),
                           ),
                         ),
-                      ),
-                    ],
-                  ),
+                        Flexible(
+                          child: TextButton(
+                            onPressed:
+                                !_busy && _failure == null && canSummarize
+                                ? () => _summarize()
+                                : null,
+                            child: const Text('いったんまとめる'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -1122,10 +1163,13 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                   (c) => ChoiceChip(
                     label: Text(c),
                     selected: _selectedChoice == c,
-                    onSelected: (selected) => setState(() {
-                      _selectedChoice = selected ? c : null;
-                      if (selected) _freeCtrl.clear();
-                    }),
+                    onSelected: (selected) {
+                      HapticFeedback.selectionClick();
+                      setState(() {
+                        _selectedChoice = selected ? c : null;
+                        if (selected) _freeCtrl.clear();
+                      });
+                    },
                   ),
                 )
                 .toList(),
@@ -1144,7 +1188,8 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
               if (_freeCtrl.text.trim().isNotEmpty) _selectedChoice = null;
             }),
           ),
-          if (_openingTurn)
+          if (_openingTurn) ...[
+            const SizedBox(height: 8),
             Wrap(
               spacing: 8,
               children: [
@@ -1159,6 +1204,72 @@ class _DigScreenState extends State<DigScreen> with WidgetsBindingObserver {
                   ),
               ],
             ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _OpeningCheckpointCard extends StatelessWidget {
+  final List<QaEntry> answers;
+  const _OpeningCheckpointCard({required this.answers});
+
+  @override
+  Widget build(BuildContext context) {
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+    return GlassCard(
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.check_circle_outline,
+                size: 20,
+                color: accentTextColor(context),
+              ),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'ここまでの回答を保存しました',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+          if (answers.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            for (final a in answers)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Q: ${a.question}',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: muted,
+                        height: 1.4,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'A: ${a.answer}',
+                      style: const TextStyle(fontSize: 14, height: 1.5),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+          const SizedBox(height: 4),
+          Text(
+            'もう1問続けるか、ここで企画メモにまとめられます。',
+            style: TextStyle(fontSize: 13, color: muted, height: 1.5),
+          ),
         ],
       ),
     );

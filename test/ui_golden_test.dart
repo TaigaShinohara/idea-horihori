@@ -303,11 +303,15 @@ void main() {
       ));
       await tester.pump();
 
-      expect(find.textContaining('送信内容：'), findsOneWidget);
-      expect(find.textContaining('注意点：'), findsOneWidget);
+      expect(find.textContaining('送信内容：'), findsNWidgets(2));
+      expect(find.textContaining('注意点：'), findsNWidgets(2));
+      expect(find.textContaining('OpenAIへ送信します'), findsOneWidget);
+      expect(find.textContaining('GoogleのGemini APIへ送信します'), findsOneWidget);
       expect(find.textContaining('Google AI Studio'), findsOneWidget);
 
       await tester.enterText(find.byType(TextField).first, 'test-api-key-123');
+      await tester.ensureVisible(find.text('保存する'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('保存する'));
       await tester.pumpAndSettle();
 

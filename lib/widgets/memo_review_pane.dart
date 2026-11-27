@@ -78,7 +78,7 @@ class _MemoReviewPaneState extends State<MemoReviewPane> {
     );
   }
 
-  Widget _input(String label, _ReviewField field) {
+  Widget _input(String label, _ReviewField field, {String? hintText}) {
     return TextField(
       controller: field.controller,
       focusNode: field.focus,
@@ -87,95 +87,145 @@ class _MemoReviewPaneState extends State<MemoReviewPane> {
       maxLines: 4,
       onChanged: (_) => _emitChanges(),
       onTapOutside: (_) => field.focus.unfocus(),
-      decoration: glassInputDecoration(context, labelText: label),
+      decoration: glassInputDecoration(
+        context,
+        labelText: label,
+        hintText: hintText,
+      ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final muted = theme.colorScheme.onSurfaceVariant;
     final returnToQuestions = widget.onReturnToQuestions;
     final editLastAnswer = widget.onEditLastAnswer;
     final intro = switch (widget.memo.source) {
       AnswerSource.local || null => '下書きを確認して、必要な箇所を直せます。',
       _ => 'AIがまとめた下書きです。必要な箇所を直せます。',
     };
-    return SingleChildScrollView(
-      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(child: Text(intro, style: theme.textTheme.bodyMedium)),
-              if (widget.memo.source case final source?) ...[
-                const SizedBox(width: 8),
-                Text(
-                  source.label,
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ],
-          ),
-          const SizedBox(height: 16),
-          ReadingGlass(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(
+          child: SingleChildScrollView(
+            keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Semantics(
-                  header: true,
-                  child: Text('決めたこと', style: theme.textTheme.titleMedium),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(child: Text(intro, style: theme.textTheme.bodyMedium)),
+                    if (widget.memo.source case final source?) ...[
+                      const SizedBox(width: 8),
+                      Text(
+                        source.label,
+                        style: TextStyle(fontSize: 13, color: muted),
+                      ),
+                    ],
+                  ],
                 ),
-                const SizedBox(height: 10),
-                _input('何を作る', _what),
-                const SizedBox(height: 8),
-                _input('誰に', _who),
-                const SizedBox(height: 8),
-                _input('なぜ', _why),
-                const SizedBox(height: 8),
-                _input('どうやって', _how),
                 const SizedBox(height: 16),
-                _input('未確認のこと', _openQuestions),
-                const SizedBox(height: 16),
-                _input('次に試すこと', _nextStep),
-                if (widget.memo.input case final input?) ...[
-                  const SizedBox(height: 8),
-                  MemoInputView(input: input, idea: widget.idea),
-                ],
+                ReadingGlass(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Semantics(
+                        header: true,
+                        child: Text('決めたこと', style: theme.textTheme.titleMedium),
+                      ),
+                      const SizedBox(height: 10),
+                      _input(
+                        '何を作る',
+                        _what,
+                        hintText: '例：1行メモから企画を育てるアプリ',
+                      ),
+                      const SizedBox(height: 8),
+                      _input(
+                        '誰に',
+                        _who,
+                        hintText: '例：思いつきをよく忘れる自分',
+                      ),
+                      const SizedBox(height: 8),
+                      _input(
+                        'なぜ',
+                        _why,
+                        hintText: '例：メモしても形にならず消えてしまう',
+                      ),
+                      const SizedBox(height: 8),
+                      _input(
+                        'どうやって',
+                        _how,
+                        hintText: '例：1問ずつ答えるだけで型に整理する',
+                      ),
+                      const SizedBox(height: 16),
+                      _input(
+                        '未確認のこと',
+                        _openQuestions,
+                        hintText: '迷っていることや調べたいこと（空欄でも可）',
+                      ),
+                      const SizedBox(height: 16),
+                      _input(
+                        '次に試すこと',
+                        _nextStep,
+                        hintText: '例：まず紙やメモで1回試してみる',
+                      ),
+                      if (widget.memo.input case final input?) ...[
+                        const SizedBox(height: 8),
+                        MemoInputView(input: input, idea: widget.idea),
+                      ],
+                    ],
+                  ),
+                ),
               ],
             ),
           ),
-          const SizedBox(height: 14),
-          if (!widget.canSave)
-            const Text('決めたことや次に試すことを書き足すと保存できます。')
-          else if (!widget.memo.hasReviewContent)
-            const Text('ここでは元メモと回答を保存できます。'),
-          FilledButton(
-            onPressed: widget.busy || !widget.canSave ? null : widget.onSave,
-            style: FilledButton.styleFrom(
-              minimumSize: const Size.fromHeight(48),
-              backgroundColor: kButtonFill,
-              foregroundColor: Colors.white,
-            ),
-            child: const Text('企画メモを保存'),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (!widget.canSave) ...[
+                Text(
+                  '決めたことや次に試すことを書き足すと保存できます。',
+                  style: TextStyle(fontSize: 13, color: muted),
+                ),
+                const SizedBox(height: 8),
+              ] else if (!widget.memo.hasReviewContent) ...[
+                Text(
+                  '空欄のままでも、元メモと回答と一緒に保存できます。',
+                  style: TextStyle(fontSize: 13, color: muted),
+                ),
+                const SizedBox(height: 8),
+              ],
+              FilledButton(
+                onPressed: widget.busy || !widget.canSave ? null : widget.onSave,
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size.fromHeight(48),
+                  backgroundColor: kButtonFill,
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text('企画メモを保存'),
+              ),
+              if (returnToQuestions != null)
+                TextButton(
+                  onPressed: widget.busy ? null : returnToQuestions,
+                  child: const Text('質問に戻る'),
+                )
+              else if (editLastAnswer != null)
+                TextButton(
+                  onPressed: widget.busy ? null : editLastAnswer,
+                  child: const Text('最後の回答を直す'),
+                ),
+            ],
           ),
-          if (returnToQuestions != null)
-            TextButton(
-              onPressed: widget.busy ? null : returnToQuestions,
-              child: const Text('質問に戻る'),
-            )
-          else if (editLastAnswer != null)
-            TextButton(
-              onPressed: widget.busy ? null : editLastAnswer,
-              child: const Text('最後の回答を直す'),
-            ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 }

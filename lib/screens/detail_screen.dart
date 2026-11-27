@@ -57,7 +57,7 @@ class _DetailScreenState extends State<DetailScreen> {
   Idea get idea => widget.idea;
 
   Future<void> _editIdea(BuildContext context) async {
-    if (_editing) return;
+    if (_editing || _sendingToDrive) return;
     setState(() => _editing = true);
     try {
       final values = await showDialog<(String, String)>(
@@ -86,6 +86,7 @@ class _DetailScreenState extends State<DetailScreen> {
         _editing ||
         _openingDig ||
         _openingBrief ||
+        _sendingToDrive ||
         ModalRoute.of(context)?.isCurrent != true) {
       return;
     }
@@ -108,6 +109,7 @@ class _DetailScreenState extends State<DetailScreen> {
         _editing ||
         _namesOpen ||
         _openingDig ||
+        _sendingToDrive ||
         ModalRoute.of(context)?.isCurrent != true) {
       return;
     }
@@ -128,6 +130,7 @@ class _DetailScreenState extends State<DetailScreen> {
         _editing ||
         _namesOpen ||
         _openingBrief ||
+        _sendingToDrive ||
         ModalRoute.of(context)?.isCurrent != true) {
       return;
     }
@@ -217,7 +220,7 @@ class _DetailScreenState extends State<DetailScreen> {
   ).showSnackBar(const SnackBar(content: Text('変更を保存できませんでした。もう一度お試しください。')));
 
   Future<void> _confirmArchive(BuildContext context) async {
-    if (_archiving || _editing) return;
+    if (_archiving || _editing || _sendingToDrive) return;
     setState(() => _archiving = true);
     try {
       final ok = await showDialog<bool>(
@@ -285,13 +288,16 @@ class _DetailScreenState extends State<DetailScreen> {
             IconButton(
               icon: const Icon(Icons.edit_outlined),
               tooltip: 'タイトルとメモを編集',
-              onPressed: _editing || _archiving ? null : () => _editIdea(context),
+              onPressed: _editing || _archiving || _sendingToDrive
+                  ? null
+                  : () => _editIdea(context),
             ),
             IconButton(
               icon: const Icon(Icons.archive_outlined),
               tooltip: 'アーカイブ',
-              onPressed:
-                  _editing || _archiving ? null : () => _confirmArchive(context),
+              onPressed: _editing || _archiving || _sendingToDrive
+                  ? null
+                  : () => _confirmArchive(context),
             ),
           ],
         ),
@@ -302,7 +308,20 @@ class _DetailScreenState extends State<DetailScreen> {
             final latest = memos.isEmpty ? null : memos.first;
             final older = memos.length <= 1 ? <PlanMemo>[] : memos.sublist(1);
             final hasAnswers = idea.sessions.any((s) => s.answers.isNotEmpty);
-            final hasResumable = idea.resumableSession != null;
+            final resumable = idea.resumableSession;
+            final hasResumable = resumable != null;
+            final isReviewPending =
+                resumable?.reviewOpen == true && resumable?.reviewDraft != null;
+            final extraSessions = latest == null
+                ? [for (final s in idea.sessions) if (s.answers.isNotEmpty) s]
+                : [
+                    for (final s in idea.sessions)
+                      if (s.answers.isNotEmpty &&
+                          (latest.input == null ||
+                              s.id != latest.input!.sessionId ||
+                              s.answers.length != latest.input!.answerCount))
+                        s,
+                  ];
             return ListView(
               padding: EdgeInsets.fromLTRB(
                 16,
@@ -361,8 +380,19 @@ class _DetailScreenState extends State<DetailScreen> {
                       padding: const EdgeInsets.symmetric(vertical: 13),
                     ),
                     onPressed: _openDig,
-                    icon: const Icon(Icons.chat_bubble_outline, size: 19),
-                    label: Text(hasResumable ? 'つづきを掘る' : '深掘りする'),
+                    icon: Icon(
+                      isReviewPending
+                          ? Icons.fact_check_outlined
+                          : Icons.chat_bubble_outline,
+                      size: 19,
+                    ),
+                    label: Text(
+                      isReviewPending
+                          ? '下書きを確認'
+                          : hasResumable
+                          ? 'つづきを掘る'
+                          : '深掘りする',
+                    ),
                   ),
                   if (hasAnswers) ...[
                     const SizedBox(height: 20),
@@ -372,11 +402,10 @@ class _DetailScreenState extends State<DetailScreen> {
                           TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
                     ),
                     const SizedBox(height: 8),
-                    for (final session in idea.sessions)
-                      if (session.answers.isNotEmpty) ...[
-                        _SessionHistoryTile(session: session),
-                        const SizedBox(height: 10),
-                      ],
+                    for (final session in extraSessions) ...[
+                      _SessionHistoryTile(session: session),
+                      const SizedBox(height: 10),
+                    ],
                   ],
                 ] else ...[
                   // K5: 最新メモが主役（最初・最大）。S-01: 完了直後は静かなフェードイン。
@@ -394,8 +423,19 @@ class _DetailScreenState extends State<DetailScreen> {
                       padding: const EdgeInsets.symmetric(vertical: 12),
                     ),
                     onPressed: _openDig,
-                    icon: const Icon(Icons.chat_bubble_outline, size: 19),
-                    label: Text(hasResumable ? 'つづきを掘る' : 'もっと深掘り'),
+                    icon: Icon(
+                      isReviewPending
+                          ? Icons.fact_check_outlined
+                          : Icons.chat_bubble_outline,
+                      size: 19,
+                    ),
+                    label: Text(
+                      isReviewPending
+                          ? '下書きを確認'
+                          : hasResumable
+                          ? 'つづきを掘る'
+                          : 'もっと深掘り',
+                    ),
                   ),
                   const SizedBox(height: 10),
                   // v0.2 項目5・6: メモがある時だけ出せる書き出し／名前候補。
@@ -423,14 +463,27 @@ class _DetailScreenState extends State<DetailScreen> {
                   ),
                   const SizedBox(height: 10),
                   // v0.5.0: 完成した企画書を Google ドキュメント化する。
-                  OutlinedButton.icon(
-                    onPressed: _sendingToDrive
-                        ? null
-                        : () => _sendToDrive(latest),
-                    icon: const Icon(Icons.cloud_upload_outlined, size: 18),
-                    label: Text(_sendingToDrive ? '送信中…' : 'Googleドキュメントで開く'),
-                  ),
-                  if (hasAnswers) ...[
+                  if (_google.isConfigured)
+                    OutlinedButton.icon(
+                      onPressed: _sendingToDrive
+                          ? null
+                          : () => _sendToDrive(latest),
+                      icon: const Icon(Icons.cloud_upload_outlined, size: 18),
+                      label: Text(_sendingToDrive ? '送信中…' : 'Googleドキュメントで開く'),
+                    )
+                  else
+                    TextButton.icon(
+                      style: TextButton.styleFrom(
+                        foregroundColor:
+                            Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                      onPressed: _sendingToDrive
+                          ? null
+                          : () => _sendToDrive(latest),
+                      icon: const Icon(Icons.cloud_upload_outlined, size: 18),
+                      label: Text(_sendingToDrive ? '送信中…' : 'Googleドキュメントで開く'),
+                    ),
+                  if (extraSessions.isNotEmpty) ...[
                     const SizedBox(height: 20),
                     const Text(
                       '深掘りの記録',
@@ -438,11 +491,10 @@ class _DetailScreenState extends State<DetailScreen> {
                           TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
                     ),
                     const SizedBox(height: 8),
-                    for (final session in idea.sessions)
-                      if (session.answers.isNotEmpty) ...[
-                        _SessionHistoryTile(session: session),
-                        const SizedBox(height: 10),
-                      ],
+                    for (final session in extraSessions) ...[
+                      _SessionHistoryTile(session: session),
+                      const SizedBox(height: 10),
+                    ],
                   ],
                   if (older.isNotEmpty) ...[
                     const SizedBox(height: 20),
@@ -505,22 +557,64 @@ class _MemoBody extends StatelessWidget {
     final labelColor = Theme.of(context).colorScheme.onSurfaceVariant;
     final openQuestions = memo.openQuestions;
     if (openQuestions != null) {
+      if (!memo.hasReviewContent) {
+        return Text(
+          'まだ整理中のメモです。「元メモと回答」に記録が残っています。',
+          style: TextStyle(fontSize: 14, height: 1.6, color: labelColor),
+        );
+      }
+      final decided = [
+        if (memo.what.isNotEmpty) ('何を作る', memo.what),
+        if (memo.who.isNotEmpty) ('誰に', memo.who),
+        if (memo.why.isNotEmpty) ('なぜ', memo.why),
+        if (memo.how.isNotEmpty) ('どうやって', memo.how),
+      ];
+      final hasOpen = openQuestions.trim().isNotEmpty;
+      final hasNext = memo.nextStep.trim().isNotEmpty;
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _row(
-            '決めたこと',
-            [
-              if (memo.what.isNotEmpty) '何を作る　${memo.what}',
-              if (memo.who.isNotEmpty) '誰に　${memo.who}',
-              if (memo.why.isNotEmpty) 'なぜ　${memo.why}',
-              if (memo.how.isNotEmpty) 'どうやって　${memo.how}',
-            ]
-                .join('\n'),
-            labelColor,
-          ),
-          _row('未確認のこと', openQuestions, labelColor),
-          _row('次に試すこと', memo.nextStep, labelColor, last: true),
+          if (decided.isNotEmpty)
+            Padding(
+              padding: EdgeInsets.only(bottom: hasOpen || hasNext ? 14 : 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '決めたこと',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                      color: labelColor,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  for (var i = 0; i < decided.length; i++)
+                    Padding(
+                      padding: EdgeInsets.only(
+                        bottom: i == decided.length - 1 ? 0 : 8,
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            decided[i].$1,
+                            style: TextStyle(fontSize: 12, color: labelColor),
+                          ),
+                          const SizedBox(height: 1),
+                          Text(
+                            decided[i].$2,
+                            style: const TextStyle(fontSize: 15, height: 1.6),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          if (hasOpen)
+            _row('未確認のこと', openQuestions, labelColor, last: !hasNext),
+          if (hasNext) _row('次に試すこと', memo.nextStep, labelColor, last: true),
         ],
       );
     }
@@ -609,8 +703,10 @@ class _MemoView extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           _MemoBody(memo: memo),
-          if (memo.input case final input?)
+          if (memo.input case final input?) ...[
+            const SizedBox(height: 8),
             MemoInputView(input: input, idea: idea),
+          ],
           // 体力測定（項目4）: 値がある時だけ、末尾に静かに1行添える。
           if (memo.hasFitness) ...[
             const SizedBox(height: 14),
@@ -862,6 +958,7 @@ class _EditIdeaDialogState extends State<_EditIdeaDialog> {
         TextField(
           controller: _title,
           autofocus: true,
+          textInputAction: TextInputAction.next,
           decoration: glassInputDecoration(context, labelText: 'タイトル'),
           onChanged: (_) => setState(() {}),
         ),
@@ -975,6 +1072,7 @@ class _NameCandidatesSheetState extends State<_NameCandidatesSheet>
     var message = '「$name」をコピーしました';
     try {
       await Clipboard.setData(ClipboardData(text: name));
+      HapticFeedback.selectionClick();
     } catch (_) {
       message = 'コピーできませんでした。';
     }
