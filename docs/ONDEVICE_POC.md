@@ -110,3 +110,18 @@
 
 - **生成の実エラー理由（ネイティブのエラーコード）は未確定**。v0.5.2 を入れた実機で再度「質問を試す」を実行し、設定→詳細・動作確認に表示される「最後の生成エラーの詳細」（例: "GENERATION_FAILED: GenAI error <code>: ..."）を確認して初めて切り分けられる。憶測で原因は断定しない。
 - v0.5.2 のリトライで実機生成が通るかも未確認（再試行が効くのは初回初期化失敗型の場合のみ）。
+
+## 診断結果（2026-11-28、Pixel 10 Pro・v0.5.2）
+
+本人が v0.5.2 で「Nanoで質問を試す」を実行し、設定→詳細・動作確認のスクショを報告:
+
+- 状態確認: 「Could not query AICore: null」（継続）
+- 最後の生成エラーの詳細: **GENERATION_FAILED: java.lang.NullPointerException**（メッセージなし）
+- v0.5.2 の自動リトライ（1秒後1回）でも回復しなかった
+
+### 切り分け（2026-11-28、コード＋ネット調査）
+
+- 正常な AICore エラー（BUSY・容量不足・未対応など）は数字コード付き GenAiException になる。今回は checkStatus・countTokens 系・generateContent の全てが「メッセージなし例外」で落ちており、AICore 側がまともな応答を返さず ML Kit 内部で null を踏んでいるパターン。アプリ側の固定文ではなく実エラーが初めて見えた。
+- アプリ側に NPE の原因は見当たらない: release に minify なし、flutter_device_ai は最新 0.3.0（genai-prompt 1.0.0-beta4）、同じ経路で 2026-11-23 に生成成功の記録あり。
+- ネット上の同型事例: Pixel 9/10 で AICore が stub 版（versionName 0.stub…）のままだと ML Kit が AICore サービスにバインドできず全呼び出しが失敗する（creativeworkline の AICore Binding Failure 記事）。公式の 606（FEATURE_NOT_FOUND）説明でも「AICore が最新構成をダウンロードし終わるまで使えない。再起動で早まる」とある。
+- 結論: 一時的な初期化失敗ではなく、端末側 AICore の状態（未更新・stub・構成未取得）が持続的に悪い可能性が高い。確定には端末側の確認が要る: ①Playストアで AICore の更新有無とバージョン（0.stub か）②再起動後の再試行 ③Gmail の「作成を手伝って」等、他の Nano 機能が動くか（動かなければ端末側で確定）。
