@@ -125,3 +125,13 @@
 - アプリ側に NPE の原因は見当たらない: release に minify なし、flutter_device_ai は最新 0.3.0（genai-prompt 1.0.0-beta4）、同じ経路で 2026-11-23 に生成成功の記録あり。
 - ネット上の同型事例: Pixel 9/10 で AICore が stub 版（versionName 0.stub…）のままだと ML Kit が AICore サービスにバインドできず全呼び出しが失敗する（creativeworkline の AICore Binding Failure 記事）。公式の 606（FEATURE_NOT_FOUND）説明でも「AICore が最新構成をダウンロードし終わるまで使えない。再起動で早まる」とある。
 - 結論: 一時的な初期化失敗ではなく、端末側 AICore の状態（未更新・stub・構成未取得）が持続的に悪い可能性が高い。確定には端末側の確認が要る: ①Playストアで AICore の更新有無とバージョン（0.stub か）②再起動後の再試行 ③Gmail の「作成を手伝って」等、他の Nano 機能が動くか（動かなければ端末側で確定）。
+
+### 端末確認の結果（2026-11-28 16:06）
+
+本人が設定→アプリ→AICore のスクショを報告:
+
+- バージョン: **26.10.15.11.release.prod_aicore_20261015.00_RC11**（APKMirror 掲載の最新 release と一致。**stub ではない**）
+- ストレージ使用量: 4.42 GB（Nano モデルのデータは落ちている）
+- Play ストアからインストール済み
+
+→ 「AICore が stub 版」という仮説は棄却。AICore 本体は正常に入っている。それでも checkStatus／generateContent がメッセージなし例外で落ちる。プラグイン側の buildRequest は config を安全に読む実装で、NPE は ML Kit の generateContent 内部＝AICore とのやり取りの中で起きている。残る未実施の切り分け: ①再起動後の再試行（AICore サービスの状態リセット）②他の Nano 機能（Gmail の作成支援等）が動くか＝端末全体か／このアプリだけか ③別パッケージ検証版（2026-11-23 に成功した方式）を現行コードで作り直しての再現確認。
